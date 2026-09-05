@@ -1,0 +1,29 @@
+# Gradle
+.gradle/
+build/
+run/
+mcmodsrepo/
+
+# IntelliJ IDEA
+.idea/
+out/
+*.iml
+*.ipr
+*.iws
+
+# Eclipse
+bin/
+eclipse/
+.settings/
+.metadata/
+.classpath
+.project
+*.launch
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志和临时文件
+*.log
+*.tmp

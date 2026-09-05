@@ -1,0 +1,7 @@
+项目作者：LAI
+
+特别感谢：
+- Minecraft Forge：提供模组加载器与开发工具链。
+- EMI：提供配方查看与配方上下文接口。
+- FindMeExtended：提供周围容器搜索与物品提取能力。
+- Architectury API：作为 FindMeExtended 的运行依赖。

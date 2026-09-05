@@ -1,0 +1,27 @@
+配方材料发送器
+================
+
+适用环境
+--------
+- Minecraft 1.20.1
+- Forge 47.4.20 或兼容的 47.x 版本
+- Java 17
+- EMI 1.1.24 或更高版本
+- FindMeExtended 1.0.1 或更高版本（可选，仅反转模式需要）
+- Applied Energistics 2 15.x（可选，用于识别 AE2 ME 存储）
+- Architectury API 9.1.12 或更高版本（FindMeExtended 的依赖）
+
+功能
+----
+1. 在 EMI 配方界面悬停配方后，按住 Z 使用滚轮选择份数（同时按住shift每次变动8份，按住ctrl每次变动64份），松开后将背包中的材料发送到当前容器。
+2. 按住 Alt 再按 Z，可直接选择背包能够提供的全部配方份数。
+3. 安装 FindMeExtended 后，按住反转键“~”再按 Z，会统计背包与 FindMeExtended 搜索范围内的材料；松开 Z 后，只从周围容器取回背包缺少的部分。未安装 FindMeExtended 时不会注册反转键。
+4. 背包中原有材料不会在反转模式下被移动（会参与统计）；FindMeExtended 负责执行普通容器提取和背包溢出处理。安装 AE2 后，会额外读取附近 AE2 ME 存储中的物品。
+
+构建
+----
+在项目根目录使用 Gradle Wrapper 执行 build 任务。构建产物位于 build/libs。
+
+作者
+----
+LAI

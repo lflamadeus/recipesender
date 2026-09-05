@@ -1,0 +1,9 @@
+{
+  "key.recipe_sender.insert": "Select and transfer recipe materials",
+  "key.recipe_sender.reverse": "Reverse transfer direction (hold)",
+  "key.categories.recipe_sender": "Recipe Sender",
+  "text.recipe_sender.available_count": "Inventory: %s batches",
+  "text.recipe_sender.nearby_available_count": "Inventory and nearby: %s batches",
+  "text.recipe_sender.send_count": "Send %s batches",
+  "text.recipe_sender.pull_count": "Pull %s batches"
+}

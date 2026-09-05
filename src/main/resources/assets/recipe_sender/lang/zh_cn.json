@@ -1,0 +1,9 @@
+{
+  "key.recipe_sender.insert": "选择并传输配方材料",
+  "key.recipe_sender.reverse": "反转传输方向（按住）",
+  "key.categories.recipe_sender": "配方材料发送器",
+  "text.recipe_sender.available_count": "背包现有 %s 份",
+  "text.recipe_sender.nearby_available_count": "背包与周围现有 %s 份",
+  "text.recipe_sender.send_count": "发送 %s 份",
+  "text.recipe_sender.pull_count": "取回 %s 份"
+}
