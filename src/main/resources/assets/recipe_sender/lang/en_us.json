@@ -5,5 +5,6 @@
   "text.recipe_sender.available_count": "Inventory: %s batches",
   "text.recipe_sender.nearby_available_count": "Inventory and nearby: %s batches",
   "text.recipe_sender.send_count": "Send %s batches",
-  "text.recipe_sender.pull_count": "Pull %s batches"
+  "text.recipe_sender.pull_count": "Pull %s batches",
+  "text.recipe_sender.target_limit": "Target accepts at most %s batches"
 }

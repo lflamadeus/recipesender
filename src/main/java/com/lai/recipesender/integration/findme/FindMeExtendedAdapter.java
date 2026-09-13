@@ -1,12 +1,15 @@
 package com.lai.recipesender.integration.findme;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.ChestBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.ChestType;
 import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraftforge.common.capabilities.Capability;
 import net.minecraftforge.common.capabilities.ForgeCapabilities;
 import net.minecraftforge.fml.ModList;
@@ -36,9 +39,17 @@ public final class FindMeExtendedAdapter {
     private FindMeExtendedAdapter() {
     }
 
+    /**
+     * 判断 FindMeExtended 是否安装。
+     * 只查模组列表，不触发反射初始化，因此可以在按键注册等早期阶段安全调用。
+     */
+    public static boolean isModPresent() {
+        return ModList.get().isLoaded(FIND_ME_ID);
+    }
+
     /** 判断 FindMeExtended 是否存在且兼容接口初始化成功。 */
     public static boolean isAvailable() {
-        return ModList.get().isLoaded(FIND_ME_ID) && getAccess() != null;
+        return isModPresent() && getAccess() != null;
     }
 
     /** 快照周围容器和 AE2 存储中的物品，用于服务端配方数量计算。 */
@@ -48,22 +59,9 @@ public final class FindMeExtendedAdapter {
             return List.of();
         }
 
-        int radius = reflection.getSafeRadius();
-        BlockPos center = player.blockPosition();
         List<ItemStack> result = new ArrayList<>();
         Set<Object> visitedAe2Storages = Collections.newSetFromMap(new IdentityHashMap<>());
-        for (BlockPos pos : BlockPos.betweenClosed(center.offset(-radius, -radius, -radius),
-                center.offset(radius, radius, radius))) {
-            if (!player.serverLevel().hasChunkAt(pos)) {
-                continue;
-            }
-            BlockEntity blockEntity = player.serverLevel().getBlockEntity(pos);
-            if (blockEntity == null) {
-                continue;
-            }
-            if (isSecondaryVanillaChestHalf(player, pos)) {
-                continue;
-            }
+        for (BlockEntity blockEntity : reflection.collectNearbyBlockEntities(player)) {
             blockEntity.getCapability(ForgeCapabilities.ITEM_HANDLER, null)
                     .ifPresent(handler -> copyHandlerContents(handler, result));
             reflection.copyAe2Contents(blockEntity, result, visitedAe2Storages);
@@ -71,24 +69,30 @@ public final class FindMeExtendedAdapter {
         return List.copyOf(result);
     }
 
-    /** 双箱子的两半都会暴露合并后的处理器，只读取坐标较小的一半。 */
-    private static boolean isSecondaryVanillaChestHalf(ServerPlayer player, BlockPos pos) {
-        BlockState state = player.serverLevel().getBlockState(pos);
-        if (!(state.getBlock() instanceof ChestBlock)
-                || state.getValue(ChestBlock.TYPE) == ChestType.SINGLE) {
-            return false;
-        }
-        BlockPos connectedPos = pos.relative(ChestBlock.getConnectedDirection(state));
-        return pos.compareTo(connectedPos) > 0;
-    }
-
-    /** 委托 FindMeExtended 的提取器，从周围容器取回指定数量的物品。 */
-    public static int pull(ServerPlayer player, ItemStack stack, int amount) {
+    /**
+     * 一次扫描周围容器后按顺序取回多种材料。
+     * 返回每种材料实际取回的数量，顺序与传入列表一致。
+     * 分批扫描是必要的：逐种材料各自扫描一遍整个搜索范围会成倍放大服务端主线程开销。
+     */
+    public static int[] pullAll(ServerPlayer player, List<ItemStack> requirements) {
         ReflectionAccess reflection = getAccess();
-        if (player == null || reflection == null || stack.isEmpty() || amount <= 0) {
-            return 0;
+        int[] pulled = new int[requirements.size()];
+        if (player == null || reflection == null || requirements.isEmpty()) {
+            return pulled;
         }
-        return reflection.pull(player, stack.copyWithCount(1), amount);
+        List<BlockEntity> containers = reflection.collectNearbyBlockEntities(player);
+        if (containers.isEmpty()) {
+            return pulled;
+        }
+        for (int index = 0; index < requirements.size(); index++) {
+            ItemStack requirement = requirements.get(index);
+            if (requirement.isEmpty() || requirement.getCount() <= 0) {
+                continue;
+            }
+            pulled[index] = reflection.pull(containers, player,
+                    requirement.copyWithCount(1), requirement.getCount());
+        }
+        return pulled;
     }
 
     /** 复制 Forge 物品处理器的内容，不修改容器状态。 */
@@ -101,10 +105,28 @@ public final class FindMeExtendedAdapter {
         }
     }
 
+    /** 双箱子的两半都会暴露合并后的处理器，只读取坐标较小的一半。 */
+    private static boolean isSecondaryVanillaChestHalf(Level level, BlockPos pos) {
+        BlockState state = level.getBlockState(pos);
+        if (!(state.getBlock() instanceof ChestBlock)
+                || state.getValue(ChestBlock.TYPE) == ChestType.SINGLE) {
+            return false;
+        }
+        BlockPos connectedPos = pos.relative(ChestBlock.getConnectedDirection(state));
+        return pos.compareTo(connectedPos) > 0;
+    }
+
+    /** 判断坐标是否落在以玩家为中心的搜索立方体内。 */
+    private static boolean isInsideSearchBox(BlockPos pos, BlockPos min, BlockPos max) {
+        return pos.getX() >= min.getX() && pos.getX() <= max.getX()
+                && pos.getY() >= min.getY() && pos.getY() <= max.getY()
+                && pos.getZ() >= min.getZ() && pos.getZ() <= max.getZ();
+    }
+
     /** 延迟初始化可选模组接口，避免缺少依赖时触发类加载异常。 */
     private static ReflectionAccess getAccess() {
         ReflectionAccess current = access;
-        if (current != null || initializationFailed || !ModList.get().isLoaded(FIND_ME_ID)) {
+        if (current != null || initializationFailed || !isModPresent()) {
             return current;
         }
         synchronized (FindMeExtendedAdapter.class) {
@@ -199,6 +221,40 @@ public final class FindMeExtendedAdapter {
             }
         }
 
+        /**
+         * 枚举搜索范围内所有已加载区块的方块实体。
+         * 逐格遍历 (2r+1)^3 个坐标再逐个查询方块实体代价极高（半径 32 时为 27 万次），
+         * 按区块读取方块实体表能把开销降到与实际存在的方块实体数量同阶。
+         */
+        private List<BlockEntity> collectNearbyBlockEntities(ServerPlayer player) {
+            int radius = getSafeRadius();
+            BlockPos center = player.blockPosition();
+            ServerLevel level = player.serverLevel();
+            BlockPos min = center.offset(-radius, -radius, -radius);
+            BlockPos max = center.offset(radius, radius, radius);
+            List<BlockEntity> result = new ArrayList<>();
+            for (int chunkX = min.getX() >> 4; chunkX <= max.getX() >> 4; chunkX++) {
+                for (int chunkZ = min.getZ() >> 4; chunkZ <= max.getZ() >> 4; chunkZ++) {
+                    if (!level.getChunkSource().hasChunk(chunkX, chunkZ)) {
+                        continue;
+                    }
+                    LevelChunk chunk = level.getChunk(chunkX, chunkZ);
+                    for (Map.Entry<BlockPos, BlockEntity> entry : chunk.getBlockEntities().entrySet()) {
+                        BlockPos pos = entry.getKey();
+                        if (!isInsideSearchBox(pos, min, max)
+                                || isSecondaryVanillaChestHalf(level, pos)) {
+                            continue;
+                        }
+                        BlockEntity blockEntity = entry.getValue();
+                        if (blockEntity != null) {
+                            result.add(blockEntity);
+                        }
+                    }
+                }
+            }
+            return result;
+        }
+
         /** 读取方块实体的 AE2 MEStorage 内容。 */
         private void copyAe2Contents(BlockEntity blockEntity, List<ItemStack> output,
                                      Set<Object> visitedStorages) {
@@ -258,43 +314,31 @@ public final class FindMeExtendedAdapter {
             }
         }
 
-        /** 调用 FindMeExtended 提取器并隔离单个提取器异常。 */
-        private int pull(ServerPlayer player, ItemStack stack, int amount) {
-            int pulled = 0;
-            int radius = getSafeRadius();
-            BlockPos center = player.blockPosition();
+        /** 在已收集的方块实体中提取指定材料，隔离单个提取器的异常。 */
+        private int pull(List<BlockEntity> containers, ServerPlayer player, ItemStack stack, int amount) {
+            int extracted = 0;
             List<?> extractorSnapshot = List.copyOf(extractors);
-            for (BlockPos pos : BlockPos.betweenClosed(center.offset(-radius, -radius, -radius),
-                    center.offset(radius, radius, radius))) {
-                if (pulled >= amount) {
+            for (BlockEntity blockEntity : containers) {
+                if (extracted >= amount) {
                     break;
-                }
-                if (!player.serverLevel().hasChunkAt(pos)
-                        || isSecondaryVanillaChestHalf(player, pos)) {
-                    continue;
-                }
-                BlockEntity blockEntity = player.serverLevel().getBlockEntity(pos);
-                if (blockEntity == null) {
-                    continue;
                 }
                 for (Object extractor : extractorSnapshot) {
                     try {
                         Object value = pullMethod.invoke(extractor, blockEntity, stack,
-                                amount - pulled, player);
-                        if (value instanceof Integer extracted && extracted > 0) {
-                            pulled = Math.min(amount, pulled + extracted);
+                                amount - extracted, player);
+                        if (value instanceof Integer pulled && pulled > 0) {
+                            extracted = Math.min(amount, extracted + pulled);
                         }
                     } catch (ReflectiveOperationException | RuntimeException exception) {
-                        LOGGER.warn("FindMeExtended 提取器处理 {} 时失败", pos, exception);
+                        LOGGER.warn("FindMeExtended 提取器处理 {} 时失败",
+                                blockEntity.getBlockPos(), exception);
                     }
-                    if (pulled >= amount) {
+                    if (extracted >= amount) {
                         break;
                     }
                 }
             }
-            return pulled;
+            return extracted;
         }
     }
 }
-
-

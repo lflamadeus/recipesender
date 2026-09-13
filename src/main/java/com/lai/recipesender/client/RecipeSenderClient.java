@@ -35,6 +35,7 @@ import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
 import org.lwjgl.glfw.GLFW;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
@@ -47,6 +48,8 @@ public final class RecipeSenderClient {
     private static final int CONTROL_STEP = 64;
     private static final int SHIFT_STEP = 8;
     private static final long AVAILABILITY_REFRESH_INTERVAL_TICKS = 10L;
+    /** 服务端统计请求的等待上限；超时后解除等待，避免界面永久卡在“统计中”。 */
+    private static final long AVAILABILITY_TIMEOUT_TICKS = 40L;
     private static final AtomicLong REQUEST_SEQUENCE = new AtomicLong();
 
     private static final KeyMapping INSERT_RECIPE_KEY = new KeyMapping(
@@ -61,12 +64,13 @@ public final class RecipeSenderClient {
     private static boolean awaitingAvailability;
     private static boolean releasePending;
     private static boolean selectAllRequested;
-    private static boolean reverseKeyAvailable;
     private static boolean nearbyAvailabilityReceived;
     private static int selectedBatches;
     private static int availableBatches;
+    private static int insertableBatches;
     private static long clientTicks;
     private static long nextAvailabilityRefreshTick;
+    private static long availabilityRequestTick;
     private static long activeRequestId;
     private static Set<Integer> highlightedInventorySlots = Set.of();
     private static Screen activeScreen;
@@ -83,13 +87,31 @@ public final class RecipeSenderClient {
         modBus.addListener(RecipeSenderClient::registerKeyMappings);
     }
 
-    /** 注册基础按键；只有 FindMeExtended 可用时才注册反转按键。 */
+    /** 注册基础按键；只有 FindMeExtended 存在时才注册反转按键。 */
     private static void registerKeyMappings(RegisterKeyMappingsEvent event) {
         event.register(INSERT_RECIPE_KEY);
-        reverseKeyAvailable = FindMeExtendedAdapter.isAvailable();
-        if (reverseKeyAvailable) {
+        // 这里只判断模组是否存在，不触发可选模组的反射初始化：
+        // 注册阶段一旦初始化失败就会被永久标记，导致反转功能再也无法启用。
+        if (FindMeExtendedAdapter.isModPresent()) {
             event.register(REVERSE_KEY);
         }
+    }
+
+    /**
+     * 判断反转按键当前是否按下。
+     * 直接读取实时按键绑定并查询 GLFW 原始状态，因此玩家在控制设置里改键后立即生效；
+     * 不能依赖 KeyMapping.isDown()，它在 GUI 冲突上下文下并不可靠。
+     */
+    private static boolean isReverseKeyHeld() {
+        // getKey() 不会返回 null，未绑定时给的是 InputConstants.UNKNOWN（value 为 -1），
+        // 因此只需要用 value > 0 排除“未绑定”这一种情况。
+        InputConstants.Key bound = REVERSE_KEY.getKey();
+        if (bound.getType() == InputConstants.Type.KEYSYM
+                && bound.getValue() > 0 && isGlfwKeyDown(bound.getValue())) {
+            return true;
+        }
+        // 绑定到鼠标按键等非键盘输入时退回 KeyMapping 自身状态。
+        return REVERSE_KEY.isDown();
     }
 
     /** 处理 Alt、Z 和配方反转键的按下与松开事件。 */
@@ -97,7 +119,7 @@ public final class RecipeSenderClient {
     public static void onKeyInput(InputEvent.Key event) {
         if (event.getAction() == GLFW.GLFW_PRESS && selecting && isAltKey(event)) {
             selectAllRequested = true;
-            selectedBatches = availableBatches;
+            selectedBatches = maxSendableBatches();
             return;
         }
         if (!INSERT_RECIPE_KEY.matches(event.getKey(), event.getScanCode())) {
@@ -123,6 +145,10 @@ public final class RecipeSenderClient {
         Minecraft minecraft = Minecraft.getInstance();
         if (minecraft.screen != activeScreen || !isActiveTarget(EmiApi.getHoveredStack(true))) {
             cancelSelection();
+            return;
+        }
+        if (awaitingAvailability && clientTicks - availabilityRequestTick >= AVAILABILITY_TIMEOUT_TICKS) {
+            onAvailabilityTimeout();
             return;
         }
         if (!reverseMode && clientTicks >= nextAvailabilityRefreshTick) {
@@ -170,15 +196,25 @@ public final class RecipeSenderClient {
         String availableKey = reverseMode
                 ? "text.recipe_sender.nearby_available_count"
                 : "text.recipe_sender.available_count";
-        Component availableText = getCountText(availableKey, availableBatches,
-                reverseMode ? "周围现有" : "背包现有");
-        Component sendText = getCountText(reverseMode
+        List<Component> lines = new ArrayList<>(3);
+        List<Integer> colors = new ArrayList<>(3);
+        lines.add(getCountText(availableKey, availableBatches,
+                reverseMode ? "周围现有" : "背包现有"));
+        colors.add(0xB8B8B8);
+        lines.add(getCountText(reverseMode
                         ? "text.recipe_sender.pull_count" : "text.recipe_sender.send_count",
-                selectedBatches, reverseMode ? "取回" : "发送");
-        int availableWidth = minecraft.font.width(availableText);
-        int sendWidth = minecraft.font.width(sendText);
-        int width = Math.max(availableWidth, sendWidth);
-        int textHeight = minecraft.font.lineHeight * 2 + 2;
+                selectedBatches, reverseMode ? "取回" : "发送"));
+        colors.add(0xFFFFFF);
+        if (!reverseMode && insertableBatches < availableBatches) {
+            // 目标容器成为瓶颈时明确提示上限，避免玩家以为滚轮失效。
+            lines.add(getCountText("text.recipe_sender.target_limit", insertableBatches,
+                    "目标最多接收"));
+            colors.add(0x9AD9FF);
+        }
+
+        int width = lines.stream().mapToInt(line -> minecraft.font.width(line)).max().orElse(0);
+        int lineHeight = minecraft.font.lineHeight + 2;
+        int textHeight = lineHeight * lines.size();
         int x = Math.max(2, Math.min(mouseX - width / 2, event.getScreen().width - width - 2));
         int y = mouseY - textHeight - 6;
         if (y < 2) {
@@ -187,11 +223,12 @@ public final class RecipeSenderClient {
         graphics.pose().pushPose();
         graphics.pose().translate(0.0D, 0.0D, 1000.0D);
         graphics.fill(x - 2, y - 2, x + width + 2, y + textHeight + 2, 0xB0000000);
-        graphics.drawString(minecraft.font, availableText,
-                x + (width - availableWidth) / 2, y, 0xB8B8B8, true);
-        graphics.drawString(minecraft.font, sendText,
-                x + (width - sendWidth) / 2, y + minecraft.font.lineHeight + 2,
-                0xFFFFFF, true);
+        for (int index = 0; index < lines.size(); index++) {
+            Component line = lines.get(index);
+            graphics.drawString(minecraft.font, line,
+                    x + (width - minecraft.font.width(line)) / 2, y + index * lineHeight,
+                    colors.get(index), true);
+        }
         graphics.pose().popPose();
     }
 
@@ -209,8 +246,7 @@ public final class RecipeSenderClient {
         }
 
         selecting = true;
-        reverseMode = reverseKeyAvailable
-                && (REVERSE_KEY.isDown() || isGlfwKeyDown(GLFW.GLFW_KEY_GRAVE_ACCENT));
+        reverseMode = FindMeExtendedAdapter.isAvailable() && isReverseKeyHeld();
         selectAllRequested = isAltDown();
         selectedBatches = reverseMode ? 0 : 1;
         activeScreen = minecraft.screen;
@@ -232,7 +268,7 @@ public final class RecipeSenderClient {
         } else {
             refreshInventoryAvailability(minecraft);
             if (selectAllRequested) {
-                selectedBatches = availableBatches;
+                selectedBatches = maxSendableBatches();
             }
             nextAvailabilityRefreshTick = clientTicks + AVAILABILITY_REFRESH_INTERVAL_TICKS;
         }
@@ -245,6 +281,7 @@ public final class RecipeSenderClient {
         }
         awaitingAvailability = true;
         activeRequestId = REQUEST_SEQUENCE.incrementAndGet();
+        availabilityRequestTick = clientTicks;
         ModNetwork.CHANNEL.sendToServer(new NearbyRecipeQueryPacket(activeRequestId, activeSpecs));
     }
 
@@ -265,8 +302,12 @@ public final class RecipeSenderClient {
         }
 
         Minecraft minecraft = Minecraft.getInstance();
+        // 选择的份数超过目标容器能容纳的数量时，按目标容器可容纳的份数发送；
+        // 这里重新估算一次，避免使用最多 10 tick 前的旧值。
+        int batches = RecipeMaterialCollector.countInsertableBatches(activeRecipe, minecraft.player,
+                activeContainer.getMenu(), Math.min(selectedBatches, availableBatches));
         RecipeMaterialCollector.CollectionResult result =
-                RecipeMaterialCollector.collect(activeRecipe, minecraft.player, selectedBatches);
+                RecipeMaterialCollector.collect(activeRecipe, minecraft.player, batches);
         if (result.success()) {
             List<ItemStack> requirements = result.requirements();
             ModNetwork.CHANNEL.sendToServer(new InsertRecipeItemsPacket(
@@ -299,6 +340,19 @@ public final class RecipeSenderClient {
         }
     }
 
+    /**
+     * 服务端长时间没有返回统计结果时解除等待。
+     * 否则一旦数据包丢失，滚轮和松开按键都会被 awaitingAvailability 永久阻断。
+     */
+    private static void onAvailabilityTimeout() {
+        awaitingAvailability = false;
+        nextAvailabilityRefreshTick = clientTicks + AVAILABILITY_REFRESH_INTERVAL_TICKS;
+        if (releasePending) {
+            sendPullRequest();
+            cancelSelection();
+        }
+    }
+
     /** 向服务端发送反向取回请求。 */
     private static void sendPullRequest() {
         if (selectedBatches > 0 && !activeSpecs.isEmpty()) {
@@ -318,19 +372,31 @@ public final class RecipeSenderClient {
                 && getRecipe(hovered) == activeRecipe;
     }
 
-    /** 刷新背包可制作份数和材料槽位高亮。 */
+    /** 刷新背包可制作份数、目标槽可容纳份数和材料槽位高亮。 */
     private static void refreshInventoryAvailability(Minecraft minecraft) {
         availableBatches = RecipeMaterialCollector.countAvailableBatches(activeRecipe,
                 minecraft.player);
         highlightedInventorySlots = RecipeMaterialCollector.findMatchingInventorySlots(
                 activeRecipe, minecraft.player);
-        if (availableBatches == 0) {
+        insertableBatches = activeContainer == null ? 0
+                : RecipeMaterialCollector.countInsertableBatches(activeRecipe, minecraft.player,
+                        activeContainer.getMenu(), availableBatches);
+        int ceiling = maxSendableBatches();
+        if (ceiling == 0) {
             selectedBatches = 0;
         } else if (selectedBatches == 0) {
             selectedBatches = 1;
         } else {
-            selectedBatches = Math.min(selectedBatches, availableBatches);
+            selectedBatches = Math.min(selectedBatches, ceiling);
         }
+    }
+
+    /**
+     * 当前最多可发送的份数：反向模式只看周围存量；
+     * 正向模式还要受目标容器容量限制。
+     */
+    private static int maxSendableBatches() {
+        return reverseMode ? availableBatches : Math.min(availableBatches, insertableBatches);
     }
 
     /** 绘制当前配方匹配的背包槽位。 */
@@ -372,23 +438,24 @@ public final class RecipeSenderClient {
 
     /** 根据修饰键和滚轮方向计算新的份数。 */
     private static int adjustBatches(int current, double scrollDelta) {
-        if (availableBatches == 0) {
+        int ceiling = maxSendableBatches();
+        if (ceiling == 0) {
             return 0;
         }
         int direction = scrollDelta > 0 ? 1 : -1;
         if (isAltDown()) {
             selectAllRequested = true;
-            return availableBatches;
+            return ceiling;
         }
         if (isControlDown()) {
             if (direction > 0) {
                 int next = current == 1 ? CONTROL_STEP : current + CONTROL_STEP;
-                return Math.min(availableBatches, Math.min(RecipeIngredientSpec.MAX_BATCHES, next));
+                return Math.min(ceiling, Math.min(RecipeIngredientSpec.MAX_BATCHES, next));
             }
             return Math.max(1, current <= CONTROL_STEP ? 1 : current - CONTROL_STEP);
         }
         int step = isShiftDown() ? SHIFT_STEP : 1;
-        return Math.max(1, Math.min(availableBatches,
+        return Math.max(1, Math.min(ceiling,
                 Math.min(RecipeIngredientSpec.MAX_BATCHES, current + direction * step)));
     }
 
@@ -433,6 +500,7 @@ public final class RecipeSenderClient {
         nearbyAvailabilityReceived = false;
         selectedBatches = 0;
         availableBatches = 0;
+        insertableBatches = 0;
         activeRequestId = 0;
         activeScreen = null;
         activeContainer = null;

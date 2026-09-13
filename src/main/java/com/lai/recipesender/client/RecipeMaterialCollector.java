@@ -2,11 +2,13 @@ package com.lai.recipesender.client;
 
 import com.lai.recipesender.model.RecipeIngredientSpec;
 import com.lai.recipesender.network.packet.InsertRecipeItemsPacket;
+import com.lai.recipesender.service.TransferPlanner;
 import dev.emi.emi.api.recipe.EmiRecipe;
 import dev.emi.emi.api.stack.EmiIngredient;
 import dev.emi.emi.api.stack.EmiStack;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.item.ItemStack;
 
 import java.util.ArrayList;
@@ -35,6 +37,41 @@ final class RecipeMaterialCollector {
             }
         }
         return lower;
+    }
+
+    /**
+     * 统计当前目标容器还能接收的最大配方份数。
+     * 结果同时受背包存量和目标槽位容量限制，用于“尽可能发送”功能。
+     * 规划器与服务端共用同一份实现，因此这里的估算与真正的投放判定一致。
+     */
+    static int countInsertableBatches(EmiRecipe recipe, Player player, AbstractContainerMenu menu,
+                                      int availableBatches) {
+        int upperBound = Math.min(availableBatches, RecipeIngredientSpec.MAX_BATCHES);
+        if (recipe == null || player == null || menu == null || upperBound < 1) {
+            return 0;
+        }
+        int lower = 0;
+        int upper = upperBound + 1;
+        while (lower + 1 < upper) {
+            int candidate = lower + (upper - lower) / 2;
+            if (canInsert(recipe, player, menu, candidate)) {
+                lower = candidate;
+            } else {
+                upper = candidate;
+            }
+        }
+        return lower;
+    }
+
+    /** 判断背包材料能否完整放进当前目标槽位。 */
+    private static boolean canInsert(EmiRecipe recipe, Player player, AbstractContainerMenu menu,
+                                     int batches) {
+        if (batches < 1) {
+            return true;
+        }
+        CollectionResult result = collect(recipe, player, batches);
+        return result.success() && TransferPlanner.create(player.getInventory(), menu,
+                result.requirements()) != null;
     }
 
     /** 找出当前配方匹配的背包槽位，用于界面高亮。 */

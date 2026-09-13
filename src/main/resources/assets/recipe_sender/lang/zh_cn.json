@@ -5,5 +5,6 @@
   "text.recipe_sender.available_count": "背包现有 %s 份",
   "text.recipe_sender.nearby_available_count": "背包与周围现有 %s 份",
   "text.recipe_sender.send_count": "发送 %s 份",
-  "text.recipe_sender.pull_count": "取回 %s 份"
+  "text.recipe_sender.pull_count": "取回 %s 份",
+  "text.recipe_sender.target_limit": "目标最多接收 %s 份"
 }
