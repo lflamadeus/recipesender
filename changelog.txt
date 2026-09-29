@@ -1,6 +1,11 @@
 更新日志
 ========
 
+1.0.15 - 2026-09-29
+-------------------
+- 文档：README 第 6 条的黑名单高亮说明跟上 FindMeExtended 1.0.3 的新画法。原来写的是 1.0.2 的「每个方块一圈描边、颜色见 CLIENT.BLACKLIST_HIGHLIGHT_COLOR、默认亮红」，现在改为两层画法：亮黄轮廓 CLIENT.BLACKLIST_HIGHLIGHT_COLOR（默认 #FFE533）+ 深灰半透明填充 CLIENT.BLACKLIST_FILL_COLOR（默认 #2D2D2D）、不透明度 CLIENT.BLACKLIST_FILL_ALPHA（默认 0.52，设为 0 就只剩轮廓）；并补上双箱子的两半都会高亮、换上工具当帧就出高亮（不用等服务端往返）两条。
+- 说明：本版只改文档与版本号，没有代码改动。反转搜索共用黑名单的行为、网络协议（仍为版本 3）均未变化；黑名单仍由 FindMeExtended 提供，需要 1.0.2 或更高版本。
+
 1.0.14 - 2026-09-29
 -------------------
 - 修复（关键）：按住反转键完全没有反应。FindMeExtended 1.0.2 把包名从 com.lflamadeus.findmeextended 改成了 com.lai.findmeextended，而本模组兼容层里还写死着旧包名——FindMeExtendedAdapter 的 ReflectionAccess.create() 里 Class.forName("com.lflamadeus.findmeextended.FindMeMod") 与 IInventoryPuller 两处没跟着改。于是反射初始化抛 ClassNotFoundException，initializationFailed 被永久置位，isAvailable() 恒为 false：反转模式（reverseMode = isAvailable() && 按住反转键）永远进不去，服务端那边的统计与取回也一起失效，表现就是“按住反转键 + Z”和普通按 Z 没有任何区别。日志里会有一条 “无法初始化 FindMeExtended 兼容层，反转功能已禁用”。
