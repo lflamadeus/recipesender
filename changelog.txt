@@ -1,6 +1,13 @@
 更新日志
 ========
 
+1.0.14 - 2026-09-29
+-------------------
+- 修复（关键）：按住反转键完全没有反应。FindMeExtended 1.0.2 把包名从 com.lflamadeus.findmeextended 改成了 com.lai.findmeextended，而本模组兼容层里还写死着旧包名——FindMeExtendedAdapter 的 ReflectionAccess.create() 里 Class.forName("com.lflamadeus.findmeextended.FindMeMod") 与 IInventoryPuller 两处没跟着改。于是反射初始化抛 ClassNotFoundException，initializationFailed 被永久置位，isAvailable() 恒为 false：反转模式（reverseMode = isAvailable() && 按住反转键）永远进不去，服务端那边的统计与取回也一起失效，表现就是“按住反转键 + Z”和普通按 Z 没有任何区别。日志里会有一条 “无法初始化 FindMeExtended 兼容层，反转功能已禁用”。
+- 改法：兼容层不再写死单一包名，改为按候选包名列表加载（新包名 com.lai.findmeextended 优先，其次旧的 com.lflamadeus.findmeextended），FindMeMod / IInventoryPuller / api.FindMeBlacklistApi 三处都走同一个 findMeClass 助手。这样既修好新版，也让仍在用 FindMeExtended 1.0.1 及更早版本的玩家继续保有反转搜索（那些版本只是没有黑名单接口）。全部候选都找不到时抛出的异常会列出尝试过的包名，下次再遇到改名能直接从日志看出原因。
+- 改进：反转搜索不可用时不再静默失效。按住反转键按 Z 会直接给出提示——没装 FindMeExtended 时提示“反转搜索需要安装 FindMeExtended”，装了但兼容层初始化失败时提示“反转搜索需要 FindMeExtended 1.0.2 或更高版本，当前版本不兼容”，同时每次会话记一条 WARN 日志。提示出现时这次操作会被中止，而不是悄悄退化成正向发送（那会把玩家背包里的材料送进机器，与按住反转键的意图相反）。
+- 说明：本次只改兼容层的类名解析与错误提示，未改动网络协议（仍为版本 3）、黑名单共用逻辑或任何传输行为；黑名单仍由 FindMeExtended 1.0.2 提供。
+
 1.0.13 - 2026-09-29
 -------------------
 - 新增：反转搜索共用 FindMeExtended 的容器黑名单。黑名单本体做在 FindMeExtended 1.0.2 里（黑名单工具、持续高亮、潜行右键加入 / 潜行左键移出、按维度存档、只认坐标，见该模组的说明），本模组不再自己维护一份，只在反转搜索里把黑名单坐标排除掉：被列入黑名单的容器既不计入“背包与周围现有 X 份”，也不会被取回，与 FindMeExtended 自己的“查找物品 / 取出物品”口径一致。

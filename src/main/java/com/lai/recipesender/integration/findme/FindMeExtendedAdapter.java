@@ -35,6 +35,16 @@ public final class FindMeExtendedAdapter {
     private static final String FIND_ME_ID = "findmeextended";
     private static final String AE2_ID = "ae2";
     private static final int MAX_SAFE_RADIUS = 32;
+    /**
+     * FindMeExtended 的包名候选，按新到旧排列。
+     * <p>
+     * 1.0.2 起作者把包名从 {@code com.lflamadeus.findmeextended} 改成了 {@code com.lai.findmeextended}。
+     * 兼容层原本写死旧包名，改名之后反射初始化直接抛 ClassNotFoundException、
+     * {@link #isAvailable()} 恒为 false，表现就是「按住反转键完全没有反应」（1.0.13 的故障）。
+     * 这里两个都试：新版走新包名，仍在用 1.0.1 及更早版本的玩家也不会因此丢掉反转搜索。
+     */
+    private static final String[] FIND_ME_PACKAGES = {
+            "com.lai.findmeextended", "com.lflamadeus.findmeextended"};
 
     private static volatile ReflectionAccess access;
     private static volatile boolean initializationFailed;
@@ -56,6 +66,25 @@ public final class FindMeExtendedAdapter {
     /** 判断 FindMeExtended 是否存在且兼容接口初始化成功。 */
     public static boolean isAvailable() {
         return isModPresent() && getAccess() != null;
+    }
+
+    /**
+     * 按包名候选加载 FindMeExtended 的类。
+     *
+     * @param relativeName 相对包名的类名，可以带子包（例如 {@code api.FindMeBlacklistApi}）
+     * @throws ClassNotFoundException 所有候选包名里都没有这个类
+     */
+    private static Class<?> findMeClass(String relativeName) throws ClassNotFoundException {
+        ClassNotFoundException failure = null;
+        for (String packageName : FIND_ME_PACKAGES) {
+            try {
+                return Class.forName(packageName + "." + relativeName);
+            } catch (ClassNotFoundException exception) {
+                failure = exception;
+            }
+        }
+        throw new ClassNotFoundException("FindMeExtended 里找不到 " + relativeName
+                + "（已尝试 " + String.join("、", FIND_ME_PACKAGES) + "）", failure);
     }
 
     /**
@@ -102,8 +131,7 @@ public final class FindMeExtendedAdapter {
                 return null;
             }
             try {
-                Class<?> apiClass = Class.forName(
-                        "com.lai.findmeextended.api.FindMeBlacklistApi");
+                Class<?> apiClass = findMeClass("api.FindMeBlacklistApi");
                 blacklistMethod = apiClass.getMethod("blacklistedPositions", ServerLevel.class);
             } catch (ReflectiveOperationException | RuntimeException exception) {
                 blacklistUnavailable = true;
@@ -217,7 +245,8 @@ public final class FindMeExtendedAdapter {
                 access = ReflectionAccess.create();
             } catch (ReflectiveOperationException | RuntimeException exception) {
                 initializationFailed = true;
-                LOGGER.error("无法初始化 FindMeExtended 兼容层，反转功能已禁用", exception);
+                LOGGER.error("无法初始化 FindMeExtended 兼容层，反转搜索已禁用（按住反转键不会有反应）",
+                        exception);
             }
             return access;
         }
@@ -245,17 +274,16 @@ public final class FindMeExtendedAdapter {
 
         /** 创建 FindMeExtended、Forge capability 和 AE2 API 的反射访问器。 */
         private static ReflectionAccess create() throws ReflectiveOperationException {
-            Class<?> findMeClass = Class.forName("com.lflamadeus.findmeextended.FindMeMod");
-            Object config = findMeClass.getField("CONFIG").get(null);
+            Class<?> findMeModClass = findMeClass("FindMeMod");
+            Object config = findMeModClass.getField("CONFIG").get(null);
             Object common = config.getClass().getField("COMMON").get(config);
             Field radius = common.getClass().getField("RADIUS_RANGE");
 
-            Object extractorValue = findMeClass.getField("BLOCK_EXTRACTORS").get(null);
+            Object extractorValue = findMeModClass.getField("BLOCK_EXTRACTORS").get(null);
             if (!(extractorValue instanceof List<?> extractorList)) {
                 throw new IllegalStateException("FindMeExtended 提取器列表类型不兼容");
             }
-            Class<?> pullerClass = Class.forName(
-                    "com.lflamadeus.findmeextended.IInventoryPuller");
+            Class<?> pullerClass = findMeClass("IInventoryPuller");
             Method pull = pullerClass.getMethod("pull", BlockEntity.class, ItemStack.class,
                     int.class, net.minecraft.world.entity.player.Player.class);
 

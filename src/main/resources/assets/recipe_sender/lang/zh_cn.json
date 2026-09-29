@@ -7,5 +7,7 @@
   "text.recipe_sender.send_count": "发送 %s 份",
   "text.recipe_sender.pull_count": "取回 %s 份",
   "text.recipe_sender.target_limit": "目标最多接收 %s 份",
-  "text.recipe_sender.circuit": "电路 #%s"
+  "text.recipe_sender.circuit": "电路 #%s",
+  "text.recipe_sender.reverse_missing": "反转搜索需要安装 FindMeExtended",
+  "text.recipe_sender.reverse_incompatible": "反转搜索需要 FindMeExtended 1.0.2 或更高版本，当前版本不兼容"
 }

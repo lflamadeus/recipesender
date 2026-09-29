@@ -72,6 +72,8 @@ public final class RecipeSenderClient {
     private static boolean selectAllRequested;
     private static boolean nearbyAvailabilityReceived;
     private static boolean bindingLogged;
+    /** 反转搜索不可用的提示每次会话只写一条日志，避免玩家反复按键刷屏。 */
+    private static boolean reverseUnavailableLogged;
     /**
      * 等待服务端统计结果期间攒下的滚轮格数（正数向上）。
      * 这段窗口里滚轮不能直接改份数（可发送上限还没刷新），但事件必须被吞掉，
@@ -184,9 +186,44 @@ public final class RecipeSenderClient {
     }
 
     /**
-     * 每次启动只记录一次反转键的真实绑定，用于排查“改了键却不生效”这类问题：
-     * 日志会给出模组读到的键名，以及这个 KeyMapping 是否真的进了控制设置的列表
-     * （只有进了列表的按键，options.txt 里保存的绑定才会被写回）。
+     * 玩家按住反转键、但反转搜索不可用时给出明确原因。
+     * <p>
+     * 区分“没装”和“装了但不兼容”两种情况：前者是玩家漏装可选依赖，后者几乎总是
+     * FindMeExtended 换了包名或改动了兼容层依赖的类/字段/方法。过去这两种情况都只是
+     * 静默失效（按住反转键毫无反应、也没有任何提示），排查只能靠翻日志。
+     */
+    private static void warnReverseUnavailable(Minecraft minecraft) {
+        if (minecraft.player == null) {
+            return;
+        }
+        boolean installed = FindMeExtendedAdapter.isModPresent();
+        if (!reverseUnavailableLogged) {
+            reverseUnavailableLogged = true;
+            LOGGER.warn("反转搜索不可用：FindMeExtended 已安装 = {}", installed);
+        }
+        minecraft.player.displayClientMessage(installed
+                ? getMessage("text.recipe_sender.reverse_incompatible",
+                        "反转搜索需要 FindMeExtended 1.0.2 或更高版本，当前版本不兼容")
+                : getMessage("text.recipe_sender.reverse_missing",
+                        "反转搜索需要安装 FindMeExtended"), false);
+    }
+
+    /** 生成带语言文件回退文本的提示。 */
+    private static Component getMessage(String key, String fallback) {
+        String text = I18n.get(key);
+        if (text.equals(key) || text.startsWith("Format error:")) {
+            return Component.literal(fallback);
+        }
+        return Component.literal(text);
+    }
+
+    /**
+     * 每次启动只记录一次反转键的真实绑定和反转搜索是否可用，用于排查“按住反转键没反应”这类问题：
+     * 日志会给出模组读到的键名、这个 KeyMapping 是否真的进了控制设置的列表
+     * （只有进了列表的按键，options.txt 里保存的绑定才会被写回），以及兼容层能否初始化。
+     * <p>
+     * 可用性这一项是有意留着的：1.0.13 里 FindMeExtended 改名导致兼容层初始化失败时，
+     * 表现是“按住反转键毫无反应”，而日志里一条记录都没有，只能靠猜。
      */
     private static void logReverseBinding(Minecraft minecraft) {
         bindingLogged = true;
@@ -197,8 +234,8 @@ public final class RecipeSenderClient {
                 break;
             }
         }
-        LOGGER.info("反转键绑定 = {}，已进入控制设置列表 = {}",
-                REVERSE_KEY.getKey().getName(), registered);
+        LOGGER.info("反转键绑定 = {}，已进入控制设置列表 = {}，反转搜索可用 = {}",
+                REVERSE_KEY.getKey().getName(), registered, FindMeExtendedAdapter.isAvailable());
     }
 
     /**
@@ -385,8 +422,15 @@ public final class RecipeSenderClient {
             return;
         }
 
+        boolean reverseRequested = isReverseKeyHeld();
+        if (reverseRequested && !FindMeExtendedAdapter.isAvailable()) {
+            // 反转搜索完全依赖 FindMeExtended 的容器扫描与提取器。不可用时必须中止并明说：
+            // 悄悄退化成正向发送会把玩家背包里的材料送进机器，和按住反转键的意图正好相反。
+            warnReverseUnavailable(minecraft);
+            return;
+        }
         selecting = true;
-        reverseMode = FindMeExtendedAdapter.isAvailable() && isReverseKeyHeld();
+        reverseMode = reverseRequested;
         selectAllRequested = isAltDown();
         selectedBatches = reverseMode ? 0 : 1;
         pendingScrollNotches = 0;
