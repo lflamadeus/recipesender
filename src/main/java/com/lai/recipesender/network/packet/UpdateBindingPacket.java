@@ -10,8 +10,8 @@ import java.util.function.Supplier;
 /**
  * 客户端请求修改一条已有绑定的名字。
  *
- * <p>刻意只带名称：S1 的可改字段只有名字。类别（{@code routeKeys}）是 S6 的事，
- * 容器关系（{@code role} / {@code parentId}）是 S2 的事，届时各加各的字段，
+ * <p>刻意只带名称：改名走它，配方类别（{@code routeKeys}）走 {@link UpdateBindingRoutesPacket}，
+ * 容器关系（{@code role} / {@code parentId}）走 {@link UpdateBindingRelationPacket}，
  * 不让一个包同时承担三种语义——服务端按包做校验时也能一眼看出在改什么。
  *
  * <p>服务端只用 id 定位、只取名称，其余字段一律以服务端自己存的那份为准。

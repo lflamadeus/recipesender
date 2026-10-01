@@ -19,6 +19,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -39,12 +40,13 @@ public final class BoundContainerService {
     private static final String KEY_LAST_CHOICE = "recipe_sender:last_choice";
 
     /**
-     * S1 阶段还没有真实的路由键（{@code routeKeys} 一律为空，配方类别路由是 S6 的事），
-     * 所以玩家在弹窗里手选的结果全部记在这一个键下。
+     * 「认不出路由键」时的兜底记忆键。
+     *
+     * <p>S1–S5 没有真实路由键，玩家在弹窗里手选的结果全部记在这一个键下；S6 起自动路由按各自的
+     * 路由键分别记录（{@link #KEY_LAST_CHOICE}），本键只在「连类别都认不出来、玩家自己挑了一个」
+     * 时才用得上。
      *
      * <p>用命名空间自己的 id 而不是空串：空串做 NBT 键名合法但极易写错，也看不出是「手选」。
-     * S6 接上真实路由键后，自动路由命中的发送单元按各自的路由键分别记录，本键仍然保留，
-     * 用于「没有任何路由命中、玩家自己挑了一个」这种场景。
      */
     public static final ResourceLocation MANUAL_ROUTE =
             ResourceLocation.fromNamespaceAndPath(RecipeSenderMod.MOD_ID, "manual");
@@ -93,6 +95,18 @@ public final class BoundContainerService {
      */
     public static BoundContainer bind(ServerPlayer player, ResourceKey<Level> dimension, BlockPos pos,
                                       String name, ItemStack icon, BoundContainer.Role role, UUID parentId) {
+        return bind(player, dimension, pos, name, icon, role, parentId, Set.of());
+    }
+
+    /**
+     * 绑定一个坐标，并顺带落盘配方类别。
+     *
+     * <p>{@code routes} 为<b>空集合时表示「不动类别」</b>：绑定弹窗上没打开类别选择器时不该把
+     * 已有主容器的类别清空。想清空类别走 {@link #setRoutes}（管理界面的类别按钮就是这么做的）。
+     */
+    public static BoundContainer bind(ServerPlayer player, ResourceKey<Level> dimension, BlockPos pos,
+                                      String name, ItemStack icon, BoundContainer.Role role, UUID parentId,
+                                      Set<ResourceLocation> routes) {
         BoundContainer.Role effectiveRole = role == null ? BoundContainer.Role.MASTER : role;
         UUID effectiveParent = effectiveRole == BoundContainer.Role.MASTER ? null : parentId;
         List<BoundContainer> bindings = new ArrayList<>(list(player));
@@ -109,12 +123,17 @@ public final class BoundContainerService {
                 updated = updated.withIcon(icon);
             }
             updated = updated.withRole(effectiveRole, effectiveParent);
+            if (routes != null && !routes.isEmpty()) {
+                // 放在 withRole 之后：withRole 会把非主容器的类别清空，顺序反过来会被它抹掉。
+                updated = updated.withRoutes(routes);
+            }
             bindings.set(index, updated);
             save(player, bindings);
             return updated;
         }
         BoundContainer created = new BoundContainer(UUID.randomUUID(), name, dimension, pos,
-                icon, effectiveRole, effectiveParent, java.util.Set.of(),
+                icon, effectiveRole, effectiveParent,
+                routes == null ? Set.of() : Set.copyOf(routes),
                 System.currentTimeMillis());
         bindings.add(created);
         save(player, bindings);
@@ -166,6 +185,20 @@ public final class BoundContainerService {
             return false;
         }
         return update(player, existing.renamed(name));
+    }
+
+    /**
+     * 整体替换一个主容器的配方类别；返回是否找到并改掉。
+     *
+     * <p>非主容器会被 {@code withRoutes} 清成空集合，所以这里不必先判断角色——
+     * 但客户端不该发出这种请求，收到时也照旧落盘（空集合是安全结果）。
+     */
+    public static boolean setRoutes(ServerPlayer player, UUID id, Set<ResourceLocation> routes) {
+        BoundContainer existing = find(player, id);
+        if (existing == null) {
+            return false;
+        }
+        return update(player, existing.withRoutes(routes));
     }
 
     /** 读取全部「上次选择」记录：路由键的字符串形式 → 发送单元主体 id。 */

@@ -10,6 +10,7 @@ import com.lai.recipesender.network.packet.SyncBoundContainersPacket;
 import com.lai.recipesender.network.packet.UnbindContainerPacket;
 import com.lai.recipesender.network.packet.UpdateBindingPacket;
 import com.lai.recipesender.network.packet.UpdateBindingRelationPacket;
+import com.lai.recipesender.network.packet.UpdateBindingRoutesPacket;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
@@ -24,7 +25,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -87,7 +90,7 @@ public final class BoundBindingService {
                 ? defaultName(existing, state, pos) : packet.name();
         ItemStack icon = iconOf(state);
         BoundContainer bound = BoundContainerService.bind(player, player.level().dimension(), pos,
-                name, icon, role, packet.parentId());
+                name, icon, role, packet.parentId(), packet.routeKeys());
         sync(player);
         notifyRelation(player, bound, existing);
     }
@@ -228,6 +231,38 @@ public final class BoundBindingService {
             return;
         }
         if (BoundContainerService.rename(player, packet.id(), packet.name())) {
+            sync(player);
+        }
+    }
+
+    /**
+     * 处理一次配方类别（自动路由键）修改。
+     *
+     * <p>类别只属于主容器：并列成员与从容器跟随父容器，收到它们的改类别请求时按空集合落盘，
+     * 而不是报错——客户端可能正拿着改角色之前的旧界面，回推一次同步就自然对齐了。
+     *
+     * <p>键的合法性只做最基本的一道闸：null 与空字符串丢掉，其余原样收下。类别集合是玩家自己的
+     * 偏好数据，多存几个不存在的键无害（永远匹配不上），而做白名单校验反而会把自定义类别
+     * （GTO 子类别、整合包自加机器）挡在外面。
+     */
+    public static void updateRoutes(ServerPlayer player, UpdateBindingRoutesPacket packet) {
+        if (player == null || packet == null) {
+            return;
+        }
+        BoundContainer existing = BoundContainerService.find(player, packet.id());
+        if (existing == null) {
+            // 可能刚被别的界面删掉了：不回话也不报错，客户端下一次同步自然会看到最新列表。
+            return;
+        }
+        Set<ResourceLocation> routes = new LinkedHashSet<>();
+        if (packet.routeKeys() != null) {
+            for (ResourceLocation route : packet.routeKeys()) {
+                if (route != null) {
+                    routes.add(route);
+                }
+            }
+        }
+        if (BoundContainerService.setRoutes(player, packet.id(), routes)) {
             sync(player);
         }
     }

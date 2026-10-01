@@ -5,6 +5,7 @@ import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ItemStack;
 import org.lwjgl.glfw.GLFW;
 
@@ -41,6 +42,12 @@ class BoundContainerPickScreen extends Screen {
     private final List<ItemStack> requirements;
     private final int batches;
 
+    /**
+     * 这次选择对应的配方路由键（S6）。「上次选择」按它分别记忆（方案 §4.3 D2）：
+     * 组装机选过 A、化学选过 B，两边互不覆盖。取不到时退回 {@code recipe_sender:manual}。
+     */
+    private final ResourceLocation routeKey;
+
     /** 过滤后的候选，数字键与方向键都按这个顺序生效。 */
     private final List<BoundContainer> filtered = new ArrayList<>();
     private EditBox searchBox;
@@ -60,14 +67,15 @@ class BoundContainerPickScreen extends Screen {
     private boolean hasSearch;
 
     BoundContainerPickScreen(Screen parent, List<BoundContainer> candidates, List<ItemStack> requirements,
-                             int batches) {
+                             int batches, ResourceLocation routeKey) {
         super(Component.translatable("text.recipe_sender.pick_title"));
         this.parent = parent;
         this.candidates = List.copyOf(candidates);
         this.requirements = List.copyOf(requirements);
         this.batches = batches;
         this.awaitBoundRelease = true;
-        BoundContainer last = BoundContainerClient.lastChoice(BoundContainerClient.manualRoute());
+        this.routeKey = routeKey == null ? BoundContainerClient.manualRoute() : routeKey;
+        BoundContainer last = BoundContainerClient.lastChoice(this.routeKey);
         this.selectedId = last == null ? null : last.id();
     }
 
@@ -119,7 +127,7 @@ class BoundContainerPickScreen extends Screen {
      * 有搜索词时同样置顶，所以过滤后按 {@code 1} 仍然是上次那个（如果它还在结果里）。
      */
     private void moveLastChoiceToFront() {
-        BoundContainer last = BoundContainerClient.lastChoice(BoundContainerClient.manualRoute());
+        BoundContainer last = BoundContainerClient.lastChoice(routeKey);
         if (last == null) {
             return;
         }
@@ -288,7 +296,7 @@ class BoundContainerPickScreen extends Screen {
     }
 
     private boolean isLastChoice(BoundContainer binding) {
-        BoundContainer last = BoundContainerClient.lastChoice(BoundContainerClient.manualRoute());
+        BoundContainer last = BoundContainerClient.lastChoice(routeKey);
         return last != null && last.id().equals(binding.id());
     }
 
@@ -427,7 +435,7 @@ class BoundContainerPickScreen extends Screen {
 
     /** 再按一次 B：跳过选择，直接发往上次用过的发送单元；没有记录时弹窗保持打开。 */
     private void sendToLastChoice() {
-        BoundContainer last = BoundContainerClient.lastChoice(BoundContainerClient.manualRoute());
+        BoundContainer last = BoundContainerClient.lastChoice(routeKey);
         if (last == null) {
             RecipeSenderClient.notifyPlayer(Component.translatable("text.recipe_sender.pick_no_last"));
             return;
@@ -447,7 +455,7 @@ class BoundContainerPickScreen extends Screen {
     }
 
     private void confirm(BoundContainer binding) {
-        RecipeSenderClient.rememberBoundChoice(binding.id());
+        RecipeSenderClient.rememberBoundChoice(binding.id(), routeKey);
         RecipeSenderClient.sendBoundInsert(binding.id(), requirements, batches);
         onClose();
     }

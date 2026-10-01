@@ -94,6 +94,17 @@ public record BoundContainer(UUID id, String name, ResourceKey<Level> dimension,
                 newRole == Role.MASTER ? routeKeys : Set.of(), createdAt);
     }
 
+    /**
+     * 生成替换配方类别后的副本。
+     *
+     * <p>只有主容器带类别：并列成员与从容器一律清空，免得它们被当成发送单元参与路由
+     * （{@link #withRole} 也按同一规则处理）。
+     */
+    public BoundContainer withRoutes(Set<ResourceLocation> newRoutes) {
+        return new BoundContainer(id, name, dimension, pos, iconItem, role, parentId,
+                isMaster() && newRoutes != null ? Set.copyOf(newRoutes) : Set.of(), createdAt);
+    }
+
     /** 序列化为 NBT；同时用于玩家存档和网络同步，保证两侧格式一致。 */
     public CompoundTag save() {
         CompoundTag tag = new CompoundTag();

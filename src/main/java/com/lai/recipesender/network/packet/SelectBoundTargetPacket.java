@@ -16,8 +16,9 @@ import java.util.function.Supplier;
  * 材料因为背包不够、目标满了而没送出去，不该把玩家的选择也一起忘掉——
  * 下次按住 B 再按 Z，他要的仍然是同一台机器。
  *
- * <p>路由键由客户端给出：S1 阶段还没有真实路由（配方类别路由是 S6 的事），
- * 客户端统一报 {@code recipe_sender:manual}；S6 之后按配方类别分别记忆。
+ * <p>路由键由客户端给出：S6 起是这条配方的路由键（GT 机器类型注册名，取不到时用 EMI 类别 id），
+ * 于是「上次选择」按配方类别分别记忆——组装机选过 A、化学选过 B，互不覆盖。
+ * 只有连类别都认不出来时才退回 {@code recipe_sender:manual}（S5 的全局记忆）。
  * 服务端只校验「这个绑定确实属于该玩家」，不采信客户端给出的其它任何内容。
  */
 public record SelectBoundTargetPacket(ResourceLocation routeKey, UUID bindingId) {

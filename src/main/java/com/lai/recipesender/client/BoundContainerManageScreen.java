@@ -4,6 +4,7 @@ import com.lai.recipesender.model.BoundContainer;
 import com.lai.recipesender.network.ModNetwork;
 import com.lai.recipesender.network.packet.UnbindContainerPacket;
 import com.lai.recipesender.network.packet.UpdateBindingPacket;
+import com.lai.recipesender.network.packet.UpdateBindingRoutesPacket;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
@@ -39,7 +40,9 @@ import java.util.UUID;
  *
  * <p>E 或 Esc 关界面（焦点在搜索框 / 改名框里时 E 让给输入框）。
  *
- * <p>行内操作：「改名 / 关系 / 高亮 / 删除」。「类别」要等 S6 的类别选择器。
+ * <p>行内操作：「改名 / 关系 / 类别 / 高亮 / 删除」。其中「类别」只出现在主容器行上，
+ * 打开 {@link CategoryPickerScreen} 勾选这个容器负责的配方类别（S6 自动路由）；并列成员与从容器
+ * 跟随父容器，不单独勾。
  */
 class BoundContainerManageScreen extends Screen {
 
@@ -473,8 +476,14 @@ class BoundContainerManageScreen extends Screen {
         int nameWidth = font.width(displayName(binding));
         int tagsX = cursor + nameWidth + 4;
         if (!renaming) {
-            BoundUi.tags(graphics, tagsX, y + 3, binding, parallelCountOf(binding), slaveCountOf(binding),
-                    false);
+            int tagsWidth = BoundUi.tags(graphics, tagsX, y + 3, binding, parallelCountOf(binding),
+                    slaveCountOf(binding), false);
+            // 类别标签只给主容器画：并列成员与从容器跟随父容器，它们身上永远没有类别。
+            if (binding.isMaster() && !binding.routeKeys().isEmpty()) {
+                BoundUi.tag(graphics, tagsX + tagsWidth, y + 3,
+                        Component.translatable("text.recipe_sender.manage_route_tag",
+                                binding.routeKeys().size()), BoundUi.TAG_ROUTE);
+            }
         }
 
         int subY = row.indent() ? y + 14 : y + 17;
@@ -568,6 +577,11 @@ class BoundContainerManageScreen extends Screen {
         List<Action> actions = new ArrayList<>();
         actions.add(new Action(Component.translatable("text.recipe_sender.button_rename"), false, "rename"));
         actions.add(new Action(Component.translatable("text.recipe_sender.button_relation"), false, "relation"));
+        // 「类别」只给主容器：并列成员与从容器跟随父容器，勾类别没有意义（方案 §6⑩ 明确不加）。
+        if (binding.isMaster()) {
+            actions.add(new Action(Component.translatable("text.recipe_sender.button_category"), false,
+                    "category"));
+        }
         actions.add(new Action(Component.translatable("text.recipe_sender.button_highlight"), false, "highlight"));
         actions.add(new Action(Component.translatable("text.recipe_sender.button_delete"), true, "delete"));
         return actions;
@@ -577,6 +591,11 @@ class BoundContainerManageScreen extends Screen {
 
     @Override
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        // 失焦即确认：正在改名时点到输入框以外，就当作改完了（不必按回车）。点了别的按钮、
+        // 别的行、甚至空白处都算，改名框不会挂在那里等一个永远不会来的回车。
+        if (renameBox != null && !renameBox.isMouseOver(mouseX, mouseY)) {
+            commitRename();
+        }
         if (renameBox != null && renameBox.isMouseOver(mouseX, mouseY)) {
             setFocused(renameBox);
             return renameBox.mouseClicked(mouseX, mouseY, button);
@@ -611,6 +630,7 @@ class BoundContainerManageScreen extends Screen {
         switch (target.action()) {
             case "rename" -> beginRename(binding);
             case "relation" -> openRelation(binding);
+            case "category" -> openCategories(binding);
             case "toggle" -> toggleExpanded(binding.id());
             case "highlight" -> highlight(binding);
             case "delete" -> requestDelete(binding);
@@ -638,6 +658,21 @@ class BoundContainerManageScreen extends Screen {
         }
         minecraft.setScreen(new BoundContainerBindScreen(this, binding.dimension().location(),
                 binding.pos(), binding));
+    }
+
+    /**
+     * 勾选这个主容器负责的配方类别（S6 自动路由）。
+     *
+     * <p>确定时才发 {@link UpdateBindingRoutesPacket}，而且是**覆盖**语义：选择器本身是多选，
+     * 玩家按确定时手上拿的就是最终结果。Esc 退出不发包，本地勾选随之丢弃。
+     */
+    private void openCategories(BoundContainer binding) {
+        if (minecraft == null) {
+            return;
+        }
+        minecraft.setScreen(new CategoryPickerScreen(this, binding.name(), binding.iconItem(),
+                binding.routeKeys(), routes ->
+                ModNetwork.CHANNEL.sendToServer(new UpdateBindingRoutesPacket(binding.id(), routes))));
     }
 
     private void beginRename(BoundContainer binding) {

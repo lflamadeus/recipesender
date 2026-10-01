@@ -347,6 +347,50 @@ public final class GtCircuitSupport {
         return new CircuitRequirement(NO_CIRCUIT, true);
     }
 
+    /**
+     * 读出这条 EMI 配方所属的 GT 机器类型注册名（如 {@code gtceu:assembler}），用于自动路由。
+     *
+     * <p>跟电路一样走结构而不是类名：GTCEu 26.x 的配方定义里有 {@code recipeType} 字段，
+     * 类型是 {@code GTRecipeType}，注册名在它的 {@code registryName} 字段上。取不到就返回
+     * {@code null}，调用方会退回 EMI 类别 id —— 那条路零反射，永远可用。
+     *
+     * @param recipe 可能是 {@link EmiRecipe}，也可能已经是 GT 配方对象；null 或认不出来都返回 null
+     */
+    public static ResourceLocation findRecipeTypeKey(Object recipe) {
+        if (recipe == null) {
+            return null;
+        }
+        Object gtRecipe = findGtRecipeObject(recipe);
+        if (gtRecipe == null) {
+            return null;
+        }
+        Object recipeType = readFieldByName(gtRecipe, "recipeType");
+        if (recipeType == null) {
+            return null;
+        }
+        // 注册名可能叫 registryName（GTCEu 26.x），也可能只暴露了 getter。
+        ResourceLocation direct = asResourceLocation(readFieldByName(recipeType, "registryName"));
+        if (direct != null) {
+            return direct;
+        }
+        direct = asResourceLocation(invokePublicNoArg(recipeType, "getRegistryName"));
+        if (direct != null) {
+            return direct;
+        }
+        return asResourceLocation(invokePublicNoArg(recipeType, "getId"));
+    }
+
+    /** 把反射拿到的值收拾成 ResourceLocation：本来就是就直接用，是字符串就解析，其它一律 null。 */
+    private static ResourceLocation asResourceLocation(Object value) {
+        if (value instanceof ResourceLocation location) {
+            return location;
+        }
+        if (value instanceof String text && !text.isEmpty()) {
+            return ResourceLocation.tryParse(text);
+        }
+        return null;
+    }
+
     /** 找到 EmiRecipe 持有的 GT 配方对象：字段类型名里带 “GTRecipe” 的那个。 */
     private static Object findGtRecipeObject(Object owner) {
         for (Class<?> type = owner.getClass(); type != null && type != Object.class;

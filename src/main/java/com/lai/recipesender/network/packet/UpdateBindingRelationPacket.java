@@ -11,8 +11,8 @@ import java.util.function.Supplier;
 /**
  * 客户端请求修改一条已有绑定的容器关系（角色 + 父容器）。
  *
- * <p>刻意只带关系：名字走 {@link UpdateBindingPacket}，配方类别（{@code routeKeys}）是 S6 的事。
- * 三种语义各用各的包，服务端按包做校验时一眼就能看出在改什么。
+ * <p>刻意只带关系：名字走 {@link UpdateBindingPacket}，配方类别（{@code routeKeys}）走
+ * {@link UpdateBindingRoutesPacket}。三种语义各用各的包，服务端按包做校验时一眼就能看出在改什么。
  *
  * <p>服务端只用 id 定位，角色与父容器都要重新校验：
  * 父容器必须存在、必须是主容器、不能是自己；主容器不能挂到别的容器下面。

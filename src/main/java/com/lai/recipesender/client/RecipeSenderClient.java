@@ -30,10 +30,12 @@ import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.client.resources.language.I18n;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraftforge.api.distmarker.Dist;
@@ -116,6 +118,13 @@ public final class RecipeSenderClient {
     private static boolean boundMode;
     /** 本次发送的目标；只在 {@link #boundMode} 为 true 时有值。 */
     private static BoundContainer activeBinding;
+    /**
+     * 本次「发送到已绑定容器」的候选（已按配方类别与维度筛过，S6）。
+     *
+     * <p>开始选择时算一次就固定下来：松手那一刻鼠标下的配方可能已经变了，用两份不同的候选
+     * 会导致「弹窗里挑了 A，实际发给 B」这类对不上的行为。
+     */
+    private static List<BoundContainer> boundCandidates = List.of();
     /** 最近一次绑定发送的请求号；只接受与它相等的回执。 */
     private static long boundRequestId;
     private static boolean awaitingAvailability;
@@ -694,11 +703,12 @@ public final class RecipeSenderClient {
         List<Integer> colors = new ArrayList<>(5);
         if (boundMode) {
             // 落点在玩家看不到的远程方块上，所以第一行必须先说清楚发到哪儿。
-            // 有多个候选时这里说不了具体是哪一个（等松开 Z 才由玩家挑），只说候选数量。
+            // 有多个候选时这里说不了具体是哪一个（等松开 Z 才由玩家挑），只说候选数量——
+            // 数量取的是按配方类别筛过的候选（S6），不是全部主容器。
             lines.add(activeBinding != null
                     ? getBoundTargetText(activeBinding.name())
                     : getBoundText("text.recipe_sender.bound_target_pick",
-                            new Object[]{BoundContainerClient.masters().size()}, "候选容器"));
+                            new Object[]{boundCandidates.size()}, "候选容器"));
             colors.add(0x8FE08F);
         }
         lines.add(getCountText(availableKey, availableBatches,
@@ -741,6 +751,48 @@ public final class RecipeSenderClient {
         graphics.pose().popPose();
     }
 
+    /**
+     * 按配方类别把主容器筛成候选（方案 §4.3）。
+     *
+     * <p>命中规则：主容器的类别集合与这条配方的路由键有交集才算命中。两处刻意的宽松，都在
+     * 方案 §4.2 / §4.3 的范围里：
+     * <ul>
+     *   <li><b>没勾过类别的主容器（{@code routeKeys} 为空）= 仅手动选择，不参与自动路由</b>
+     *       （方案 §5.5.2）。所以这里既不能把它当成「什么都收」，也不能拿它兜底——兜底正是
+     *       方案里被取消的 D3。老玩家升级后第一次按 B+Z 会收到一条提示，照着提示去管理界面勾类别即可。</li>
+     *   <li><b>认不出配方类别时（路由键集合为空）退回全部主容器</b>：没装 GT、EMI 类别 id 也拿不到的
+     *       极端情况，退回 S5 的行为（只有一个就直接发，多个就弹窗），而不是直接报错。</li>
+     *   <li><b>维度必须相同</b>：跨维度的落点连方块都加载不了，早筛掉比事后报「区块未加载」清楚。</li>
+     * </ul>
+     */
+    private static List<BoundContainer> routeCandidates(List<BoundContainer> masters, EmiRecipe recipe) {
+        Minecraft minecraft = Minecraft.getInstance();
+        ResourceKey<Level> dimension = minecraft.player == null
+                ? null : minecraft.player.level().dimension();
+        Set<ResourceLocation> keys = RecipeRouteKeys.of(recipe);
+        List<BoundContainer> matched = new ArrayList<>();
+        for (BoundContainer master : masters) {
+            if (dimension != null && !dimension.equals(master.dimension())) {
+                continue;
+            }
+            // 认不出类别：没有依据可筛，只能把同维度的主容器都交出去（S5 行为）。
+            if (keys.isEmpty()) {
+                matched.add(master);
+                continue;
+            }
+            if (master.routeKeys().isEmpty()) {
+                continue;
+            }
+            for (ResourceLocation key : keys) {
+                if (master.routeKeys().contains(key)) {
+                    matched.add(master);
+                    break;
+                }
+            }
+        }
+        return matched;
+    }
+
     /** 初始化当前悬停配方，并根据按键状态进入正向、反向或「发送到已绑定容器」模式。 */
     private static void beginSelection() {
         Minecraft minecraft = Minecraft.getInstance();
@@ -773,6 +825,7 @@ public final class RecipeSenderClient {
             return;
         }
         BoundContainer boundTarget = null;
+        List<BoundContainer> candidates = List.of();
         if (boundRequested) {
             List<BoundContainer> masters = BoundContainerClient.masters();
             if (masters.isEmpty()) {
@@ -780,16 +833,27 @@ public final class RecipeSenderClient {
                         "还没有绑定容器：对着方块按 B 绑定"));
                 return;
             }
-            // 只有一个主容器时直接定下；有多个时这里不定，等松开 Z 再弹选择界面让玩家挑。
+            // S6 起按配方类别自动路由：只有「勾了这条配方所属类别」的主容器才是候选。
+            // 一个都没勾过的老容器不会被当成兜底（方案 §5.5.2），所以这里必须把话说清楚：
+            // 提示里带上类别名与下一步该去哪儿勾，而不是干巴巴一句「没有匹配」。
+            candidates = routeCandidates(masters, recipe);
+            if (candidates.isEmpty()) {
+                sendMessage(minecraft, getBoundText("text.recipe_sender.route_none",
+                        new Object[]{RecipeRouteKeys.categoryName(recipe)},
+                        "没有为「%s」绑定容器 · 去管理界面点「类别」给主容器勾上"));
+                return;
+            }
+            // 只有一个候选时直接定下；有多个时这里不定，等松开 Z 再弹选择界面让玩家挑。
             // 绝不静默挑一个：那会把材料发进玩家没预期的机器里。
-            if (masters.size() == 1) {
-                boundTarget = masters.get(0);
+            if (candidates.size() == 1) {
+                boundTarget = candidates.get(0);
             }
         }
         selecting = true;
         reverseMode = reverseRequested;
         boundMode = boundRequested;
         activeBinding = boundTarget;
+        boundCandidates = candidates;
         selectAllRequested = isAltDown();
         selectedBatches = reverseMode ? 0 : 1;
         pendingScrollNotches = 0;
@@ -884,8 +948,10 @@ public final class RecipeSenderClient {
      * 玩家挑完再发。材料在这一刻就已经从背包「预定」出来了，弹窗期间不会因为背包变动而失效。
      */
     private static void finishBoundSelection(Minecraft minecraft) {
-        List<BoundContainer> masters = BoundContainerClient.masters();
-        if (masters.isEmpty()) {
+        // 用开始选择时算好的候选（已按配方类别与维度筛过），而不是重新取一遍主容器：
+        // 中途可能又绑了新容器，重新筛会得到一份与界面上显示的不一样的候选。
+        List<BoundContainer> candidates = boundCandidates;
+        if (candidates.isEmpty()) {
             sendMessage(minecraft, getMessage("text.recipe_sender.bound_none",
                     "还没有绑定容器：对着方块按 B 绑定"));
             cancelSelection();
@@ -905,14 +971,16 @@ public final class RecipeSenderClient {
             return;
         }
         List<ItemStack> requirements = result.requirements();
-        if (masters.size() == 1) {
-            sendBoundInsert(masters.get(0).id(), requirements, batches);
+        if (candidates.size() == 1) {
+            sendBoundInsert(candidates.get(0).id(), requirements, batches);
             cancelSelection();
             return;
         }
         Screen parent = minecraft.screen;
+        // 路由键要在 cancelSelection() 之前取：它清掉的是这次选择的状态。
+        ResourceLocation routeKey = RecipeRouteKeys.primary(activeRecipe);
         cancelSelection();
-        minecraft.setScreen(new BoundContainerPickScreen(parent, masters, requirements, batches));
+        minecraft.setScreen(new BoundContainerPickScreen(parent, candidates, requirements, batches, routeKey));
     }
 
     /**
@@ -941,13 +1009,16 @@ public final class RecipeSenderClient {
      *
      * <p>写在玩家确认选择这一刻，而不是材料成功送达那一刻：
      * 材料没送出去（目标满了之类）不该把玩家的选择也一起忘掉。
+     *
+     * <p>记忆按<b>配方路由键</b>分别存（S6）：组装机选过 A、化学选过 B，两边互不覆盖；
+     * 拿不到路由键时退回 {@code recipe_sender:manual}，也就是 S5 的全局记忆。
      */
-    public static void rememberBoundChoice(UUID bindingId) {
+    public static void rememberBoundChoice(UUID bindingId, ResourceLocation routeKey) {
         if (bindingId == null) {
             return;
         }
-        ModNetwork.CHANNEL.sendToServer(
-                new SelectBoundTargetPacket(BoundContainerClient.manualRoute(), bindingId));
+        ModNetwork.CHANNEL.sendToServer(new SelectBoundTargetPacket(
+                routeKey == null ? BoundContainerClient.manualRoute() : routeKey, bindingId));
     }
 
     /** 给玩家显示一条屏幕下方的提示。界面代码拿不到私有发送方法，所以开这个口子。 */
@@ -1367,6 +1438,7 @@ public final class RecipeSenderClient {
         reverseMode = false;
         boundMode = false;
         activeBinding = null;
+        boundCandidates = List.of();
         awaitingAvailability = false;
         releasePending = false;
         selectAllRequested = false;

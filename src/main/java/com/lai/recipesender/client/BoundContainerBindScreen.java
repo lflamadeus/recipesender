@@ -5,6 +5,7 @@ import com.lai.recipesender.network.ModNetwork;
 import com.lai.recipesender.network.packet.BindContainerPacket;
 import com.lai.recipesender.network.packet.UpdateBindingPacket;
 import com.lai.recipesender.network.packet.UpdateBindingRelationPacket;
+import com.lai.recipesender.network.packet.UpdateBindingRoutesPacket;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
@@ -20,6 +21,7 @@ import org.lwjgl.glfw.GLFW;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -57,6 +59,15 @@ public class BoundContainerBindScreen extends Screen {
     private String blockId = "";
 
     private EditBox nameBox;
+
+    /**
+     * 名字输入框里的当前文本。
+     *
+     * <p>必须存在字段里：{@code init()} 每次都会重建输入框（去类别选择器再回来时 {@code init()} 会再跑
+     * 一遍），只把文本留在 {@code EditBox} 里的话，刚敲完名字去勾类别、回来名字就没了。
+     */
+    private String nameDraft = "";
+
     private BoundContainer.Role role = BoundContainer.Role.MASTER;
     private UUID parentId;
     private boolean parentDropOpen;
@@ -69,6 +80,14 @@ public class BoundContainerBindScreen extends Screen {
      * 注册进去会被面板底色整个盖住。照管理界面 {@code renameBox} 的做法手动 {@code render}。
      */
     private EditBox dropSearch;
+
+    /**
+     * 这个主容器负责的配方类别（S6 自动路由）。
+     *
+     * <p>只在构造器里初始化、{@code init()} 里**不重置**：从类别选择器回来时 {@code init()} 会再跑一遍，
+     * 重置就等于把刚勾好的类别抹掉。空集合 = 「仅手动选择」，这个容器不参与自动路由。
+     */
+    private Set<ResourceLocation> pendingRoutes = Set.of();
 
     /** 下拉的搜索词，始终已 trim + 小写。由 {@link #dropSearch} 的 responder 维护。 */
     private String dropQuery = "";
@@ -91,6 +110,8 @@ public class BoundContainerBindScreen extends Screen {
         this.editing = editing;
         this.dimension = editing != null ? editing.dimension().location() : dimension;
         this.pos = editing != null ? editing.pos() : pos;
+        this.pendingRoutes = editing != null ? Set.copyOf(editing.routeKeys()) : Set.of();
+        this.nameDraft = editing != null ? editing.name() : "";
     }
 
     // ------------------------------------------------------------------ 布局
@@ -110,7 +131,9 @@ public class BoundContainerBindScreen extends Screen {
         nameBox = new EditBox(font, left + PADDING, top + 72, PANEL_WIDTH - PADDING * 2, 18,
                 Component.translatable("text.recipe_sender.bind_name_label"));
         nameBox.setMaxLength(BoundContainer.MAX_NAME_LENGTH);
-        nameBox.setValue(editing != null ? editing.name() : "");
+        nameBox.setValue(nameDraft);
+        // 实时同步回 nameDraft，等于「失焦即确认」：文本永远不会因为输入框被重建而丢。
+        nameBox.setResponder(value -> nameDraft = value);
         nameBox.setHint(Component.translatable("text.recipe_sender.bind_name_hint"));
         addRenderableWidget(nameBox);
 
@@ -200,8 +223,28 @@ public class BoundContainerBindScreen extends Screen {
                 textX, top + 166, needsParent ? BoundUi.TEXT_DIM : BoundUi.TEXT_DISABLED, false);
         drawParentSelect(graphics, mouseX, mouseY, textX, top + 176, innerWidth, needsParent);
 
-        graphics.drawString(font, Component.translatable("text.recipe_sender.bind_category_hint"),
-                textX, top + 200, BoundUi.TEXT_DISABLED, false);
+        // S6：类别按钮。只有主容器需要勾（并列成员与从容器跟随父容器，服务端也会把它们清空）。
+        if (role == BoundContainer.Role.MASTER) {
+            Component label = Component.translatable("text.recipe_sender.button_category");
+            int buttonWidth = font.width(label) + 12;
+            int buttonY = top + 196;
+            boolean hovered = BoundUi.inside(mouseX, mouseY, textX, buttonY, buttonWidth, 16);
+            graphics.fill(textX, buttonY, textX + buttonWidth, buttonY + 16,
+                    hovered ? BoundUi.BORDER_LIGHT : BoundUi.PANEL);
+            graphics.renderOutline(textX, buttonY, buttonWidth, 16, BoundUi.BORDER_DARK);
+            graphics.drawString(font, label, textX + 6, buttonY + 4, BoundUi.TEXT, false);
+            // 空集合在服务端是「什么都收」，所以这里必须说清楚，而不是显示「已选 0 个类别」。
+            Component summary = pendingRoutes.isEmpty()
+                    ? Component.translatable("text.recipe_sender.bind_category_all")
+                    : Component.translatable("text.recipe_sender.bind_category_count",
+                            pendingRoutes.size());
+            graphics.drawString(font, summary, textX + buttonWidth + 6, buttonY + 4,
+                    BoundUi.TEXT_DIM, false);
+            hits.add(new Hit(textX, buttonY, buttonWidth, 16, "category"));
+        } else {
+            graphics.drawString(font, Component.translatable("text.recipe_sender.bind_category_hint"),
+                    textX, top + 200, BoundUi.TEXT_DISABLED, false);
+        }
 
         graphics.drawString(font, Component.translatable("text.recipe_sender.bind_footer"),
                 textX, top + PANEL_HEIGHT - 22, BoundUi.TEXT_DIM, false);
@@ -358,6 +401,10 @@ public class BoundContainerBindScreen extends Screen {
 
     @Override
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        // 点到输入框以外 = 名字输入框失焦。文本已经实时同步进 nameDraft，不会因为失焦或界面重建而丢。
+        if (nameBox != null && nameBox.isFocused() && !nameBox.isMouseOver(mouseX, mouseY)) {
+            setFocused(null);
+        }
         // 搜索框在 hits 之外，必须最先判：它的位置在候选行上面，落到 hits 循环里会被当成点空。
         if (parentDropOpen && dropSearch != null && dropSearch.isMouseOver(mouseX, mouseY)) {
             if (button == 1) {
@@ -429,9 +476,24 @@ public class BoundContainerBindScreen extends Screen {
             }
             return;
         }
+        if ("category".equals(action)) {
+            openCategories();
+            return;
+        }
         if ("save".equals(action)) {
             save();
         }
+    }
+
+    /** 打开类别选择器；确定时只改本地字段，落盘统一走「保存」。 */
+    private void openCategories() {
+        if (minecraft == null) {
+            return;
+        }
+        String target = nameBox == null || nameBox.getValue().trim().isEmpty()
+                ? blockName : nameBox.getValue().trim();
+        minecraft.setScreen(new CategoryPickerScreen(this, target, blockIcon, pendingRoutes,
+                routes -> pendingRoutes = Set.copyOf(routes)));
     }
 
     /** 切到「并列成员 / 从容器」时，默认先挂到第一个主容器上，省一次点击。 */
@@ -509,7 +571,7 @@ public class BoundContainerBindScreen extends Screen {
         }
         if (editing == null) {
             ModNetwork.CHANNEL.sendToServer(
-                    new BindContainerPacket(dimension, pos, name, role, parentId));
+                    new BindContainerPacket(dimension, pos, name, role, parentId, pendingRoutes));
         } else {
             // 名字留空 = 保持原名（不是「改成未命名」）；关系无论如何都发一遍，服务端自己比对。
             if (!name.isEmpty() && !name.equals(editing.name())) {
@@ -517,6 +579,12 @@ public class BoundContainerBindScreen extends Screen {
             }
             ModNetwork.CHANNEL.sendToServer(
                     new UpdateBindingRelationPacket(editing.id(), role, parentId));
+            // 类别单独一个包（覆盖语义）。新建时它已经随 BindContainerPacket 走了，这里只补改绑的情况；
+            // 非主容器不发——服务端保存时本来就会把它们的类别清空。
+            if (role == BoundContainer.Role.MASTER) {
+                ModNetwork.CHANNEL.sendToServer(
+                        new UpdateBindingRoutesPacket(editing.id(), pendingRoutes));
+            }
         }
         onClose();
     }

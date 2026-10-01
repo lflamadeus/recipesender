@@ -7,6 +7,8 @@ import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraftforge.network.NetworkEvent;
 
+import java.util.LinkedHashSet;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -20,11 +22,17 @@ import java.util.function.Supplier;
  *
  * <p>{@code role} 是容器关系（主容器 / 并列成员 / 从容器）；{@code parentId} 只在角色不是主容器时使用，
  * 指向挂靠的主容器。两者都是<b>请求</b>，服务端会重新校验一遍（父容器必须真的存在且是主容器）。
+ *
+ * <p>{@code routeKeys} 是这次绑定时顺手勾好的配方类别（S6）。空集合表示「不动类别」——
+ * 绑一个已经绑过的坐标时，没打开类别选择器不该把原有类别清空。
  */
 public record BindContainerPacket(ResourceLocation dimension, BlockPos pos, String name,
-                                  BoundContainer.Role role, UUID parentId) {
+                                  BoundContainer.Role role, UUID parentId,
+                                  Set<ResourceLocation> routeKeys) {
     /** 名称长度上限，与 {@code BoundContainer.MAX_NAME_LENGTH} 保持一致。 */
     public static final int MAX_NAME_LENGTH = 32;
+    /** 单次请求允许携带的最大类别数，与 {@code UpdateBindingRoutesPacket} 保持一致。 */
+    private static final int MAX_ROUTES = 4096;
 
     /** 编码绑定请求。 */
     public static void encode(BindContainerPacket packet, FriendlyByteBuf buffer) {
@@ -36,6 +44,11 @@ public record BindContainerPacket(ResourceLocation dimension, BlockPos pos, Stri
         if (packet.parentId != null) {
             buffer.writeUUID(packet.parentId);
         }
+        Set<ResourceLocation> routes = packet.routeKeys == null ? Set.of() : packet.routeKeys;
+        buffer.writeVarInt(routes.size());
+        for (ResourceLocation route : routes) {
+            buffer.writeResourceLocation(route);
+        }
     }
 
     /** 解码绑定请求。 */
@@ -45,7 +58,15 @@ public record BindContainerPacket(ResourceLocation dimension, BlockPos pos, Stri
         String name = buffer.readUtf(MAX_NAME_LENGTH);
         BoundContainer.Role role = buffer.readEnum(BoundContainer.Role.class);
         UUID parentId = buffer.readBoolean() ? buffer.readUUID() : null;
-        return new BindContainerPacket(dimension, pos, name, role, parentId);
+        int routeCount = buffer.readVarInt();
+        if (routeCount < 0 || routeCount > MAX_ROUTES) {
+            throw new IllegalArgumentException("绑定路由数量超出限制: " + routeCount);
+        }
+        Set<ResourceLocation> routes = new LinkedHashSet<>(Math.min(routeCount, 64));
+        for (int index = 0; index < routeCount; index++) {
+            routes.add(buffer.readResourceLocation());
+        }
+        return new BindContainerPacket(dimension, pos, name, role, parentId, routes);
     }
 
     /** 交给服务端主线程落盘并回推同步包。 */

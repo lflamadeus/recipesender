@@ -16,6 +16,7 @@ import com.lai.recipesender.network.packet.SyncBoundContainersPacket;
 import com.lai.recipesender.network.packet.UnbindContainerPacket;
 import com.lai.recipesender.network.packet.UpdateBindingPacket;
 import com.lai.recipesender.network.packet.UpdateBindingRelationPacket;
+import com.lai.recipesender.network.packet.UpdateBindingRoutesPacket;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraftforge.network.NetworkDirection;
 import net.minecraftforge.network.NetworkRegistry;
@@ -29,8 +30,10 @@ public final class ModNetwork {
      *
      * <p>1.0.23 由 8 升到 9：{@code InsertRecipeItemsToBoundPacket} 尾部加了电路编号与
      * 「是否格雷配方」两个字段。
+     *
+     * <p>1.0.25 由 9 升到 10：新增 {@code UpdateBindingRoutesPacket}（配方类别选择器）。
      */
-    private static final String PROTOCOL_VERSION = "9";
+    private static final String PROTOCOL_VERSION = "10";
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             ResourceLocation.fromNamespaceAndPath(RecipeSenderMod.MOD_ID, "main"),
             () -> PROTOCOL_VERSION, PROTOCOL_VERSION::equals, PROTOCOL_VERSION::equals);
@@ -110,6 +113,11 @@ public final class ModNetwork {
                 .encoder(UpdateBindingRelationPacket::encode)
                 .decoder(UpdateBindingRelationPacket::decode)
                 .consumerMainThread(UpdateBindingRelationPacket::handle)
+                .add();
+        CHANNEL.messageBuilder(UpdateBindingRoutesPacket.class, id++, NetworkDirection.PLAY_TO_SERVER)
+                .encoder(UpdateBindingRoutesPacket::encode)
+                .decoder(UpdateBindingRoutesPacket::decode)
+                .consumerMainThread(UpdateBindingRoutesPacket::handle)
                 .add();
         CHANNEL.messageBuilder(BoundNoticePacket.class, id++, NetworkDirection.PLAY_TO_CLIENT)
                 .encoder(BoundNoticePacket::encode)

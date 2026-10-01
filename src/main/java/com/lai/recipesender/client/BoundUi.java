@@ -39,6 +39,8 @@ final class BoundUi {
     static final int TAG_SLAVE = 0xFF6B6B6B;
     /** 上次用过的发送单元。 */
     static final int TAG_LAST = 0xFFB8860B;
+    /** 已勾选的配方类别数量（S6 自动路由）。 */
+    static final int TAG_ROUTE = 0xFF7A4FA8;
 
     private BoundUi() {
     }
