@@ -8,6 +8,7 @@
   "text.recipe_sender.pull_count": "Pull %s batches",
   "text.recipe_sender.target_limit": "Target accepts at most %s batches",
   "text.recipe_sender.circuit": "Circuit #%s",
+  "text.recipe_sender.circuit_clear": "Circuit cleared",
   "text.recipe_sender.reverse_missing": "Reverse search requires FindMeExtended to be installed",
   "text.recipe_sender.reverse_incompatible": "Reverse search requires FindMeExtended 1.0.2 or newer (current version is incompatible)"
 }

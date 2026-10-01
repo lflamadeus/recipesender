@@ -37,8 +37,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *       “注册名 {@code programmed_circuit} + NBT 键 {@code Configuration}”，完全不依赖 GT 的类。</li>
  *   <li><b>写电路</b>：不检查机器是否实现 {@code IHasCircuitSlot}，改成鸭子类型——
  *       只要机器（或其父类）有无参方法 {@code getCircuitInventory()} 且返回可写物品槽，就往第 0 格写。
- *       {@code isCircuitSlotEnabled()} 存在时用它把关（蒸汽总线、以及控制器不允许电路槽的部件
- *       都是靠它关掉的），不存在则视为可用。</li>
+ *       {@code isCircuitSlotEnabled()} 存在时用它把关（蒸汽总线之类靠它关掉），不存在则视为可用；
+ *       GTO 用的 gtceu 26.9.70 里已经没有这个方法，所以那里等于只看有没有电路槽。</li>
  *   <li><b>找机器</b>：不检查菜单是不是 {@code ModularUIContainer}，改成鸭子类型——
  *       先找无参方法 {@code getModularUI()}，找不到再找类型名含 {@code ModularUI} 的字段；
  *       拿到 ModularUI 后读 {@code holder} 字段（找不到就找类型名含 {@code IUIHolder} 的字段）。</li>
@@ -54,10 +54,22 @@ import java.util.concurrent.ConcurrentHashMap;
  * （界面槽位单独走 {@code getXEIIngredients()}），却根本不会出现在原料列表里。
  * 因此除了扫 EMI 列表，还必须有一条直接翻配方内部数据的通路（{@link #scanGtRecipe}）。
  *
+ * <h2>为什么“配方不需要电路”时要把电路置空</h2>
+ * 格雷的配方匹配是按键匹配的：配方侧把 {@code IntCircuitIngredient} 变成搜索表里的一个键，
+ * 机器侧再把电路槽里的编号加成同一个键。不需要电路的配方根本不产生电路键，于是槽里放着
+ * 电路 5 时，它和要求电路 5 的配方会同时成为候选，跑哪一个取决于搜索顺序——这就是
+ * “材料送进去了、跑的却是另一个配方”的原因。把电路槽清空（空槽与电路 0 等价，见
+ * {@link #clearCircuit}）能让那些要求具体编号的配方不再匹配。
+ *
+ * <p>判定只看两件事：悬停的确实是格雷配方（认出了配方对象）、且它不使用电路，就把目标容器的
+ * 电路清空。目标没有电路槽（原版箱子等）时自然什么都不会发生——这是服务端按机器实例判断的结果，
+ * 不需要客户端预判机型，机器支持什么配方由 GT 自己决定。
+ *
  * <h2>调用频率</h2>
- * {@link #findCircuit} 只在玩家按下按键开始选择配方时调用一次，{@link #findCircuitHolder} 等
- * 只在提交时调用一次，都不是每 tick 的路径。其中唯一有点开销的是 {@code recipe.getInputs()}，
- * 但 GTO 与材料统计本来就要用它，且配方自己带懒初始化，重复调用不会再算一遍。
+ * {@link #findCircuit} 只在玩家按下按键开始选择配方时调用一次，{@link #findCircuitHolder}、
+ * {@link #canAdjustCircuit} 也只在开始选择与提交时各调用一次，都不是每 tick 的路径。其中唯一有点
+ * 开销的是 {@code recipe.getInputs()}，但 GTO 与材料统计本来就要用它，且配方自己带懒初始化，
+ * 重复调用不会再算一遍。
  */
 public final class GtCircuitSupport {
 
@@ -100,6 +112,27 @@ public final class GtCircuitSupport {
     private static Method isIntegratedCircuitMethod;
     private static Method getCircuitConfigurationMethod;
     private static Method circuitStackMethod;
+
+    // ------------------------------------------------------------------
+    // 配方对电路的要求
+    // ------------------------------------------------------------------
+
+    /**
+     * 悬停配方对编程电路的要求。
+     *
+     * @param circuit    0-{@link #MAX_CIRCUIT} 表示配方要求该编号；{@link #NO_CIRCUIT}
+     *                   表示这是格雷配方但不使用电路，目标容器有电路槽时应把电路置空
+     * @param gregRecipe 是否确认这是格雷配方（认出了配方对象）。只有它为 {@code true} 时
+     *                   {@link #NO_CIRCUIT} 才意味着“该置空”；只看 EMI 原料的通路认不出配方对象，
+     *                   为 {@code false}，那种情况只用于“按编号写电路”
+     */
+    public record CircuitRequirement(int circuit, boolean gregRecipe) {
+
+        /** 配方是否要求一个具体的电路编号；否则就是“不使用电路”。 */
+        public boolean requiresCircuit() {
+            return circuit >= 0;
+        }
+    }
 
     private GtCircuitSupport() {
     }
@@ -183,7 +216,7 @@ public final class GtCircuitSupport {
     // ------------------------------------------------------------------
 
     /**
-     * 从 EMI 配方里找出它要求的电路编号。
+     * 从 EMI 配方里找出它对编程电路的要求。
      *
      * <p>两条通路依次尝试：
      * <ol>
@@ -191,36 +224,37 @@ public final class GtCircuitSupport {
      *   <li>直接翻配方对象里的 GT 配方数据——对 GTO 配方是唯一可行的通路。</li>
      * </ol>
      *
-     * @return 电路编号（0-32）；配方不需要电路时返回 {@link #NO_CIRCUIT}
+     * @return 配方对电路的要求；不是格雷配方、未安装格雷科技或识别失败时返回 {@code null}，
+     *         调用方不要改动任何电路
      */
-    public static int findCircuit(EmiRecipe recipe) {
+    public static CircuitRequirement findCircuit(EmiRecipe recipe) {
         if (recipe == null) {
-            return NO_CIRCUIT;
+            return null;
         }
         resolve();
         if (circuitItem == null) {
-            return NO_CIRCUIT;
+            return null;
         }
         try {
             return detectCircuit(recipe);
         } catch (RuntimeException | LinkageError error) {
             // 反射翻配方内部数据有可能撞上第三方实现的意外结构，绝不能让它冒泡打断按键处理。
-            LOGGER.warn("检测配方电路时出错，本次按“无电路”处理", error);
-            return NO_CIRCUIT;
+            LOGGER.warn("检测配方电路时出错，本次按“不动电路”处理", error);
+            return null;
         }
     }
 
     /** {@link #findCircuit} 的实际实现，异常由调用方兜住。 */
-    private static int detectCircuit(EmiRecipe recipe) {
+    private static CircuitRequirement detectCircuit(EmiRecipe recipe) {
         // 顺序不能反：GTO 是在 getInputs() 里才把零概率输入补进 catalysts 的。
         List<EmiIngredient> inputs = inputsOf(recipe);
         int circuit = scanIngredients(catalystsOf(recipe));
-        if (circuit != NO_CIRCUIT) {
-            return circuit;
+        if (circuit == NO_CIRCUIT) {
+            circuit = scanIngredients(inputs);
         }
-        circuit = scanIngredients(inputs);
         if (circuit != NO_CIRCUIT) {
-            return circuit;
+            // 这条通路只看得见原料，认不出配方对象，所以只用于“按编号写电路”。
+            return new CircuitRequirement(circuit, false);
         }
         return scanGtRecipe(recipe);
     }
@@ -284,23 +318,32 @@ public final class GtCircuitSupport {
      * GTO 的 {@code GTEMIRecipe} 持有 {@code GTRecipeDefinition recipe}（{@code itemInputs} 是
      * {@code List<Content>}，{@code Content.inner} 再包一层）。两条都按“字段名 + 递归解包”处理，
      * 不依赖具体类名。
+     *
+     * @return 配方对电路的要求；连 GT 配方对象或它的输入字段都找不到时返回 {@code null}
+     *         —— 结构不认识时宁可不动电路，也不能误判成“这个配方不使用电路”
      */
-    private static int scanGtRecipe(EmiRecipe recipe) {
+    private static CircuitRequirement scanGtRecipe(EmiRecipe recipe) {
         Object gtRecipe = findGtRecipeObject(recipe);
         if (gtRecipe == null) {
-            return NO_CIRCUIT;
+            return null;
         }
+        boolean scanned = false;
         for (String fieldName : RECIPE_CONTENT_FIELDS) {
             Object collection = readFieldByName(gtRecipe, fieldName);
-            if (collection == null) {
+            if (!(collection instanceof Map<?, ?>) && !(collection instanceof Iterable<?>)) {
                 continue;
             }
+            scanned = true;
             int circuit = scanCollection(collection);
             if (circuit != NO_CIRCUIT) {
-                return circuit;
+                return new CircuitRequirement(circuit, true);
             }
         }
-        return NO_CIRCUIT;
+        if (!scanned) {
+            return null;
+        }
+        // 输入字段都在、里面确实没有电路，才能判定“这个配方不使用电路”。
+        return new CircuitRequirement(NO_CIRCUIT, true);
     }
 
     /** 找到 EmiRecipe 持有的 GT 配方对象：字段类型名里带 “GTRecipe” 的那个。 */
@@ -511,6 +554,33 @@ public final class GtCircuitSupport {
         return true;
     }
 
+    /**
+     * 清空机器电路槽（第 0 格写入空物品堆）。
+     *
+     * <p>与 {@link #setCircuit}(holder, 0) 的区别只在观感：GT 的电路 0 也是一块真实的编程电路物品，
+     * 留在槽里玩家会以为没生效。对配方匹配两者完全等价（没有任何配方要求电路 0），而空槽更贴近
+     * “从没设过电路”的原始状态。
+     *
+     * <p>槽里放着不是编程电路的东西时不动它：那是玩家自己的物品，不该由“发送配方”代删。
+     *
+     * @return 是否真的清空了（槽本来就空也算成功）
+     */
+    public static boolean clearCircuit(Object holder) {
+        if (!canAdjustCircuit(holder)) {
+            return false;
+        }
+        Object inventory = circuitInventory(holder);
+        if (!(inventory instanceof IItemHandlerModifiable handler) || handler.getSlots() < 1) {
+            return false;
+        }
+        ItemStack current = handler.getStackInSlot(0);
+        if (current != null && !current.isEmpty() && readCircuit(current) == NO_CIRCUIT) {
+            return false;
+        }
+        handler.setStackInSlot(0, ItemStack.EMPTY);
+        return true;
+    }
+
     /** 取机器的电路槽物品容器。 */
     private static Object circuitInventory(Object holder) {
         Method method = circuitInventoryMethod(holder);
@@ -564,6 +634,28 @@ public final class GtCircuitSupport {
         } catch (ReflectiveOperationException | RuntimeException | LinkageError error) {
             return null;
         }
+    }
+
+    /**
+     * 反射调用一个公开的无参方法，按公开方法表查找（含继承来的接口 default 方法）。
+     *
+     * <p>与 {@link #invokeNoArg} 分开：后者只走类层次，找不到 {@code IRecipeLogicMachine} 这类
+     * 接口 default 方法。两条通路互不影响，既有的鸭子类型判断不会被这次新增改到。
+     */
+    private static Object invokePublicNoArg(Object owner, String name) {
+        if (owner == null) {
+            return null;
+        }
+        try {
+            for (Method method : owner.getClass().getMethods()) {
+                if (method.getName().equals(name) && method.getParameterCount() == 0) {
+                    return method.invoke(owner);
+                }
+            }
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError error) {
+            return null;
+        }
+        return null;
     }
 
     private static Method findNoArgMethod(Class<?> owner, String name) {

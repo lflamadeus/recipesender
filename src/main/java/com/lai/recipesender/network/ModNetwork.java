@@ -1,6 +1,7 @@
 package com.lai.recipesender.network;
 
 import com.lai.recipesender.RecipeSenderMod;
+import com.lai.recipesender.network.packet.ClearContainerCircuitPacket;
 import com.lai.recipesender.network.packet.InsertRecipeItemsPacket;
 import com.lai.recipesender.network.packet.NearbyRecipeAvailabilityPacket;
 import com.lai.recipesender.network.packet.NearbyRecipePullPacket;
@@ -13,7 +14,7 @@ import net.minecraftforge.network.simple.SimpleChannel;
 
 /** 集中注册客户端与服务端之间的数据包。 */
 public final class ModNetwork {
-    private static final String PROTOCOL_VERSION = "3";
+    private static final String PROTOCOL_VERSION = "4";
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             ResourceLocation.fromNamespaceAndPath(RecipeSenderMod.MOD_ID, "main"),
             () -> PROTOCOL_VERSION, PROTOCOL_VERSION::equals, PROTOCOL_VERSION::equals);
@@ -48,6 +49,11 @@ public final class ModNetwork {
                 .encoder(SetContainerCircuitPacket::encode)
                 .decoder(SetContainerCircuitPacket::decode)
                 .consumerMainThread(SetContainerCircuitPacket::handle)
+                .add();
+        CHANNEL.messageBuilder(ClearContainerCircuitPacket.class, id++, NetworkDirection.PLAY_TO_SERVER)
+                .encoder(ClearContainerCircuitPacket::encode)
+                .decoder(ClearContainerCircuitPacket::decode)
+                .consumerMainThread(ClearContainerCircuitPacket::handle)
                 .add();
     }
 }

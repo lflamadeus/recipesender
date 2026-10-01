@@ -5,6 +5,7 @@ import com.lai.recipesender.integration.findme.FindMeExtendedAdapter;
 import com.lai.recipesender.integration.gt.GtCircuitSupport;
 import com.lai.recipesender.model.RecipeIngredientSpec;
 import com.lai.recipesender.network.ModNetwork;
+import com.lai.recipesender.network.packet.ClearContainerCircuitPacket;
 import com.lai.recipesender.network.packet.InsertRecipeItemsPacket;
 import com.lai.recipesender.network.packet.NearbyRecipePullPacket;
 import com.lai.recipesender.network.packet.NearbyRecipeQueryPacket;
@@ -83,8 +84,15 @@ public final class RecipeSenderClient {
     private static int selectedBatches;
     private static int availableBatches;
     private static int insertableBatches;
-    /** 当前悬停配方要求的编程电路编号；GtCircuitSupport.NO_CIRCUIT 表示该配方不使用电路。 */
-    private static int activeCircuit = GtCircuitSupport.NO_CIRCUIT;
+    /** 当前悬停配方对编程电路的要求；null 表示不动电路（不是格雷配方或识别失败）。 */
+    private static GtCircuitSupport.CircuitRequirement activeCircuit;
+    /**
+     * 当前打开的目标容器有没有可写的电路槽（客户端预判，只用来决定提示行）。
+     *
+     * <p>原版箱子、漏斗这类容器没有机器实例，{@link GtCircuitSupport#canAdjustCircuit} 给出
+     * {@code false}：发送时既不会写电路也不会置空，所以连提示都不该显示。
+     */
+    private static boolean activeTargetHasCircuit;
     private static long clientTicks;
     private static long nextAvailabilityRefreshTick;
     private static long availabilityRequestTick;
@@ -377,9 +385,10 @@ public final class RecipeSenderClient {
                         ? "text.recipe_sender.pull_count" : "text.recipe_sender.send_count",
                 selectedBatches, reverseMode ? "取回" : "发送"));
         colors.add(0xFFFFFF);
-        if (!reverseMode && activeCircuit != GtCircuitSupport.NO_CIRCUIT) {
-            // 提前显示将要写入的电路，避免玩家不知道这次发送会顺带改动机器配置。
-            lines.add(getCircuitText(activeCircuit));
+        Component circuitLine = reverseMode ? null : describeCircuitChange();
+        if (circuitLine != null) {
+            // 提前显示这次发送会顺带把机器电路改成什么，避免玩家不知道配置被动过。
+            lines.add(circuitLine);
             colors.add(0xFFD479);
         }
         if (!reverseMode && insertableBatches < availableBatches) {
@@ -440,6 +449,8 @@ public final class RecipeSenderClient {
         activeRecipe = recipe;
         // 电路只影响机器的配方匹配，不参与材料统计，因此在开始选择时解析一次即可。
         activeCircuit = GtCircuitSupport.findCircuit(recipe);
+        activeTargetHasCircuit = GtCircuitSupport.canAdjustCircuit(
+                GtCircuitSupport.findCircuitHolder(container.getMenu()));
         highlightedInventorySlots = RecipeMaterialCollector.findMatchingInventorySlots(recipe,
                 minecraft.player);
 
@@ -506,24 +517,33 @@ public final class RecipeSenderClient {
     }
 
     /**
-     * 请求服务端把目标机器的电路调整为当前配方要求的编号。
+     * 请求服务端按当前配方调整目标机器的电路：配方要求编号就写编号，配方不使用电路就清空。
      *
      * <p>这里不预先判断容器是否支持电路：机器实例只有服务端才有，客户端只看得到菜单，
      * 判断交给服务端，不支持的容器会直接忽略这个数据包。
      *
      * <p>唯一的例外是“目标压根不是格雷机器界面”（原版箱子、漏斗等）——菜单类型在客户端与
      * 服务端是一致的，这类目标连一个能装电路的机器实例都取不到，直接不发，省掉一次无意义往返。
-     * 至于多方块控制器、蒸汽输入总线这类“是格雷界面但没有电路槽”的情况，仍然交给服务端判断。
+     *
+     * <p>清空请求只在“认出了配方对象、且它确实不使用电路”时发；目标容器有没有电路槽由服务端
+     * 拿机器实例判断（写不进去时服务端直接返回，不会误删别的东西）。
      */
     private static void sendCircuitRequest() {
-        if (reverseMode || activeCircuit == GtCircuitSupport.NO_CIRCUIT || activeContainer == null) {
+        if (reverseMode || activeCircuit == null || activeContainer == null) {
             return;
         }
         if (!GtCircuitSupport.isModularUiContainer(activeContainer.getMenu())) {
             return;
         }
-        ModNetwork.CHANNEL.sendToServer(new SetContainerCircuitPacket(
-                activeContainer.getMenu().containerId, activeCircuit));
+        int containerId = activeContainer.getMenu().containerId;
+        if (activeCircuit.requiresCircuit()) {
+            ModNetwork.CHANNEL.sendToServer(new SetContainerCircuitPacket(
+                    containerId, activeCircuit.circuit()));
+            return;
+        }
+        if (activeCircuit.gregRecipe()) {
+            ModNetwork.CHANNEL.sendToServer(new ClearContainerCircuitPacket(containerId));
+        }
     }
 
     /** 处理服务端返回的周围配方份数。 */
@@ -680,12 +700,40 @@ public final class RecipeSenderClient {
         return Component.literal(text);
     }
 
+    /**
+     * 描述这次发送会怎样改动机器电路。
+     *
+     * @return 提示行；目标没有电路槽、或不是格雷配方（识别失败、只从 EMI 原料看到电路）时返回
+     *         {@code null}
+     */
+    private static Component describeCircuitChange() {
+        if (activeCircuit == null || !activeTargetHasCircuit) {
+            // 目标没有电路槽（原版箱子、漏斗等）时什么都不会发，别提示得像是会改电路。
+            return null;
+        }
+        if (activeCircuit.requiresCircuit()) {
+            return getCircuitText(activeCircuit.circuit());
+        }
+        // 认出了配方对象、且它确实不使用电路：目标有电路槽（上面已判）就会置空。
+        return activeCircuit.gregRecipe() ? getCircuitClearText() : null;
+    }
+
     /** 生成带语言文件回退文本的电路提示。 */
     private static Component getCircuitText(int circuit) {
         String key = "text.recipe_sender.circuit";
         String text = I18n.get(key, circuit);
         if (text.equals(key) || text.startsWith("Format error:")) {
             return Component.literal("电路 #" + circuit);
+        }
+        return Component.literal(text);
+    }
+
+    /** 生成带语言文件回退文本的置空提示。 */
+    private static Component getCircuitClearText() {
+        String key = "text.recipe_sender.circuit_clear";
+        String text = I18n.get(key);
+        if (text.equals(key) || text.startsWith("Format error:")) {
+            return Component.literal("电路置空");
         }
         return Component.literal(text);
     }
@@ -774,7 +822,8 @@ public final class RecipeSenderClient {
         activeIngredient = null;
         activeRecipe = null;
         activeSpecs = List.of();
-        activeCircuit = GtCircuitSupport.NO_CIRCUIT;
+        activeCircuit = null;
+        activeTargetHasCircuit = false;
         highlightedInventorySlots = Set.of();
     }
 }
