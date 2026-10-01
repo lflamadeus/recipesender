@@ -20,9 +20,19 @@ public record InsertRecipeItemsPacket(int containerId, List<ItemStack> requireme
     /** 编码正向材料投放请求。 */
     public static void encode(InsertRecipeItemsPacket packet, FriendlyByteBuf buffer) {
         buffer.writeVarInt(packet.containerId);
-        buffer.writeVarInt(Math.min(packet.requirements.size(), MAX_REQUIREMENTS));
-        for (int i = 0; i < packet.requirements.size() && i < MAX_REQUIREMENTS; i++) {
-            ItemStack stack = packet.requirements.get(i);
+        writeRequirements(buffer, packet.requirements);
+    }
+
+    /**
+     * 写入一份材料需求列表。
+     * 数量单独使用 VarInt 编码，绕过原版 writeItem 的单字节数量限制。
+     * 正向投放与「发送到已绑定容器」共用，保证两条通路的材料编码规则不会各写一份。
+     */
+    public static void writeRequirements(FriendlyByteBuf buffer, List<ItemStack> requirements) {
+        int size = Math.min(requirements.size(), MAX_REQUIREMENTS);
+        buffer.writeVarInt(size);
+        for (int i = 0; i < size; i++) {
+            ItemStack stack = requirements.get(i);
             int count = Math.min(stack.getCount(), MAX_ITEMS_PER_REQUIREMENT);
             // Vanilla writeItem 使用单字节数量；先写一份物品信息，再单独写 VarInt 数量。
             buffer.writeItem(stack.copyWithCount(1));
@@ -30,9 +40,8 @@ public record InsertRecipeItemsPacket(int containerId, List<ItemStack> requireme
         }
     }
 
-    /** 解码正向材料投放请求。 */
-    public static InsertRecipeItemsPacket decode(FriendlyByteBuf buffer) {
-        int containerId = buffer.readVarInt();
+    /** 读取一份材料需求列表。 */
+    public static List<ItemStack> readRequirements(FriendlyByteBuf buffer) {
         int size = buffer.readVarInt();
         if (size < 0 || size > MAX_REQUIREMENTS) {
             throw new IllegalArgumentException("Too many recipe requirements: " + size);
@@ -47,7 +56,13 @@ public record InsertRecipeItemsPacket(int containerId, List<ItemStack> requireme
             }
             requirements.add(stack);
         }
-        return new InsertRecipeItemsPacket(containerId, requirements);
+        return requirements;
+    }
+
+    /** 解码正向材料投放请求。 */
+    public static InsertRecipeItemsPacket decode(FriendlyByteBuf buffer) {
+        int containerId = buffer.readVarInt();
+        return new InsertRecipeItemsPacket(containerId, readRequirements(buffer));
     }
 
     /** 将正向投放请求交给服务端主线程处理。 */

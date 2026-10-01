@@ -1,0 +1,429 @@
+package com.lai.recipesender.client;
+
+import com.lai.recipesender.model.BoundContainer;
+import com.lai.recipesender.network.ModNetwork;
+import com.lai.recipesender.network.packet.BindContainerPacket;
+import com.lai.recipesender.network.packet.UpdateBindingPacket;
+import com.lai.recipesender.network.packet.UpdateBindingRelationPacket;
+import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.state.BlockState;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * 绑定确认弹窗：按下绑定键、准星指向某个方块时打开。
+ *
+ * <p>这里只负责收集「名称 + 容器关系（主容器 / 并列成员 / 从容器）」三样东西，真正的落盘、
+ * 合法性校验（父容器必须是主容器、不能挂到自己身上、目标必须有物品容器……）全部由服务端
+ * {@code BoundBindingService} 再做一遍——客户端的选择永远只是「请求」。
+ *
+ * <p>同一个界面也承担「改关系」：管理界面的「关系」按钮会带着已有的绑定重新打开它，
+ * 这时坐标与方块信息取自绑定自身（绑定的容器可能不在玩家当前维度，客户端读不到方块状态）。
+ */
+public class BoundContainerBindScreen extends Screen {
+
+    private static final int PANEL_MARGIN = 20;
+    private static final int PANEL_WIDTH = 300;
+    private static final int PANEL_HEIGHT = 244;
+    private static final int PADDING = 8;
+    private static final int ROLE_ROW_HEIGHT = 14;
+    private static final int DROP_ROW_HEIGHT = 14;
+    private static final int DROP_MAX_VISIBLE = 6;
+
+    /** 新建绑定时为 null；从管理界面进来改关系时非 null。 */
+    private final Screen parent;
+    private final BoundContainer editing;
+    private final ResourceLocation dimension;
+    private final BlockPos pos;
+
+    private ItemStack blockIcon = ItemStack.EMPTY;
+    private String blockName = "";
+    private String blockId = "";
+
+    private EditBox nameBox;
+    private BoundContainer.Role role = BoundContainer.Role.MASTER;
+    private UUID parentId;
+    private boolean parentDropOpen;
+    private int dropScroll;
+
+    private int left;
+    private int top;
+
+    private final List<Hit> hits = new ArrayList<>();
+
+    /** 新建绑定。 */
+    public BoundContainerBindScreen(Screen parent, ResourceLocation dimension, BlockPos pos) {
+        this(parent, dimension, pos, null);
+    }
+
+    /** 改关系：{@code editing} 非 null 时坐标与方块信息一律取自它。 */
+    public BoundContainerBindScreen(Screen parent, ResourceLocation dimension, BlockPos pos,
+                                    BoundContainer editing) {
+        super(Component.translatable("text.recipe_sender.bind_title"));
+        this.parent = parent;
+        this.editing = editing;
+        this.dimension = editing != null ? editing.dimension().location() : dimension;
+        this.pos = editing != null ? editing.pos() : pos;
+    }
+
+    // ------------------------------------------------------------------ 布局
+
+    @Override
+    protected void init() {
+        left = (width - PANEL_WIDTH) / 2;
+        top = Math.max(PANEL_MARGIN, (height - PANEL_HEIGHT) / 2);
+
+        resolveBlockInfo();
+
+        if (editing != null) {
+            role = editing.role();
+            parentId = editing.parentId();
+        }
+
+        nameBox = new EditBox(font, left + PADDING, top + 72, PANEL_WIDTH - PADDING * 2, 18,
+                Component.translatable("text.recipe_sender.bind_name_label"));
+        nameBox.setMaxLength(BoundContainer.MAX_NAME_LENGTH);
+        nameBox.setValue(editing != null ? editing.name() : "");
+        nameBox.setHint(Component.translatable("text.recipe_sender.bind_name_hint"));
+        addRenderableWidget(nameBox);
+
+        addRenderableWidget(Button.builder(Component.translatable("text.recipe_sender.bind_save"),
+                        button -> save())
+                .bounds(left + PANEL_WIDTH - PADDING - 64, top + PANEL_HEIGHT - 28, 64, 18)
+                .build());
+
+        setInitialFocus(nameBox);
+    }
+
+    /** 新建时从客户端世界读方块；改关系时只能靠绑定自己存的图标。 */
+    private void resolveBlockInfo() {
+        if (editing != null) {
+            blockIcon = editing.iconItem();
+            blockName = BoundUi.blockText(editing);
+            blockId = blockIcon.isEmpty()
+                    ? ""
+                    : BuiltInRegistries.ITEM.getKey(blockIcon.getItem()).toString();
+            return;
+        }
+        if (minecraft == null || minecraft.level == null) {
+            return;
+        }
+        BlockState state = minecraft.level.getBlockState(pos);
+        if (state.isAir()) {
+            return;
+        }
+        blockIcon = state.getBlock().asItem().getDefaultInstance();
+        blockName = state.getBlock().getName().getString();
+        blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+    }
+
+    // ------------------------------------------------------------------ 绘制
+
+    @Override
+    public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
+        renderBackground(graphics);
+        BoundUi.panel(graphics, left, top, PANEL_WIDTH, PANEL_HEIGHT);
+        hits.clear();
+
+        int textX = left + PADDING;
+        int innerWidth = PANEL_WIDTH - PADDING * 2;
+
+        graphics.drawString(font, Component.translatable("text.recipe_sender.bind_title"),
+                textX, top + 8, BoundUi.TEXT, false);
+        graphics.drawString(font, Component.translatable("text.recipe_sender.bind_subtitle",
+                        dimensionText(), posText()), textX, top + 20, BoundUi.TEXT_DIM, false);
+
+        drawSeparator(graphics, top + 34);
+
+        graphics.renderItem(blockIcon, textX, top + 40);
+        graphics.drawString(font, blockName, textX + 20, top + 40, BoundUi.TEXT, false);
+        graphics.drawString(font, Component.translatable("text.recipe_sender.bind_block_source",
+                        blockId), textX + 20, top + 51, BoundUi.TEXT_DIM, false);
+
+        graphics.drawString(font, Component.translatable("text.recipe_sender.bind_name_label"),
+                textX, top + 62, BoundUi.TEXT_DIM, false);
+
+        graphics.drawString(font, Component.translatable("text.recipe_sender.bind_relation_label"),
+                textX, top + 96, BoundUi.TEXT_DIM, false);
+        int roleY = top + 108;
+        drawRoleRow(graphics, mouseX, mouseY, textX, roleY, BoundContainer.Role.MASTER,
+                "text.recipe_sender.bind_role_master");
+        drawRoleRow(graphics, mouseX, mouseY, textX, roleY + ROLE_ROW_HEIGHT,
+                BoundContainer.Role.PARALLEL, "text.recipe_sender.bind_role_parallel");
+        drawRoleRow(graphics, mouseX, mouseY, textX, roleY + ROLE_ROW_HEIGHT * 2,
+                BoundContainer.Role.SLAVE, "text.recipe_sender.bind_role_slave");
+        graphics.drawString(font, roleDescription(), textX, roleY + ROLE_ROW_HEIGHT * 3 + 2,
+                BoundUi.TEXT_DIM, false);
+
+        // 这里原来还有一条分隔线，但它正好压在角色说明文字的下沿上，把字挡掉一半；
+        // 角色区与父容器区靠标签本身的颜色差异已经能区分开，索性去掉。
+        boolean needsParent = role != BoundContainer.Role.MASTER;
+        graphics.drawString(font, Component.translatable("text.recipe_sender.bind_parent_label"),
+                textX, top + 166, needsParent ? BoundUi.TEXT_DIM : BoundUi.TEXT_DISABLED, false);
+        drawParentSelect(graphics, mouseX, mouseY, textX, top + 176, innerWidth, needsParent);
+
+        graphics.drawString(font, Component.translatable("text.recipe_sender.bind_category_hint"),
+                textX, top + 200, BoundUi.TEXT_DISABLED, false);
+
+        graphics.drawString(font, Component.translatable("text.recipe_sender.bind_footer"),
+                textX, top + PANEL_HEIGHT - 22, BoundUi.TEXT_DIM, false);
+
+        super.render(graphics, mouseX, mouseY, partialTick);
+
+        if (parentDropOpen) {
+            drawDropdown(graphics, mouseX, mouseY, textX, top + 195, innerWidth);
+        }
+    }
+
+    private void drawSeparator(GuiGraphics graphics, int y) {
+        graphics.fill(left + 1, y, left + PANEL_WIDTH - 1, y + 1, BoundUi.BORDER_DARK);
+    }
+
+    private void drawRoleRow(GuiGraphics graphics, int mouseX, int mouseY, int x, int y,
+                             BoundContainer.Role candidate, String labelKey) {
+        boolean selected = role == candidate;
+        boolean hovered = BoundUi.inside(mouseX, mouseY, x, y, PANEL_WIDTH - PADDING * 2,
+                ROLE_ROW_HEIGHT);
+        if (hovered) {
+            graphics.fill(x - 2, y - 1, x + PANEL_WIDTH - PADDING * 2, y + ROLE_ROW_HEIGHT - 1,
+                    BoundUi.ROW_HOVER);
+        }
+        int boxY = y + 1;
+        graphics.fill(x, boxY, x + 11, boxY + 11, BoundUi.BORDER_DARK);
+        graphics.fill(x + 1, boxY + 1, x + 10, boxY + 10, 0xFFE8E8E8);
+        if (selected) {
+            graphics.fill(x + 3, boxY + 3, x + 8, boxY + 8, BoundUi.TAG_MASTER);
+        }
+        graphics.drawString(font, Component.translatable(labelKey), x + 16, y + 2,
+                selected ? BoundUi.TEXT : BoundUi.TEXT_DIM, false);
+        hits.add(new Hit(x - 2, y - 1, PANEL_WIDTH - PADDING * 2, ROLE_ROW_HEIGHT,
+                "role:" + candidate.name()));
+    }
+
+    private void drawParentSelect(GuiGraphics graphics, int mouseX, int mouseY, int x, int y,
+                                  int width, boolean enabled) {
+        boolean hovered = enabled && BoundUi.inside(mouseX, mouseY, x, y, width, 18);
+        graphics.fill(x, y, x + width, y + 18, hovered ? BoundUi.ROW_HOVER : 0xFFB0B0B0);
+        graphics.fill(x, y, x + width, y + 1, BoundUi.BORDER_DARK);
+        graphics.fill(x, y + 17, x + width, y + 18, BoundUi.BORDER_LIGHT);
+        graphics.fill(x, y, x + 1, y + 18, BoundUi.BORDER_DARK);
+        graphics.fill(x + width - 1, y, x + width, y + 18, BoundUi.BORDER_LIGHT);
+        graphics.drawString(font, parentText(), x + 4, y + 5,
+                enabled ? BoundUi.TEXT : BoundUi.TEXT_DISABLED, false);
+        graphics.drawString(font, "▼", x + width - 12, y + 5,
+                enabled ? BoundUi.TEXT_DIM : BoundUi.TEXT_DISABLED, false);
+        if (enabled) {
+            hits.add(new Hit(x, y, width, 18, "parent"));
+        }
+    }
+
+    private void drawDropdown(GuiGraphics graphics, int mouseX, int mouseY, int x, int y, int width) {
+        List<BoundContainer> candidates = parentCandidates();
+        if (candidates.isEmpty()) {
+            return;
+        }
+        int visible = Math.min(DROP_MAX_VISIBLE, candidates.size());
+        int height = visible * DROP_ROW_HEIGHT + 2;
+        graphics.fill(x - 1, y - 1, x + width + 1, y + height + 1, BoundUi.BORDER_DARK);
+        graphics.fill(x, y, x + width, y + height, 0xFFE0E0E0);
+        for (int index = 0; index < visible; index++) {
+            BoundContainer candidate = candidates.get(dropScroll + index);
+            int rowY = y + 1 + index * DROP_ROW_HEIGHT;
+            boolean hovered = BoundUi.inside(mouseX, mouseY, x, rowY, width, DROP_ROW_HEIGHT);
+            if (hovered) {
+                graphics.fill(x, rowY, x + width, rowY + DROP_ROW_HEIGHT, BoundUi.ROW_HOVER);
+            }
+            graphics.drawString(font, BoundContainerClient.displayName(candidate), x + 3, rowY + 3,
+                    candidate.id().equals(parentId) ? BoundUi.TEXT : BoundUi.TEXT_DIM, false);
+            hits.add(new Hit(x, rowY, width, DROP_ROW_HEIGHT, "parent:" + candidate.id()));
+        }
+    }
+
+    // ------------------------------------------------------------------ 文本
+
+    private String posText() {
+        return "(" + pos.getX() + ", " + pos.getY() + ", " + pos.getZ() + ")";
+    }
+
+    private String dimensionText() {
+        if ("minecraft".equals(dimension.getNamespace())) {
+            return Component.translatable("dimension.minecraft." + dimension.getPath()).getString();
+        }
+        return dimension.toString();
+    }
+
+    private Component roleDescription() {
+        String key = switch (role) {
+            case MASTER -> "text.recipe_sender.bind_role_master_desc";
+            case PARALLEL -> "text.recipe_sender.bind_role_parallel_desc";
+            case SLAVE -> "text.recipe_sender.bind_role_slave_desc";
+        };
+        return Component.translatable(key);
+    }
+
+    private Component parentText() {
+        if (role == BoundContainer.Role.MASTER) {
+            return Component.translatable("text.recipe_sender.bind_parent_not_needed");
+        }
+        BoundContainer chosen = findParent();
+        if (chosen == null) {
+            return Component.translatable(parentCandidates().isEmpty()
+                    ? "text.recipe_sender.bind_parent_empty"
+                    : "text.recipe_sender.bind_parent_none");
+        }
+        return Component.literal(BoundContainerClient.displayName(chosen));
+    }
+
+    private BoundContainer findParent() {
+        return parentId == null ? null : BoundContainerClient.find(parentId);
+    }
+
+    /** 可选的主容器：排除自己（自己不能当自己的父）。 */
+    private List<BoundContainer> parentCandidates() {
+        List<BoundContainer> result = new ArrayList<>();
+        for (BoundContainer master : BoundContainerClient.masters()) {
+            if (editing == null || !master.id().equals(editing.id())) {
+                result.add(master);
+            }
+        }
+        return result;
+    }
+
+    // ------------------------------------------------------------------ 交互
+
+    @Override
+    public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        if (button == 0) {
+            if (parentDropOpen) {
+                if (clickDropdown(mouseX, mouseY)) {
+                    return true;
+                }
+                parentDropOpen = false;
+                return true;
+            }
+            for (Hit hit : hits) {
+                if (BoundUi.inside(mouseX, mouseY, hit.x, hit.y, hit.width, hit.height)) {
+                    act(hit.action);
+                    return true;
+                }
+            }
+        }
+        return super.mouseClicked(mouseX, mouseY, button);
+    }
+
+    private boolean clickDropdown(double mouseX, double mouseY) {
+        for (Hit hit : hits) {
+            if (hit.action.startsWith("parent:")
+                    && BoundUi.inside(mouseX, mouseY, hit.x, hit.y, hit.width, hit.height)) {
+                parentId = UUID.fromString(hit.action.substring("parent:".length()));
+                parentDropOpen = false;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void act(String action) {
+        if ("parent".equals(action)) {
+            parentDropOpen = !parentDropOpen;
+            dropScroll = 0;
+            return;
+        }
+        if (action.startsWith("role:")) {
+            role = BoundContainer.Role.valueOf(action.substring("role:".length()));
+            if (role == BoundContainer.Role.MASTER) {
+                parentId = null;
+                parentDropOpen = false;
+            } else {
+                ensureParent();
+            }
+            return;
+        }
+        if ("save".equals(action)) {
+            save();
+        }
+    }
+
+    /** 切到「并列成员 / 从容器」时，默认先挂到第一个主容器上，省一次点击。 */
+    private void ensureParent() {
+        if (parentId != null && findParent() != null) {
+            return;
+        }
+        List<BoundContainer> candidates = parentCandidates();
+        parentId = candidates.isEmpty() ? null : candidates.get(0).id();
+    }
+
+    @Override
+    public boolean mouseScrolled(double mouseX, double mouseY, double delta) {
+        if (parentDropOpen) {
+            int max = Math.max(0, parentCandidates().size() - DROP_MAX_VISIBLE);
+            dropScroll = Math.max(0, Math.min(max, dropScroll - (int) Math.signum(delta)));
+            return true;
+        }
+        return super.mouseScrolled(mouseX, mouseY, delta);
+    }
+
+    @Override
+    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        if (keyCode == 257 || keyCode == 335) {
+            save();
+            return true;
+        }
+        if (keyCode == 256 && parentDropOpen) {
+            parentDropOpen = false;
+            return true;
+        }
+        return super.keyPressed(keyCode, scanCode, modifiers);
+    }
+
+    @Override
+    public void onClose() {
+        if (minecraft != null) {
+            minecraft.setScreen(parent);
+        }
+    }
+
+    @Override
+    public boolean isPauseScreen() {
+        return false;
+    }
+
+    // ------------------------------------------------------------------ 保存
+
+    private void save() {
+        String name = nameBox == null ? "" : nameBox.getValue().trim();
+        if (name.length() > BoundContainer.MAX_NAME_LENGTH) {
+            name = name.substring(0, BoundContainer.MAX_NAME_LENGTH);
+        }
+        if (role != BoundContainer.Role.MASTER && parentId == null) {
+            RecipeSenderClient.notifyPlayer(Component.translatable("text.recipe_sender.bind_need_parent"));
+            return;
+        }
+        if (editing == null) {
+            ModNetwork.CHANNEL.sendToServer(
+                    new BindContainerPacket(dimension, pos, name, role, parentId));
+        } else {
+            // 名字留空 = 保持原名（不是「改成未命名」）；关系无论如何都发一遍，服务端自己比对。
+            if (!name.isEmpty() && !name.equals(editing.name())) {
+                ModNetwork.CHANNEL.sendToServer(new UpdateBindingPacket(editing.id(), name));
+            }
+            ModNetwork.CHANNEL.sendToServer(
+                    new UpdateBindingRelationPacket(editing.id(), role, parentId));
+        }
+        onClose();
+    }
+
+    /** 每帧重建的命中区。 */
+    private record Hit(int x, int y, int width, int height, String action) {
+    }
+}

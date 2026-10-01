@@ -1,12 +1,21 @@
 package com.lai.recipesender.network;
 
 import com.lai.recipesender.RecipeSenderMod;
+import com.lai.recipesender.network.packet.BindContainerPacket;
+import com.lai.recipesender.network.packet.BoundInsertResultPacket;
+import com.lai.recipesender.network.packet.BoundNoticePacket;
 import com.lai.recipesender.network.packet.ClearContainerCircuitPacket;
 import com.lai.recipesender.network.packet.InsertRecipeItemsPacket;
+import com.lai.recipesender.network.packet.InsertRecipeItemsToBoundPacket;
 import com.lai.recipesender.network.packet.NearbyRecipeAvailabilityPacket;
 import com.lai.recipesender.network.packet.NearbyRecipePullPacket;
 import com.lai.recipesender.network.packet.NearbyRecipeQueryPacket;
 import com.lai.recipesender.network.packet.SetContainerCircuitPacket;
+import com.lai.recipesender.network.packet.SelectBoundTargetPacket;
+import com.lai.recipesender.network.packet.SyncBoundContainersPacket;
+import com.lai.recipesender.network.packet.UnbindContainerPacket;
+import com.lai.recipesender.network.packet.UpdateBindingPacket;
+import com.lai.recipesender.network.packet.UpdateBindingRelationPacket;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraftforge.network.NetworkDirection;
 import net.minecraftforge.network.NetworkRegistry;
@@ -14,7 +23,7 @@ import net.minecraftforge.network.simple.SimpleChannel;
 
 /** 集中注册客户端与服务端之间的数据包。 */
 public final class ModNetwork {
-    private static final String PROTOCOL_VERSION = "4";
+    private static final String PROTOCOL_VERSION = "8";
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             ResourceLocation.fromNamespaceAndPath(RecipeSenderMod.MOD_ID, "main"),
             () -> PROTOCOL_VERSION, PROTOCOL_VERSION::equals, PROTOCOL_VERSION::equals);
@@ -54,6 +63,51 @@ public final class ModNetwork {
                 .encoder(ClearContainerCircuitPacket::encode)
                 .decoder(ClearContainerCircuitPacket::decode)
                 .consumerMainThread(ClearContainerCircuitPacket::handle)
+                .add();
+        CHANNEL.messageBuilder(SyncBoundContainersPacket.class, id++, NetworkDirection.PLAY_TO_CLIENT)
+                .encoder(SyncBoundContainersPacket::encode)
+                .decoder(SyncBoundContainersPacket::decode)
+                .consumerMainThread(SyncBoundContainersPacket::handle)
+                .add();
+        CHANNEL.messageBuilder(BindContainerPacket.class, id++, NetworkDirection.PLAY_TO_SERVER)
+                .encoder(BindContainerPacket::encode)
+                .decoder(BindContainerPacket::decode)
+                .consumerMainThread(BindContainerPacket::handle)
+                .add();
+        CHANNEL.messageBuilder(UnbindContainerPacket.class, id++, NetworkDirection.PLAY_TO_SERVER)
+                .encoder(UnbindContainerPacket::encode)
+                .decoder(UnbindContainerPacket::decode)
+                .consumerMainThread(UnbindContainerPacket::handle)
+                .add();
+        CHANNEL.messageBuilder(InsertRecipeItemsToBoundPacket.class, id++, NetworkDirection.PLAY_TO_SERVER)
+                .encoder(InsertRecipeItemsToBoundPacket::encode)
+                .decoder(InsertRecipeItemsToBoundPacket::decode)
+                .consumerMainThread(InsertRecipeItemsToBoundPacket::handle)
+                .add();
+        CHANNEL.messageBuilder(BoundInsertResultPacket.class, id++, NetworkDirection.PLAY_TO_CLIENT)
+                .encoder(BoundInsertResultPacket::encode)
+                .decoder(BoundInsertResultPacket::decode)
+                .consumerMainThread(BoundInsertResultPacket::handle)
+                .add();
+        CHANNEL.messageBuilder(UpdateBindingPacket.class, id++, NetworkDirection.PLAY_TO_SERVER)
+                .encoder(UpdateBindingPacket::encode)
+                .decoder(UpdateBindingPacket::decode)
+                .consumerMainThread(UpdateBindingPacket::handle)
+                .add();
+        CHANNEL.messageBuilder(SelectBoundTargetPacket.class, id++, NetworkDirection.PLAY_TO_SERVER)
+                .encoder(SelectBoundTargetPacket::encode)
+                .decoder(SelectBoundTargetPacket::decode)
+                .consumerMainThread(SelectBoundTargetPacket::handle)
+                .add();
+        CHANNEL.messageBuilder(UpdateBindingRelationPacket.class, id++, NetworkDirection.PLAY_TO_SERVER)
+                .encoder(UpdateBindingRelationPacket::encode)
+                .decoder(UpdateBindingRelationPacket::decode)
+                .consumerMainThread(UpdateBindingRelationPacket::handle)
+                .add();
+        CHANNEL.messageBuilder(BoundNoticePacket.class, id++, NetworkDirection.PLAY_TO_CLIENT)
+                .encoder(BoundNoticePacket::encode)
+                .decoder(BoundNoticePacket::decode)
+                .consumerMainThread(BoundNoticePacket::handle)
                 .add();
     }
 }

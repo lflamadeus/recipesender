@@ -3,13 +3,20 @@ package com.lai.recipesender.client;
 import com.lai.recipesender.RecipeSenderMod;
 import com.lai.recipesender.integration.findme.FindMeExtendedAdapter;
 import com.lai.recipesender.integration.gt.GtCircuitSupport;
+import com.lai.recipesender.model.BoundContainer;
+import com.lai.recipesender.model.BoundStatus;
 import com.lai.recipesender.model.RecipeIngredientSpec;
 import com.lai.recipesender.network.ModNetwork;
+import com.lai.recipesender.network.packet.BindContainerPacket;
 import com.lai.recipesender.network.packet.ClearContainerCircuitPacket;
 import com.lai.recipesender.network.packet.InsertRecipeItemsPacket;
+import com.lai.recipesender.network.packet.InsertRecipeItemsToBoundPacket;
 import com.lai.recipesender.network.packet.NearbyRecipePullPacket;
 import com.lai.recipesender.network.packet.NearbyRecipeQueryPacket;
+import com.lai.recipesender.network.packet.SelectBoundTargetPacket;
 import com.lai.recipesender.network.packet.SetContainerCircuitPacket;
+import com.lai.recipesender.service.BoundContainerService;
+import com.lai.recipesender.service.BoundTargetResolver;
 import com.mojang.blaze3d.platform.InputConstants;
 import dev.emi.emi.api.EmiApi;
 import dev.emi.emi.api.recipe.EmiRecipe;
@@ -21,14 +28,18 @@ import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.client.resources.language.I18n;
+import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.InputEvent;
 import net.minecraftforge.client.event.RegisterKeyMappingsEvent;
+import net.minecraftforge.client.event.RenderGuiEvent;
 import net.minecraftforge.client.event.ScreenEvent;
 import net.minecraftforge.client.settings.KeyConflictContext;
 import net.minecraftforge.client.settings.KeyModifier;
@@ -44,6 +55,7 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 
 /** 管理 EMI 配方选择、份数调整以及双向材料传输。 */
@@ -58,6 +70,13 @@ public final class RecipeSenderClient {
     /** 服务端统计请求的等待上限；超时后解除等待，避免界面永久卡在“统计中”。 */
     private static final long AVAILABILITY_TIMEOUT_TICKS = 40L;
     private static final AtomicLong REQUEST_SEQUENCE = new AtomicLong();
+    /** 「发送到已绑定容器」的请求号；与反转统计分开，两边的回执互不干扰。 */
+    private static final AtomicLong BOUND_REQUEST_SEQUENCE = new AtomicLong();
+
+    /** 发送模式的优先级编号；数字越大优先级越高，见 {@link #onClientTick}。 */
+    private static final int MODE_FORWARD = 0;
+    private static final int MODE_BOUND = 1;
+    private static final int MODE_REVERSE = 2;
 
     private static final KeyMapping INSERT_RECIPE_KEY = new KeyMapping(
             "key.recipe_sender.insert", KeyConflictContext.GUI, KeyModifier.NONE,
@@ -65,9 +84,39 @@ public final class RecipeSenderClient {
     private static final KeyMapping REVERSE_KEY = new KeyMapping(
             "key.recipe_sender.reverse", KeyConflictContext.GUI, KeyModifier.NONE,
             InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_GRAVE_ACCENT, "key.categories.recipe_sender");
+    /**
+     * 绑定容器 / 按住时把 Z 的功能换成「发送到已绑定容器」。
+     *
+     * <p>一个键干两件事：<b>按住</b>它时 Z 变成「发送到已绑定容器」（与反转键同一套语义，
+     * 是按住生效的模式键，不是切换键）；在<b>世界里按一下</b>它则把准星指向的方块绑成容器。
+     * 刻意不拆成两个键：两者默认值相同、语义不冲突，而拆开后玩家改键时极易只改一个，
+     * 于是出现「改了键但没反应」——这正是 1.0.19 修掉的坑。
+     *
+     * <p>上下文必须是 {@code UNIVERSAL}：绑定要能在没有任何界面的时候发生。代价是它在世界里
+     * 和输入框里都会响应，所以绑定入口显式要求「当前没有任何界面」
+     * （见 {@link #bindLookedAtBlock()}），在容器界面里按它不会误绑界面背后的方块。
+     */
+    private static final KeyMapping BOUND_SEND_KEY = new KeyMapping(
+            "key.recipe_sender.bound", KeyConflictContext.UNIVERSAL, KeyModifier.NONE,
+            InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_B, "key.categories.recipe_sender");
+    /**
+     * 打开「已绑定容器」管理界面。
+     *
+     * <p>默认 {@code Ctrl + B}：必须带修饰键，否则会与 {@link #BOUND_SEND_KEY}（裸键 B）撞车——
+     * 同一个物理键上挂两个语义，玩家分不清按一下到底会绑定还是开界面。
+     */
+    private static final KeyMapping MANAGE_KEY = new KeyMapping(
+            "key.recipe_sender.manage", KeyConflictContext.UNIVERSAL, KeyModifier.CONTROL,
+            InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_B, "key.categories.recipe_sender");
 
     private static boolean selecting;
     private static boolean reverseMode;
+    /** 当前选择是不是「发送到已绑定容器」；与 {@link #reverseMode} 互斥。 */
+    private static boolean boundMode;
+    /** 本次发送的目标；只在 {@link #boundMode} 为 true 时有值。 */
+    private static BoundContainer activeBinding;
+    /** 最近一次绑定发送的请求号；只接受与它相等的回执。 */
+    private static long boundRequestId;
     private static boolean awaitingAvailability;
     private static boolean releasePending;
     private static boolean selectAllRequested;
@@ -117,10 +166,13 @@ public final class RecipeSenderClient {
      * 反转键必须无条件注册：Forge 只会把 options.txt 里保存的绑定写回“已注册”的 KeyMapping
      * （控制界面的列表同样是 options.keyMappings），一旦按条件注册，玩家在控制设置里改好的键
      * 在下次启动时就会被丢弃、退回默认的“~”。是否启用反转功能改由运行期的模组检测决定。
+     * 新增的绑定键同样无条件注册，理由一致：它必须在控制设置里可改、且改了要能存下来。
      */
     private static void registerKeyMappings(RegisterKeyMappingsEvent event) {
         event.register(INSERT_RECIPE_KEY);
         event.register(REVERSE_KEY);
+        event.register(BOUND_SEND_KEY);
+        event.register(MANAGE_KEY);
     }
 
     /**
@@ -130,17 +182,27 @@ public final class RecipeSenderClient {
      * 这条路径下不会同步更新，会继续响应旧按键，表现为“改键后旧键还能触发反转”。
      */
     private static boolean isReverseKeyHeld() {
-        InputConstants.Key bound = REVERSE_KEY.getKey();
+        return isKeyHeld(REVERSE_KEY);
+    }
+
+    /** 判断「发送到已绑定容器」模式键当前是否按下；判定方式与反转键完全一致。 */
+    public static boolean isBoundSendKeyHeld() {
+        return isKeyHeld(BOUND_SEND_KEY);
+    }
+
+    /** 读取实时绑定后查询 GLFW 原始状态；改键立即生效，不依赖 Forge 的按键查找表。 */
+    private static boolean isKeyHeld(KeyMapping mapping) {
+        InputConstants.Key bound = mapping.getKey();
         // 未绑定时 getKey() 给出 InputConstants.UNKNOWN（KEYSYM，value 为 -1）。
         return switch (bound.getType()) {
             case KEYSYM -> bound.getValue() > 0 && isGlfwKeyDown(bound.getValue());
             case MOUSE -> GLFW.glfwGetMouseButton(Minecraft.getInstance().getWindow().getWindow(),
                     bound.getValue()) == GLFW.GLFW_PRESS;
-            case SCANCODE -> REVERSE_KEY.isDown();
+            case SCANCODE -> mapping.isDown();
         };
     }
 
-    /** 处理 Alt、Z 和配方反转键的按下与松开事件。 */
+    /** 处理 Alt、Z、配方反转键和绑定键的按下与松开事件。 */
     @SubscribeEvent
     public static void onKeyInput(InputEvent.Key event) {
         if (event.getAction() == GLFW.GLFW_PRESS && selecting && isAltKey(event)) {
@@ -148,14 +210,134 @@ public final class RecipeSenderClient {
             selectedBatches = maxSendableBatches();
             return;
         }
-        if (!INSERT_RECIPE_KEY.matches(event.getKey(), event.getScanCode())) {
+        if (INSERT_RECIPE_KEY.matches(event.getKey(), event.getScanCode())) {
+            if (event.getAction() == GLFW.GLFW_PRESS && !selecting) {
+                beginSelection();
+            } else if (event.getAction() == GLFW.GLFW_RELEASE && selecting) {
+                finishSelection();
+            }
             return;
         }
-        if (event.getAction() == GLFW.GLFW_PRESS && !selecting) {
-            beginSelection();
-        } else if (event.getAction() == GLFW.GLFW_RELEASE && selecting) {
-            finishSelection();
+        // 本模组自己的界面（选择弹窗、管理界面）打开时，B 与 Ctrl+B 由界面自己处理：
+        // InputEvent.Key 是无条件触发的（Forge 在 KeyboardHandler.keyPress 末尾必然调用），
+        // 不挡住的话一次按键会被处理两遍——弹窗里按 B 想「直达上次」会同时去绑准星方块，
+        // 弹窗里按 Ctrl+B 会把管理界面的父界面从「弹窗的父界面」改成「弹窗本身」。
+        if (isOwnScreenOpen()) {
+            return;
         }
+        // 管理界面键默认是 Ctrl + B，必须连修饰键一起判定：isActiveAndMatches 会检查 Ctrl 是否按下，
+        // 所以裸键 B 不会走到这里，而是继续往下落到绑定键上。
+        if (event.getAction() == GLFW.GLFW_PRESS && !selecting
+                && MANAGE_KEY.isActiveAndMatches(
+                        InputConstants.getKey(event.getKey(), event.getScanCode()))) {
+            openManageScreen();
+            return;
+        }
+        // 绑定键是裸键（默认 B）且上下文为 UNIVERSAL，在 EMI 搜索框里打字母 b 也会走到这里，
+        // 所以真正的判定放在 bindLookedAtBlock() 里：那里会避开搜索框。
+        // 这里只比键码（KeyModifier.NONE 的 isActive 恒为 true，比修饰键也区分不开 Ctrl+B），
+        // 靠上面管理键分支先判并 return 把 Ctrl+B 截走。
+        if (event.getAction() == GLFW.GLFW_PRESS && !selecting
+                && BOUND_SEND_KEY.matches(event.getKey(), event.getScanCode())) {
+            bindLookedAtBlock();
+        }
+    }
+
+    /**
+     * 鼠标键版本的绑定键与管理键。
+     *
+     * <p>玩家可以在控制设置里把任意键位改成鼠标键（常见是鼠标侧键），但
+     * {@link InputEvent.Key} 只承载键盘事件，鼠标键走的是 {@link InputEvent.MouseButton}——
+     * 没有这个入口，改成鼠标侧键后按下去不会有任何反应。
+     *
+     * <p>用 {@code isActiveAndMatches} 而不是 {@code matches}：前者连修饰键一起判，
+     * 管理键是 Ctrl + 键，只比键码的话鼠标侧键会被当成管理键。
+     */
+    @SubscribeEvent
+    public static void onMouseInput(InputEvent.MouseButton.Post event) {
+        if (event.getAction() != GLFW.GLFW_PRESS || selecting || isOwnScreenOpen()) {
+            return;
+        }
+        InputConstants.Key button = InputConstants.Type.MOUSE.getOrCreate(event.getButton());
+        if (MANAGE_KEY.isActiveAndMatches(button)) {
+            openManageScreen();
+            return;
+        }
+        if (BOUND_SEND_KEY.isActiveAndMatches(button)) {
+            bindLookedAtBlock();
+        }
+    }
+
+    /** 当前打开的界面是不是本模组自己的界面（选择弹窗 / 管理界面 / 绑定确认弹窗）。 */
+    private static boolean isOwnScreenOpen() {
+        return Minecraft.getInstance().screen instanceof BoundContainerPickScreen
+                || Minecraft.getInstance().screen instanceof BoundContainerManageScreen
+                || Minecraft.getInstance().screen instanceof BoundContainerBindScreen;
+    }
+
+    /** 打开「已绑定容器」管理界面；用当前界面当父界面，这样 Esc 能原路返回。 */
+    private static void openManageScreen() {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.player == null) {
+            return;
+        }
+        if (EmiApi.isSearchFocused()) {
+            return;
+        }
+        minecraft.setScreen(new BoundContainerManageScreen(minecraft.screen));
+    }
+
+    /**
+     * 绑定玩家准星指向的方块。
+     *
+     * <p><b>只在没有任何界面时生效。</b>打开容器、背包或任何界面时按它什么都不做：
+     * 那些时候准星取到的是界面背后的方块，玩家在整理背包时按一下就会被绑上一条自己没预期的绑定。
+     * 想绑某个容器，先关掉它的界面、对着它按一下即可。
+     *
+     * <p>EMI 搜索框必须显式放行——搜索框里打字母 b 是打字，不是绑定请求。
+     * 这里用 EMI 的公开 API 判断，不去猜它的焦点状态。
+     */
+    private static void bindLookedAtBlock() {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.player == null) {
+            return;
+        }
+        if (minecraft.screen != null) {
+            return;
+        }
+        if (EmiApi.isSearchFocused()) {
+            return;
+        }
+        HitResult picked = minecraft.hitResult;
+        BlockPos pos = picked instanceof BlockHitResult hit && hit.getType() == HitResult.Type.BLOCK
+                ? hit.getBlockPos() : null;
+        // 这一条日志是为了区分「按键没被识别」和「识别了但准星没对着方块」。
+        LOGGER.info("绑定键已触发：取到的方块 = {}，EMI 搜索框聚焦 = {}", pos, EmiApi.isSearchFocused());
+        if (pos == null) {
+            sendMessage(minecraft, getMessage("text.recipe_sender.bind_no_target",
+                    "准星没有指向方块"));
+            return;
+        }
+        // 石头、混凝土这类没有方块实体的方块永远不可能提供物品容器，绑了也永远发不进去，
+        // 所以连弹窗都不打开。服务端 BoundBindingService 还会用同一个判定再拦一次：
+        // 客户端的能力表可能不全（某些模组只注册服务端），不能把它当成唯一依据。
+        if (!BoundTargetResolver.hasItemHandler(minecraft.level.getBlockEntity(pos))) {
+            sendMessage(minecraft, getMessage("text.recipe_sender.bind_no_container",
+                    "这个方块不是物品容器"));
+            return;
+        }
+        ResourceLocation dimension = minecraft.player.level().dimension().location();
+        // 同一个方块重复绑定只会把名字顶掉（服务端按同坐标更新），玩家多半是想改关系——
+        // 那走管理界面的「关系」按钮。这里直接说清楚，别让一次手抖覆盖掉已经调好的名字。
+        BoundContainer existing = BoundContainerClient.findAt(dimension, pos);
+        if (existing != null) {
+            sendMessage(minecraft, Component.translatable("text.recipe_sender.bound_already",
+                    existing.name()));
+            return;
+        }
+        // 名称、容器关系（主容器 / 并列成员 / 从容器）都在弹窗里定，服务端还会再校验一遍。
+        // 名称留空时由服务端从方块状态生成默认名，客户端不参与命名。
+        minecraft.setScreen(new BoundContainerBindScreen(null, dimension, pos));
     }
 
     /** 每客户端 tick 检查界面、目标配方和背包统计是否仍然有效。 */
@@ -165,11 +347,31 @@ public final class RecipeSenderClient {
             return;
         }
         clientTicks++;
+        // 提示的生命周期与界面无关，必须每 tick 都走：下面的 selecting 早退不能把它挡掉，
+        // 否则「绑定成功」这种在非选择状态下发出的提示会一直挂在屏幕上。
+        NoticeOverlay.tick();
         Minecraft minecraft = Minecraft.getInstance();
         if (!bindingLogged) {
             logReverseBinding(minecraft);
         }
         if (!selecting) {
+            return;
+        }
+        // 发送模式由「此刻按住哪些修饰键」实时决定，优先级固定为：反转 > 发送到已绑定容器 > 正向发送。
+        // 玩家习惯先按 Z 再补按修饰键，如果只在按下 Z 的那一瞬间判定，后补的修饰键就完全无效，
+        // 所以每 tick 复核一次。
+        //
+        // 但只升级、不降级：模式一旦升到高优先级就锁住，直到本次选择结束。
+        // 降级是错的——松开两个键必然有先后（常见是先松修饰键再松 Z，间隔几十毫秒），
+        // 若在 Z 松开前的某一 tick 看到修饰键已抬起就把模式降回去，最终就会按降级后的模式发送，
+        // 表现为「HUD 明明显示发送到已绑定容器，结果发到了当前界面」。
+        // 锁定之后松键顺序不再影响结果，也就不需要给「同时松开」猜一个容差毫秒数。
+        int wantedMode = isReverseKeyHeld() ? MODE_REVERSE
+                : (isBoundSendKeyHeld() ? MODE_BOUND : MODE_FORWARD);
+        int currentMode = reverseMode ? MODE_REVERSE : (boundMode ? MODE_BOUND : MODE_FORWARD);
+        if (wantedMode > currentMode && canEnterMode(wantedMode)) {
+            cancelSelection("发送模式已提升");
+            beginSelection();
             return;
         }
         if (minecraft.screen != activeScreen) {
@@ -194,6 +396,21 @@ public final class RecipeSenderClient {
     }
 
     /**
+     * 想切到某个模式，先确认它这次真的能成立。
+     *
+     * <p>切模式要先把当前选择取消再重开；如果重开失败（没有绑定容器、反转搜索不可用），
+     * 玩家会落得「按了修饰键，连原来的正向发送也没了」。所以不可成立时干脆不切，
+     * 让当前这次选择按原模式走完。
+     */
+    private static boolean canEnterMode(int mode) {
+        return switch (mode) {
+            case MODE_REVERSE -> FindMeExtendedAdapter.isAvailable();
+            case MODE_BOUND -> !BoundContainerClient.masters().isEmpty();
+            default -> true;
+        };
+    }
+
+    /**
      * 玩家按住反转键、但反转搜索不可用时给出明确原因。
      * <p>
      * 区分“没装”和“装了但不兼容”两种情况：前者是玩家漏装可选依赖，后者几乎总是
@@ -209,18 +426,60 @@ public final class RecipeSenderClient {
             reverseUnavailableLogged = true;
             LOGGER.warn("反转搜索不可用：FindMeExtended 已安装 = {}", installed);
         }
-        minecraft.player.displayClientMessage(installed
+        NoticeOverlay.show(installed
                 ? getMessage("text.recipe_sender.reverse_incompatible",
                         "反转搜索需要 FindMeExtended 1.0.2 或更高版本，当前版本不兼容")
                 : getMessage("text.recipe_sender.reverse_missing",
-                        "反转搜索需要安装 FindMeExtended"), false);
+                        "反转搜索需要安装 FindMeExtended"));
     }
 
     /** 生成带语言文件回退文本的提示。 */
     private static Component getMessage(String key, String fallback) {
+        return Component.literal(getMessageText(key, fallback));
+    }
+
+    /** 取语言文件里的文本；缺失或格式错误时退回兜底文案。 */
+    private static String getMessageText(String key, String fallback) {
         String text = I18n.get(key);
         if (text.equals(key) || text.startsWith("Format error:")) {
-            return Component.literal(fallback);
+            return fallback;
+        }
+        return text;
+    }
+
+    /** 把提示发给玩家；玩家还没准备好时静默丢弃。 */
+    private static void sendMessage(Minecraft minecraft, Component text) {
+        if (minecraft.player != null) {
+            NoticeOverlay.show(text);
+        }
+    }
+
+    /** 把提示画在 HUD 层；没有界面时走这里。 */
+    @SubscribeEvent
+    public static void onRenderGui(RenderGuiEvent.Post event) {
+        NoticeOverlay.renderInHud(event.getGuiGraphics());
+    }
+
+    /** 生成带语言文件回退文本的「已发送 N 份到 X」提示。 */
+    private static Component getBoundText(String key, Object[] args, String fallback) {
+        return Component.literal(getBoundTextText(key, args, fallback));
+    }
+
+    /** 与 {@link #getBoundText} 同源，但返回纯文本——供嵌进别的语言模板的 {@code %s}。 */
+    private static String getBoundTextText(String key, Object[] args, String fallback) {
+        String text = I18n.get(key, args);
+        if (text.equals(key) || text.startsWith("Format error:")) {
+            return fallback;
+        }
+        return text;
+    }
+
+    /** 生成 HUD 上的「发送到「X」」目标行。 */
+    private static Component getBoundTargetText(String name) {
+        String key = "text.recipe_sender.bound_target";
+        String text = I18n.get(key, name);
+        if (text.equals(key) || text.startsWith("Format error:")) {
+            return Component.literal("发送到「" + name + "」");
         }
         return Component.literal(text);
     }
@@ -235,15 +494,23 @@ public final class RecipeSenderClient {
      */
     private static void logReverseBinding(Minecraft minecraft) {
         bindingLogged = true;
-        boolean registered = false;
-        for (KeyMapping mapping : minecraft.options.keyMappings) {
-            if (mapping == REVERSE_KEY) {
-                registered = true;
-                break;
+        LOGGER.info("反转键绑定 = {}，已进入控制设置列表 = {}，反转搜索可用 = {}",
+                REVERSE_KEY.getKey().getName(), isRegistered(minecraft, REVERSE_KEY),
+                FindMeExtendedAdapter.isAvailable());
+        LOGGER.info("按键绑定：Z = {}（已注册 = {}），绑定键 = {}（已注册 = {}），管理键 = {}（已注册 = {}）",
+                INSERT_RECIPE_KEY.getKey().getName(), isRegistered(minecraft, INSERT_RECIPE_KEY),
+                BOUND_SEND_KEY.getKey().getName(), isRegistered(minecraft, BOUND_SEND_KEY),
+                MANAGE_KEY.getKey().getName(), isRegistered(minecraft, MANAGE_KEY));
+    }
+
+    /** 判断某个按键是否真的进了「控制设置」列表：只有进列表的键，options.txt 里的改键才会被写回。 */
+    private static boolean isRegistered(Minecraft minecraft, KeyMapping mapping) {
+        for (KeyMapping candidate : minecraft.options.keyMappings) {
+            if (candidate == mapping) {
+                return true;
             }
         }
-        LOGGER.info("反转键绑定 = {}，已进入控制设置列表 = {}，反转搜索可用 = {}",
-                REVERSE_KEY.getKey().getName(), registered, FindMeExtendedAdapter.isAvailable());
+        return false;
     }
 
     /**
@@ -329,9 +596,10 @@ public final class RecipeSenderClient {
                 || keyCode == GLFW.GLFW_KEY_LEFT_ALT || keyCode == GLFW.GLFW_KEY_RIGHT_ALT;
     }
 
-    /** 判断按键是否为“插入配方”或“反转方向”键（按玩家当前实际绑定判断，改键后立即生效）。 */
+    /** 判断按键是否为“插入配方”“反转方向”“绑定容器”或管理键（按玩家当前实际绑定判断，改键后立即生效）。 */
     private static boolean isModKeyMapping(int keyCode) {
-        return isBoundKeySym(INSERT_RECIPE_KEY, keyCode) || isBoundKeySym(REVERSE_KEY, keyCode);
+        return isBoundKeySym(INSERT_RECIPE_KEY, keyCode) || isBoundKeySym(REVERSE_KEY, keyCode)
+                || isBoundKeySym(BOUND_SEND_KEY, keyCode) || isBoundKeySym(MANAGE_KEY, keyCode);
     }
 
     /** 绑定的键是键盘按键且等于 keyCode 时返回 true；鼠标绑定不参与判断。 */
@@ -357,9 +625,16 @@ public final class RecipeSenderClient {
         }
     }
 
-    /** 在 EMI 界面上绘制材料高亮和份数提示。 */
+    /**
+     * 在 EMI 界面上绘制材料高亮和份数提示。
+     *
+     * <p>屏幕下方的浮层提示也挂在这里（界面层的那一份）：优先级 {@code LOWEST} 让它画在
+     * 高亮之上。有界面时 HUD 层的那份会被界面背景盖住但还会透出来，两处都画就是重影，
+     * 所以 {@link NoticeOverlay} 按「当前有没有界面」在两条路径里二选一。
+     */
     @SubscribeEvent(priority = EventPriority.LOWEST)
     public static void onScreenRender(ScreenEvent.Render.Post event) {
+        NoticeOverlay.renderInScreen(event.getGuiGraphics());
         if (!selecting || event.getScreen() != activeScreen) {
             return;
         }
@@ -376,8 +651,17 @@ public final class RecipeSenderClient {
         String availableKey = reverseMode
                 ? "text.recipe_sender.nearby_available_count"
                 : "text.recipe_sender.available_count";
-        List<Component> lines = new ArrayList<>(4);
-        List<Integer> colors = new ArrayList<>(4);
+        List<Component> lines = new ArrayList<>(5);
+        List<Integer> colors = new ArrayList<>(5);
+        if (boundMode) {
+            // 落点在玩家看不到的远程方块上，所以第一行必须先说清楚发到哪儿。
+            // 有多个候选时这里说不了具体是哪一个（等松开 Z 才由玩家挑），只说候选数量。
+            lines.add(activeBinding != null
+                    ? getBoundTargetText(activeBinding.name())
+                    : getBoundText("text.recipe_sender.bound_target_pick",
+                            new Object[]{BoundContainerClient.masters().size()}, "候选容器"));
+            colors.add(0x8FE08F);
+        }
         lines.add(getCountText(availableKey, availableBatches,
                 reverseMode ? "周围现有" : "背包现有"));
         colors.add(0xB8B8B8);
@@ -418,7 +702,7 @@ public final class RecipeSenderClient {
         graphics.pose().popPose();
     }
 
-    /** 初始化当前悬停配方，并根据按键状态进入正向或反向模式。 */
+    /** 初始化当前悬停配方，并根据按键状态进入正向、反向或「发送到已绑定容器」模式。 */
     private static void beginSelection() {
         Minecraft minecraft = Minecraft.getInstance();
         if (minecraft.player == null || minecraft.screen == null) {
@@ -427,19 +711,46 @@ public final class RecipeSenderClient {
         AbstractContainerScreen<?> container = EmiApi.getHandledScreen();
         EmiStackInteraction hovered = EmiApi.getHoveredStack(true);
         EmiRecipe recipe = getRecipe(hovered);
-        if (container == null || hovered.isEmpty() || recipe == null) {
+        if (hovered.isEmpty() || recipe == null) {
             return;
         }
 
-        boolean reverseRequested = isReverseKeyHeld();
+        // 绑定键与反转键同时按住时以反转为准：反转是既有行为，不能因为新增按键而改变含义。
+        boolean boundRequested = isBoundSendKeyHeld() && !isReverseKeyHeld();
+        boolean reverseRequested = !boundRequested && isReverseKeyHeld();
+        // 每次开始选择都记一行：按住 Z 却没进绑定模式时，这一行能直接说明模组读到的绑定是什么。
+        LOGGER.info("开始选择：绑定键 = {}（按住 = {}），反转键 = {}（按住 = {}），判定 = {}",
+                BOUND_SEND_KEY.getKey().getName(), isBoundSendKeyHeld(),
+                REVERSE_KEY.getKey().getName(), isReverseKeyHeld(),
+                boundRequested ? "绑定发送" : reverseRequested ? "反转" : "正向发送");
+        if (!boundRequested && container == null) {
+            // 正向发送的落点就是当前打开的容器，没有容器界面就无从谈起。
+            return;
+        }
         if (reverseRequested && !FindMeExtendedAdapter.isAvailable()) {
             // 反转搜索完全依赖 FindMeExtended 的容器扫描与提取器。不可用时必须中止并明说：
             // 悄悄退化成正向发送会把玩家背包里的材料送进机器，和按住反转键的意图正好相反。
             warnReverseUnavailable(minecraft);
             return;
         }
+        BoundContainer boundTarget = null;
+        if (boundRequested) {
+            List<BoundContainer> masters = BoundContainerClient.masters();
+            if (masters.isEmpty()) {
+                sendMessage(minecraft, getMessage("text.recipe_sender.bound_none",
+                        "还没有绑定容器：对着方块按 B 绑定"));
+                return;
+            }
+            // 只有一个主容器时直接定下；有多个时这里不定，等松开 Z 再弹选择界面让玩家挑。
+            // 绝不静默挑一个：那会把材料发进玩家没预期的机器里。
+            if (masters.size() == 1) {
+                boundTarget = masters.get(0);
+            }
+        }
         selecting = true;
         reverseMode = reverseRequested;
+        boundMode = boundRequested;
+        activeBinding = boundTarget;
         selectAllRequested = isAltDown();
         selectedBatches = reverseMode ? 0 : 1;
         pendingScrollNotches = 0;
@@ -448,9 +759,11 @@ public final class RecipeSenderClient {
         activeIngredient = hovered.getStack();
         activeRecipe = recipe;
         // 电路只影响机器的配方匹配，不参与材料统计，因此在开始选择时解析一次即可。
-        activeCircuit = GtCircuitSupport.findCircuit(recipe);
-        activeTargetHasCircuit = GtCircuitSupport.canAdjustCircuit(
-                GtCircuitSupport.findCircuitHolder(container.getMenu()));
+        // 绑定模式的落点是远程方块，客户端拿不到它的机器实例，电路衔接在后续切片处理。
+        activeCircuit = boundMode ? null : GtCircuitSupport.findCircuit(recipe);
+        activeTargetHasCircuit = !boundMode && container != null
+                && GtCircuitSupport.canAdjustCircuit(
+                        GtCircuitSupport.findCircuitHolder(container.getMenu()));
         highlightedInventorySlots = RecipeMaterialCollector.findMatchingInventorySlots(recipe,
                 minecraft.player);
 
@@ -483,7 +796,7 @@ public final class RecipeSenderClient {
         ModNetwork.CHANNEL.sendToServer(new NearbyRecipeQueryPacket(activeRequestId, activeSpecs));
     }
 
-    /** 松开 Z 时提交正向发送或反向取回请求。 */
+    /** 松开 Z 时提交正向发送、反向取回或「发送到已绑定容器」请求。 */
     private static void finishSelection() {
         if (!isActiveTarget(EmiApi.getHoveredStack(true))) {
             cancelSelection("松手时鼠标已不在目标配方上");
@@ -500,6 +813,10 @@ public final class RecipeSenderClient {
         }
 
         Minecraft minecraft = Minecraft.getInstance();
+        if (boundMode) {
+            finishBoundSelection(minecraft);
+            return;
+        }
         // 选择的份数超过目标容器能容纳的数量时，按目标容器可容纳的份数发送；
         // 这里重新估算一次，避免使用最多 10 tick 前的旧值。
         int batches = RecipeMaterialCollector.countInsertableBatches(activeRecipe, minecraft.player,
@@ -514,6 +831,105 @@ public final class RecipeSenderClient {
                     activeContainer.getMenu().containerId, requirements));
         }
         cancelSelection();
+    }
+
+    /**
+     * 提交一次「发送到已绑定容器」。
+     *
+     * <p>客户端只能数背包里的存量（远程容器的容量在服务端），所以这里不做上限夹取：
+     * 要几份就报几份，装不下由服务端的回执说清楚。
+     *
+     * <p>有多个主容器时这里不直接发，而是把已经凑好的材料交给选择界面：
+     * 玩家挑完再发。材料在这一刻就已经从背包「预定」出来了，弹窗期间不会因为背包变动而失效。
+     */
+    private static void finishBoundSelection(Minecraft minecraft) {
+        List<BoundContainer> masters = BoundContainerClient.masters();
+        if (masters.isEmpty()) {
+            sendMessage(minecraft, getMessage("text.recipe_sender.bound_none",
+                    "还没有绑定容器：对着方块按 B 绑定"));
+            cancelSelection();
+            return;
+        }
+        int batches = Math.min(selectedBatches, availableBatches);
+        if (batches <= 0) {
+            cancelSelection();
+            return;
+        }
+        RecipeMaterialCollector.CollectionResult result =
+                RecipeMaterialCollector.collect(activeRecipe, minecraft.player, batches);
+        if (!result.success()) {
+            // 从背包里凑不齐材料：直接把原因说出来，不要静默什么都不做。
+            sendMessage(minecraft, Component.literal(result.message()));
+            cancelSelection();
+            return;
+        }
+        List<ItemStack> requirements = result.requirements();
+        if (masters.size() == 1) {
+            sendBoundInsert(masters.get(0).id(), requirements, batches);
+            cancelSelection();
+            return;
+        }
+        Screen parent = minecraft.screen;
+        cancelSelection();
+        minecraft.setScreen(new BoundContainerPickScreen(parent, masters, requirements, batches));
+    }
+
+    /**
+     * 把一份材料发往指定绑定，并记下这次的请求号用于认领回执。
+     *
+     * <p>这个入口同时被选择界面调用，所以请求号的分配收在这里，避免两处各写一遍。
+     */
+    public static void sendBoundInsert(UUID bindingId, List<ItemStack> requirements, int batches) {
+        if (bindingId == null || requirements.isEmpty() || batches <= 0) {
+            return;
+        }
+        boundRequestId = BOUND_REQUEST_SEQUENCE.incrementAndGet();
+        ModNetwork.CHANNEL.sendToServer(new InsertRecipeItemsToBoundPacket(boundRequestId, bindingId,
+                requirements, batches));
+    }
+
+    /**
+     * 告诉服务端「玩家这次选了哪个发送单元」，服务端记下来供下次按 B 直达。
+     *
+     * <p>写在玩家确认选择这一刻，而不是材料成功送达那一刻：
+     * 材料没送出去（目标满了之类）不该把玩家的选择也一起忘掉。
+     */
+    public static void rememberBoundChoice(UUID bindingId) {
+        if (bindingId == null) {
+            return;
+        }
+        ModNetwork.CHANNEL.sendToServer(
+                new SelectBoundTargetPacket(BoundContainerClient.manualRoute(), bindingId));
+    }
+
+    /** 给玩家显示一条屏幕下方的提示。界面代码拿不到私有发送方法，所以开这个口子。 */
+    public static void notifyPlayer(Component text) {
+        sendMessage(Minecraft.getInstance(), text);
+    }
+
+    /** S1 的高亮还只是占位，真正的世界内红色描边在后续切片实现。 */
+    public static void notifyHighlightUnavailable(String name) {
+        notifyPlayer(Component.translatable("text.recipe_sender.highlight_pending", name));
+    }
+
+    /** 判断某个按键事件是不是绑定发送键（带修饰键判定）。 */
+    public static boolean matchesBoundSendKey(int keyCode, int scanCode) {
+        return BOUND_SEND_KEY.isActiveAndMatches(InputConstants.getKey(keyCode, scanCode));
+    }
+
+    /** 判断某个按键事件是不是管理键（Ctrl+B）。 */
+    public static boolean matchesManageKey(int keyCode, int scanCode) {
+        return MANAGE_KEY.isActiveAndMatches(InputConstants.getKey(keyCode, scanCode));
+    }
+
+    /**
+     * 判断某个鼠标键事件是不是绑定发送键。
+     *
+     * <p>键盘事件与鼠标事件是两条独立通路，所以同一个键位要分别判一次：
+     * 把绑定发送键改成鼠标侧键之后，弹窗里「再按一次直达上次」只能靠这里识别。
+     */
+    public static boolean matchesBoundSendMouse(int button) {
+        return BOUND_SEND_KEY.isActiveAndMatches(InputConstants.Type.MOUSE.getOrCreate(button));
     }
 
     /**
@@ -571,6 +987,77 @@ public final class RecipeSenderClient {
             sendPullRequest();
             cancelSelection();
         }
+    }
+
+    /**
+     * 服务端的绑定列表变了。
+     *
+     * <p>正在「发送到已绑定容器」的选择过程中、而目标刚被删掉时立即中止：
+     * 继续下去只会在松手时拿到一条「绑定不存在」的失败回执，不如当场说清楚。
+     */
+    public static void onBoundContainersSynced() {
+        if (selecting && boundMode && (activeBinding == null
+                || BoundContainerClient.find(activeBinding.id()) == null)) {
+            cancelSelection("绑定的容器已被删除");
+        }
+    }
+
+    /** 处理「发送到已绑定容器」的回执。 */
+    public static void acceptBoundInsertResult(long requestId, UUID bindingId, BoundStatus status,
+                                               int insertedBatches, int requestedBatches,
+                                               int overflowBatches, String detailKey) {
+        if (requestId != boundRequestId) {
+            return;
+        }
+        boundRequestId = 0;
+        Minecraft minecraft = Minecraft.getInstance();
+        BoundContainer target = BoundContainerClient.find(bindingId);
+        String name = target == null ? "已绑定容器" : target.name();
+        if (status != BoundStatus.OK) {
+            // 失败必须说出具体原因：落点在玩家看不到的地方，没有提示就只剩「点了没反应」。
+            String key = BoundContainerService.describe(status);
+            String fallback = "发送失败：目标「" + name + "」不可用";
+            sendMessage(minecraft, key == null ? Component.literal(fallback)
+                    : getMessage(key, fallback));
+            return;
+        }
+        if (requestedBatches <= 0) {
+            return;
+        }
+        if (insertedBatches >= requestedBatches) {
+            if (overflowBatches > 0) {
+                // 主容器与并列成员都放满后溢出去了。必须说出来：玩家看主容器没收到全部份数，
+                // 否则会以为发错了地方。
+                sendMessage(minecraft, getBoundText("text.recipe_sender.bound_sent_overflow",
+                        new Object[]{insertedBatches, name, overflowBatches},
+                        "已发送 " + insertedBatches + " 份到「" + name + "」，其中 " + overflowBatches
+                                + " 份进了从容器"));
+                return;
+            }
+            sendMessage(minecraft, getBoundText("text.recipe_sender.bound_sent",
+                    new Object[]{insertedBatches, name},
+                    "已发送 " + insertedBatches + " 份到「" + name + "」"));
+            return;
+        }
+        String detail = detailKey == null ? ""
+                : getMessageText(detailKey, detailFallback(detailKey));
+        if (overflowBatches > 0) {
+            // 部分送达 + 已有溢出：先把「溢出到从容器的份数」说清楚，再补没发完的原因。
+            String overflowNote = getBoundTextText("text.recipe_sender.bound_overflow_note",
+                    new Object[]{overflowBatches},
+                    "其中 " + overflowBatches + " 份进了从容器");
+            detail = detail.isEmpty() ? overflowNote : overflowNote + "，" + detail;
+        }
+        sendMessage(minecraft, getBoundText("text.recipe_sender.bound_partial",
+                new Object[]{insertedBatches, requestedBatches, name, detail},
+                "只发出 " + insertedBatches + "/" + requestedBatches + " 份到「" + name + "」："
+                        + detail));
+    }
+
+    /** 回执里 detailKey 的中文兜底文案（语言文件缺失时使用）。 */
+    private static String detailFallback(String detailKey) {
+        return detailKey.endsWith("target_full")
+                ? "目标容器放不下（可能已满或不允许该物品）" : "背包材料不足";
     }
 
     /**
@@ -642,7 +1129,9 @@ public final class RecipeSenderClient {
                 minecraft.player);
         highlightedInventorySlots = RecipeMaterialCollector.findMatchingInventorySlots(
                 activeRecipe, minecraft.player);
-        insertableBatches = activeContainer == null ? 0
+        // 绑定模式的落点是远程方块，客户端拿不到它的槽位，所以不做容量估计：
+        // 报多少份由玩家决定，装不下由服务端回执说明。
+        insertableBatches = boundMode || activeContainer == null ? availableBatches
                 : RecipeMaterialCollector.countInsertableBatches(activeRecipe, minecraft.player,
                         activeContainer.getMenu(), availableBatches);
         int ceiling = maxSendableBatches();
@@ -808,6 +1297,8 @@ public final class RecipeSenderClient {
     private static void cancelSelection() {
         selecting = false;
         reverseMode = false;
+        boundMode = false;
+        activeBinding = null;
         awaitingAvailability = false;
         releasePending = false;
         selectAllRequested = false;

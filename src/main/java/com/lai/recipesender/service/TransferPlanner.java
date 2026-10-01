@@ -1,6 +1,5 @@
 package com.lai.recipesender.service;
 
-import com.lai.recipesender.network.packet.InsertRecipeItemsPacket;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.Slot;
@@ -29,11 +28,11 @@ public final class TransferPlanner {
             return null;
         }
         // 先规划扣除和投放，规划失败时不产生任何修改，避免部分成功。
-        List<ItemStack> normalized = normalize(requirements);
+        List<ItemStack> normalized = InventoryDeduction.normalize(requirements);
         if (normalized.isEmpty()) {
             return null;
         }
-        List<InventoryRemoval> removals = planInventoryRemoval(inventory, normalized);
+        List<InventoryDeduction.Removal> removals = InventoryDeduction.plan(inventory, normalized);
         if (removals == null) {
             return null;
         }
@@ -48,73 +47,6 @@ public final class TransferPlanner {
             }
         }
         return new TransferPlan(removals, insertions);
-    }
-
-    /** 合并并校验客户端提交的物品需求，超过上限或格式非法时返回空列表。 */
-    private static List<ItemStack> normalize(List<ItemStack> requirements) {
-        List<ItemStack> normalized = new ArrayList<>();
-        int totalItems = 0;
-        for (ItemStack requirement : requirements) {
-            if (requirement == null || requirement.isEmpty()
-                    || requirement.getCount() <= 0
-                    || requirement.getCount() > InsertRecipeItemsPacket.MAX_ITEMS_PER_REQUIREMENT) {
-                return List.of();
-            }
-            totalItems = Math.min(Integer.MAX_VALUE, totalItems + requirement.getCount());
-            if (totalItems > 32768) {
-                return List.of();
-            }
-            addNormalized(normalized, requirement);
-        }
-        return normalized;
-    }
-
-    /** 将一个需求合并进规范化材料列表。 */
-    private static void addNormalized(List<ItemStack> normalized, ItemStack requirement) {
-        int remaining = requirement.getCount();
-        for (ItemStack existing : normalized) {
-            if (!ItemStack.isSameItemSameTags(existing, requirement)) {
-                continue;
-            }
-            int capacity = InsertRecipeItemsPacket.MAX_ITEMS_PER_REQUIREMENT - existing.getCount();
-            int moved = Math.min(remaining, Math.max(0, capacity));
-            existing.grow(moved);
-            remaining -= moved;
-            if (remaining == 0) {
-                return;
-            }
-        }
-        while (remaining > 0) {
-            int moved = Math.min(remaining, InsertRecipeItemsPacket.MAX_ITEMS_PER_REQUIREMENT);
-            normalized.add(requirement.copyWithCount(moved));
-            remaining -= moved;
-        }
-    }
-
-    /** 规划从背包哪些槽位扣除材料；材料不足或 NBT 不一致时返回 {@code null}。 */
-    private static List<InventoryRemoval> planInventoryRemoval(Inventory inventory,
-                                                               List<ItemStack> requirements) {
-        // 只在副本上扣减，借此同时验证总量和 NBT；实际扣除延迟到 apply 阶段。
-        List<ItemStack> available = inventory.items.stream().map(ItemStack::copy).toList();
-        List<InventoryRemoval> removals = new ArrayList<>();
-        for (ItemStack requirement : requirements) {
-            int remaining = requirement.getCount();
-            for (int index = 0; index < available.size() && remaining > 0; index++) {
-                ItemStack availableStack = available.get(index);
-                if (availableStack.isEmpty()
-                        || !ItemStack.isSameItemSameTags(availableStack, requirement)) {
-                    continue;
-                }
-                int moved = Math.min(remaining, availableStack.getCount());
-                availableStack.shrink(moved);
-                removals.add(new InventoryRemoval(index, moved));
-                remaining -= moved;
-            }
-            if (remaining > 0) {
-                return null;
-            }
-        }
-        return removals;
     }
 
     /** 创建当前菜单中允许投放的目标槽位模拟。 */
@@ -151,21 +83,18 @@ public final class TransferPlanner {
 
     /** 一次已验证的投放计划，必须先规划成功才能应用。 */
     public static final class TransferPlan {
-        private final List<InventoryRemoval> removals;
+        private final List<InventoryDeduction.Removal> removals;
         private final List<SlotInsertion> insertions;
 
-        private TransferPlan(List<InventoryRemoval> removals, List<SlotInsertion> insertions) {
+        private TransferPlan(List<InventoryDeduction.Removal> removals,
+                             List<SlotInsertion> insertions) {
             this.removals = removals;
             this.insertions = insertions;
         }
 
         /** 应用已验证的扣除和投放计划。 */
         public void apply(Inventory inventory) {
-            for (InventoryRemoval removal : removals) {
-                ItemStack stack = inventory.getItem(removal.slot());
-                stack.shrink(removal.amount());
-                inventory.setItem(removal.slot(), stack);
-            }
+            InventoryDeduction.apply(inventory, removals);
             for (SlotInsertion insertion : insertions) {
                 ItemStack current = insertion.slot().getItem();
                 if (current.isEmpty()) {
@@ -178,9 +107,6 @@ public final class TransferPlanner {
             }
             inventory.setChanged();
         }
-    }
-
-    private record InventoryRemoval(int slot, int amount) {
     }
 
     private record SlotInsertion(Slot slot, int amount, ItemStack stack) {
