@@ -8,7 +8,6 @@ import com.lai.recipesender.network.packet.UpdateBindingRelationPacket;
 import com.lai.recipesender.network.packet.UpdateBindingRoutesPacket;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
-import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -58,7 +57,7 @@ public class BoundContainerBindScreen extends Screen {
     private String blockName = "";
     private String blockId = "";
 
-    private EditBox nameBox;
+    private BoundEditBox nameBox;
 
     /**
      * 名字输入框里的当前文本。
@@ -79,7 +78,7 @@ public class BoundContainerBindScreen extends Screen {
      * <p>刻意**不用 {@code addRenderableWidget}**：下拉面板画在 {@code super.render} 之后，
      * 注册进去会被面板底色整个盖住。照管理界面 {@code renameBox} 的做法手动 {@code render}。
      */
-    private EditBox dropSearch;
+    private BoundEditBox dropSearch;
 
     /**
      * 这个主容器负责的配方类别（S6 自动路由）。
@@ -128,7 +127,7 @@ public class BoundContainerBindScreen extends Screen {
             parentId = editing.parentId();
         }
 
-        nameBox = new EditBox(font, left + PADDING, top + 72, PANEL_WIDTH - PADDING * 2, 18,
+        nameBox = new BoundEditBox(font, left + PADDING, top + 72, PANEL_WIDTH - PADDING * 2, 18,
                 Component.translatable("text.recipe_sender.bind_name_label"));
         nameBox.setMaxLength(BoundContainer.MAX_NAME_LENGTH);
         nameBox.setValue(nameDraft);
@@ -138,7 +137,7 @@ public class BoundContainerBindScreen extends Screen {
         addRenderableWidget(nameBox);
 
         // 下拉的第一行是搜索框，坐标与 drawDropdown 里的布局必须一致（面板内边距 +1，行高 14）。
-        dropSearch = new EditBox(font, left + PADDING + 1, top + 196, PANEL_WIDTH - PADDING * 2 - 2,
+        dropSearch = new BoundEditBox(font, left + PADDING + 1, top + 196, PANEL_WIDTH - PADDING * 2 - 2,
                 DROP_ROW_HEIGHT, Component.translatable("text.recipe_sender.bind_parent_search"));
         dropSearch.setMaxLength(BoundContainer.MAX_NAME_LENGTH);
         dropSearch.setHint(Component.translatable("text.recipe_sender.bind_parent_search"));
@@ -402,16 +401,9 @@ public class BoundContainerBindScreen extends Screen {
     @Override
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
         // 点到输入框以外 = 名字输入框失焦。文本已经实时同步进 nameDraft，不会因为失焦或界面重建而丢。
-        if (nameBox != null && nameBox.isFocused() && !nameBox.isMouseOver(mouseX, mouseY)) {
-            setFocused(null);
-        }
+        BoundUi.blurFocusedIfOutside(this, mouseX, mouseY);
         // 搜索框在 hits 之外，必须最先判：它的位置在候选行上面，落到 hits 循环里会被当成点空。
         if (parentDropOpen && dropSearch != null && dropSearch.isMouseOver(mouseX, mouseY)) {
-            if (button == 1) {
-                // 右键清空，和本模组其它搜索框一致。
-                dropSearch.setValue("");
-                return true;
-            }
             setFocused(dropSearch);
             return dropSearch.mouseClicked(mouseX, mouseY, button);
         }

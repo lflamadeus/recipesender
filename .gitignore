@@ -29,5 +29,9 @@ logs/
 *.log
 *.tmp
 
+# 构建时重定向出来的输出（取退出码用，不是产物）
+build-out.txt
+build-err.txt
+
 # 本地临时产物（反汇编素材、排查日志等）
 temp/

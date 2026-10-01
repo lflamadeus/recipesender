@@ -4,7 +4,6 @@ import dev.emi.emi.api.EmiApi;
 import dev.emi.emi.api.stack.EmiIngredient;
 import net.minecraft.Util;
 import net.minecraft.client.gui.GuiGraphics;
-import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
@@ -80,7 +79,7 @@ class CategoryPickerScreen extends Screen {
     private String needle = "";
     private boolean collapseInitialized;
 
-    private EditBox searchBox;
+    private BoundEditBox searchBox;
     private int left;
     private int top;
     private int panelWidth;
@@ -126,7 +125,7 @@ class CategoryPickerScreen extends Screen {
         top = (height - panelHeight) / 2;
         listTop = top + HEADER_HEIGHT;
         listHeight = panelHeight - HEADER_HEIGHT - FOOTER_HEIGHT;
-        searchBox = new EditBox(font, left + PADDING, top + 32, panelWidth - PADDING * 2, 16,
+        searchBox = new BoundEditBox(font, left + PADDING, top + 32, panelWidth - PADDING * 2, 16,
                 Component.translatable("text.recipe_sender.category_search"));
         searchBox.setHint(Component.translatable("text.recipe_sender.category_search"));
         searchBox.setMaxLength(64);

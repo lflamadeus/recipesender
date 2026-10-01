@@ -3,6 +3,7 @@ package com.lai.recipesender.client;
 import com.lai.recipesender.model.BoundContainer;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 
 import java.util.ArrayList;
@@ -124,6 +125,18 @@ final class BoundUi {
             return Component.translatable("text.recipe_sender.unknown_block").getString();
         }
         return binding.iconItem().getHoverName().getString();
+    }
+
+    /**
+     * 点到当前焦点输入栏以外，就让它失焦（{@link BoundEditBox#onBlur} 接手「失焦即确认」）。
+     *
+     * <p>界面里自绘的点击目标（行、自绘按钮）不走控件的焦点逻辑，光靠控件自己收不到失焦通知，
+     * 所以每次点击先过一下这里。</p>
+     */
+    static void blurFocusedIfOutside(Screen screen, double mouseX, double mouseY) {
+        if (screen.getFocused() instanceof BoundEditBox box && !box.isMouseOver(mouseX, mouseY)) {
+            screen.setFocused(null);
+        }
     }
 
     static boolean inside(double mouseX, double mouseY, int x, int y, int width, int height) {

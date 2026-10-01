@@ -2,7 +2,6 @@ package com.lai.recipesender.client;
 
 import com.lai.recipesender.model.BoundContainer;
 import net.minecraft.client.gui.GuiGraphics;
-import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
@@ -50,7 +49,7 @@ class BoundContainerPickScreen extends Screen {
 
     /** 过滤后的候选，数字键与方向键都按这个顺序生效。 */
     private final List<BoundContainer> filtered = new ArrayList<>();
-    private EditBox searchBox;
+    private BoundEditBox searchBox;
     private UUID selectedId;
     private int scrollOffset;
     private int visibleRows;
@@ -103,7 +102,7 @@ class BoundContainerPickScreen extends Screen {
         listHeight = visibleRows * ROW_HEIGHT;
 
         if (hasSearch) {
-            searchBox = new EditBox(font, left + PADDING, top + HEADER_HEIGHT + 1, panelWidth - PADDING * 2,
+            searchBox = new BoundEditBox(font, left + PADDING, top + HEADER_HEIGHT + 1, panelWidth - PADDING * 2,
                     16, Component.translatable("text.recipe_sender.pick_search"));
             searchBox.setHint(Component.translatable("text.recipe_sender.pick_search"));
             searchBox.setResponder(value -> {
@@ -316,12 +315,6 @@ class BoundContainerPickScreen extends Screen {
             return true;
         }
         if (searchBox != null && searchBox.isMouseOver(mouseX, mouseY)) {
-            if (button == 1) {
-                // 右键清空：搜索词往往是一长串拼音，逐字退格太烦。
-                searchBox.setValue("");
-                setFocused(searchBox);
-                return true;
-            }
             setFocused(searchBox);
             return searchBox.mouseClicked(mouseX, mouseY, button);
         }

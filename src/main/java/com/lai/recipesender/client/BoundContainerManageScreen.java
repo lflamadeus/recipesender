@@ -7,7 +7,6 @@ import com.lai.recipesender.network.packet.UpdateBindingPacket;
 import com.lai.recipesender.network.packet.UpdateBindingRoutesPacket;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
-import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 import org.lwjgl.glfw.GLFW;
@@ -61,8 +60,8 @@ class BoundContainerManageScreen extends Screen {
 
     private final Screen parent;
 
-    private EditBox searchBox;
-    private EditBox renameBox;
+    private BoundEditBox searchBox;
+    private BoundEditBox renameBox;
     private Button expandButton;
     private UUID renamingId;
     private UUID pendingDeleteId;
@@ -119,7 +118,7 @@ class BoundContainerManageScreen extends Screen {
         int closeX = left + panelWidth - PADDING - TOOLBAR_BUTTON_WIDTH;
         int expandX = closeX - 4 - TOOLBAR_BUTTON_WIDTH;
         int searchWidth = Math.max(60, expandX - 8 - (left + PADDING));
-        searchBox = new EditBox(font, left + PADDING, toolbarY, searchWidth, 18,
+        searchBox = new BoundEditBox(font, left + PADDING, toolbarY, searchWidth, 18,
                 Component.translatable("text.recipe_sender.manage_search"));
         searchBox.setHint(Component.translatable("text.recipe_sender.manage_search"));
         searchBox.setValue(query);
@@ -448,8 +447,6 @@ class BoundContainerManageScreen extends Screen {
             graphics.fill(x, y, x + 1, y + height - 1, binding.role() == BoundContainer.Role.SLAVE
                     ? BoundUi.TAG_SLAVE : BoundUi.TAG_PARALLEL);
         }
-        rowBounds.put(binding.id(), new int[]{x, y, width});
-
         int cursor = x + 4;
         if (row.indent()) {
             graphics.drawString(font, "└", cursor, y + 4, BoundUi.TEXT_DIM, false);
@@ -470,6 +467,9 @@ class BoundContainerManageScreen extends Screen {
         cursor += 20;
 
         boolean renaming = binding.id().equals(renamingId);
+        // 名字文字的起点一并记下来：改名输入框就摆在这儿。图标画在 GUI 的更高深度上（物品渲染带
+        // z 偏移），先画的输入框盖不住它，所以只能从图标右边开始，而不是压在它上面。
+        rowBounds.put(binding.id(), new int[]{x, y, width, cursor});
         if (!renaming) {
             graphics.drawString(font, displayName(binding), cursor, y + 4, BoundUi.TEXT, false);
         }
@@ -496,6 +496,10 @@ class BoundContainerManageScreen extends Screen {
             graphics.drawString(font, sub, x + 20, subY, BoundUi.TEXT_DIM, false);
         }
 
+        if (renaming) {
+            // 改名时这一行的按钮让位给输入框：输入框能铺满整行，也不会一边改名一边误点「删除」。
+            return;
+        }
         drawRowButtons(graphics, binding, x + width, y, mouseX, mouseY);
         // 整行可点：展开 / 收起这一组。**必须加在按钮之后**——命中判定按列表顺序取第一个，
         // 按钮先入列才能在点击时优先于整行，否则点「改名」会变成展开。
@@ -591,22 +595,16 @@ class BoundContainerManageScreen extends Screen {
 
     @Override
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
-        // 失焦即确认：正在改名时点到输入框以外，就当作改完了（不必按回车）。点了别的按钮、
-        // 别的行、甚至空白处都算，改名框不会挂在那里等一个永远不会来的回车。
-        if (renameBox != null && !renameBox.isMouseOver(mouseX, mouseY)) {
-            commitRename();
-        }
+        // 失焦即确认：正在改名时点到输入框以外，就当作改完了（不必按回车）。这里只负责摘掉焦点，
+        // 提交动作挂在改名框的 onBlur 上；点了别的按钮、别的行、甚至空白处都算。
+        BoundUi.blurFocusedIfOutside(this, mouseX, mouseY);
         if (renameBox != null && renameBox.isMouseOver(mouseX, mouseY)) {
             setFocused(renameBox);
             return renameBox.mouseClicked(mouseX, mouseY, button);
         }
         if (searchBox != null && searchBox.isMouseOver(mouseX, mouseY)) {
-            if (button == 1) {
-                // 右键清空：搜索词往往是一长串拼音，逐字退格太烦。
-                searchBox.setValue("");
-            }
             setFocused(searchBox);
-            return button == 1 ? true : searchBox.mouseClicked(mouseX, mouseY, button);
+            return searchBox.mouseClicked(mouseX, mouseY, button);
         }
         if (button != 0) {
             return super.mouseClicked(mouseX, mouseY, button);
@@ -692,8 +690,13 @@ class BoundContainerManageScreen extends Screen {
             renamingId = null;
             return;
         }
-        renameBox = new EditBox(font, bounds[0] + 18, bounds[1] + 1, 120, 16,
+        // bounds = {行左, 行上, 行宽, 名字文字左}。输入框从名字的位置起画（左边是图标），一直顶到
+        // 行的右边缘——改名时这一行的按钮不画，整行都留给输入框。
+        int textX = bounds[3];
+        int boxWidth = Math.max(60, bounds[0] + bounds[2] - textX - 4);
+        renameBox = new BoundEditBox(font, textX, bounds[1] + 1, boxWidth, 16,
                 Component.translatable("text.recipe_sender.button_rename"));
+        renameBox.onBlur(this::commitRename);
         BoundContainer binding = BoundContainerClient.find(renamingId);
         renameBox.setValue(binding == null ? "" : binding.name());
         renameBox.setMaxLength(BoundContainer.MAX_NAME_LENGTH);
