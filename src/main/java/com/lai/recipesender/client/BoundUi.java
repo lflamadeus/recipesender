@@ -139,6 +139,20 @@ final class BoundUi {
         }
     }
 
+    /**
+     * 把焦点交给输入栏。**已经聚焦时不能调 {@code setFocused(box)}**。
+     *
+     * <p>原版的 {@code Screen.setFocused} 是「先给旧焦点 {@code setFocused(false)}，再给新焦点
+     * {@code setFocused(true)}」——新旧是同一个输入栏时，中间那一下 false 会被 {@link BoundEditBox}
+     * 当成真失焦、当场跑失焦回调（改名框会提交并把自己置空），调用方紧接着用这个字段就 NPE。
+     * 1.0.26 实测点第二下改名框就崩在这里。</p>
+     */
+    static void focus(Screen screen, BoundEditBox box) {
+        if (screen.getFocused() != box) {
+            screen.setFocused(box);
+        }
+    }
+
     static boolean inside(double mouseX, double mouseY, int x, int y, int width, int height) {
         return mouseX >= x && mouseX < x + width && mouseY >= y && mouseY < y + height;
     }

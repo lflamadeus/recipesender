@@ -107,6 +107,9 @@ class BoundContainerManageScreen extends Screen {
 
     @Override
     protected void init() {
+        // 重建控件前先把焦点交还：init() 之后输入栏都是新对象，焦点却还挂在上一个对象上，
+        // 之后「点到框里没有」的判定就会错位。正在改名时这一下会让改名框失焦，按「失焦即确认」提交。
+        setFocused(null);
         panelWidth = Math.min(PANEL_MAX_WIDTH, width - PANEL_MARGIN * 2);
         panelHeight = Math.min(height - PANEL_MARGIN, 320);
         left = (width - panelWidth) / 2;
@@ -598,13 +601,16 @@ class BoundContainerManageScreen extends Screen {
         // 失焦即确认：正在改名时点到输入框以外，就当作改完了（不必按回车）。这里只负责摘掉焦点，
         // 提交动作挂在改名框的 onBlur 上；点了别的按钮、别的行、甚至空白处都算。
         BoundUi.blurFocusedIfOutside(this, mouseX, mouseY);
-        if (renameBox != null && renameBox.isMouseOver(mouseX, mouseY)) {
-            setFocused(renameBox);
-            return renameBox.mouseClicked(mouseX, mouseY, button);
+        // 取局部变量：失焦回调（BoundUi.focus 里那一层 false）会把字段置空，别在回调之后再用字段。
+        BoundEditBox box = renameBox;
+        if (box != null && box.isMouseOver(mouseX, mouseY)) {
+            BoundUi.focus(this, box);
+            return box.mouseClicked(mouseX, mouseY, button);
         }
-        if (searchBox != null && searchBox.isMouseOver(mouseX, mouseY)) {
-            setFocused(searchBox);
-            return searchBox.mouseClicked(mouseX, mouseY, button);
+        BoundEditBox search = searchBox;
+        if (search != null && search.isMouseOver(mouseX, mouseY)) {
+            BoundUi.focus(this, search);
+            return search.mouseClicked(mouseX, mouseY, button);
         }
         if (button != 0) {
             return super.mouseClicked(mouseX, mouseY, button);
@@ -677,12 +683,14 @@ class BoundContainerManageScreen extends Screen {
         renamingId = binding.id();
         rebuildRenameBox();
         if (renameBox != null) {
-            setFocused(renameBox);
-            renameBox.setFocused(true);
+            // 焦点交给改名框；它刚建出来，这里不可能是「已经聚焦」的那种情况。
+            BoundUi.focus(this, renameBox);
         }
     }
 
     private void rebuildRenameBox() {
+        // 界面重建（改窗口大小）时文本框要重建，已经敲进去的内容得先捞出来，否则会退回原名。
+        String draft = renameBox == null ? null : renameBox.getValue();
         renameBox = null;
         int[] bounds = rowBounds.get(renamingId);
         if (bounds == null) {
@@ -698,7 +706,7 @@ class BoundContainerManageScreen extends Screen {
                 Component.translatable("text.recipe_sender.button_rename"));
         renameBox.onBlur(this::commitRename);
         BoundContainer binding = BoundContainerClient.find(renamingId);
-        renameBox.setValue(binding == null ? "" : binding.name());
+        renameBox.setValue(draft != null ? draft : (binding == null ? "" : binding.name()));
         renameBox.setMaxLength(BoundContainer.MAX_NAME_LENGTH);
     }
 

@@ -404,7 +404,7 @@ public class BoundContainerBindScreen extends Screen {
         BoundUi.blurFocusedIfOutside(this, mouseX, mouseY);
         // 搜索框在 hits 之外，必须最先判：它的位置在候选行上面，落到 hits 循环里会被当成点空。
         if (parentDropOpen && dropSearch != null && dropSearch.isMouseOver(mouseX, mouseY)) {
-            setFocused(dropSearch);
+            BoundUi.focus(this, dropSearch);
             return dropSearch.mouseClicked(mouseX, mouseY, button);
         }
         if (button == 0) {
@@ -453,7 +453,7 @@ public class BoundContainerBindScreen extends Screen {
                 if (dropSearch != null) {
                     // 每次打开都从空搜索开始；留着上次的词只会让人以为候选变少了。
                     dropSearch.setValue("");
-                    setFocused(dropSearch);
+                    BoundUi.focus(this, dropSearch);
                 }
             }
             return;

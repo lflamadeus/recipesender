@@ -314,9 +314,10 @@ class BoundContainerPickScreen extends Screen {
             }
             return true;
         }
-        if (searchBox != null && searchBox.isMouseOver(mouseX, mouseY)) {
-            setFocused(searchBox);
-            return searchBox.mouseClicked(mouseX, mouseY, button);
+        BoundEditBox search = searchBox;
+        if (search != null && search.isMouseOver(mouseX, mouseY)) {
+            BoundUi.focus(this, search);
+            return search.mouseClicked(mouseX, mouseY, button);
         }
         setFocused(null);
         if (button != 0) {

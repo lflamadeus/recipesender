@@ -51,6 +51,11 @@ class BoundEditBox extends EditBox {
      * {@code setFocused(null)}、输入框被移除——所以在这里拦一次就够，各界面不必再自己判断
      * 「这一下点在了框外面没有」。判据用的是 super 之后的状态，{@code canLoseFocus = false}
      * 的输入框不会误报失焦。</p>
+     *
+     * <p><b>注意</b>：原版 {@code Screen.setFocused} 给同一个控件换焦点时会先 false 再 true，
+     * 那一下 false 在这里看和真失焦一模一样。所以界面交焦点请走 {@link BoundUi#focus}，别直接
+     * {@code setFocused(已经在焦点上的输入栏)}——回调会当场跑掉，界面若在回调里把自己置空，
+     * 后面的代码就是 NPE。</p>
      */
     @Override
     public void setFocused(boolean focused) {
