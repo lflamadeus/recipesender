@@ -11,6 +11,7 @@ import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraftforge.items.IItemHandlerModifiable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -500,6 +501,67 @@ public final class GtCircuitSupport {
             holder = readFieldByTypeName(modularUI, "IUIHolder");
         }
         return holder;
+    }
+
+    /**
+     * 从远程方块实体上找出可调电路的机器实例（<b>方块实体通路</b>）。
+     *
+     * <p>与 {@link #findCircuitHolder(AbstractContainerMenu)} 的区别只在入口：菜单通路要求玩家正开着
+     * 那台机器的界面，而「发送到已绑定容器」的落点在远程方块上，玩家不会开着它的界面。拿到机器
+     * 实例之后的鸭子类型判定（{@link #canAdjustCircuit}）与读写完全复用同一套。
+     *
+     * <p>两条来源：
+     * <ol>
+     *   <li>方块实体自己就是机器——单方块机器，或者自己就带电路槽的多方块部件
+     *       （GTCEu 的输入总线 {@code ItemBusPartMachine} 就自带 {@code getCircuitInventory()}）；</li>
+     *   <li>方块实体是多方块部件、电路却在控制器上（GTO 的多方块走这条）：顺着 {@code IMultiPart}
+     *       的 {@code getControllers()} 找控制器，再取 {@code self()}。</li>
+     * </ol>
+     *
+     * <p>返回列表而不是单个实例：一个部件理论上可以同时挂在多个已成型控制器上，每台都得调。
+     *
+     * @return 可调电路的机器实例；方块实体不是格雷机器、或拿不到带电路槽的实例时返回空列表，
+     *         调用方应原样跳过（取不到不是错误——绑定目标本来就可能是普通箱子）
+     */
+    public static List<Object> findCircuitHoldersAt(BlockEntity blockEntity) {
+        if (blockEntity == null) {
+            return List.of();
+        }
+        Object machine = invokePublicNoArg(blockEntity, "getMetaMachine");
+        if (machine == null) {
+            return List.of();
+        }
+        if (canAdjustCircuit(machine)) {
+            return List.of(machine);
+        }
+        // 部件自己不装电路时，电路在控制器上。不是部件的话 getControllers() 不存在，循环直接空转。
+        List<Object> holders = new ArrayList<>();
+        Object controllers = invokePublicNoArg(machine, "getControllers");
+        if (controllers instanceof Iterable<?> iterable) {
+            for (Object controller : iterable) {
+                if (controller == null) {
+                    continue;
+                }
+                Object candidate = invokePublicNoArg(controller, "self");
+                if (candidate == null) {
+                    candidate = controller;
+                }
+                if (canAdjustCircuit(candidate) && !containsSame(holders, candidate)) {
+                    holders.add(candidate);
+                }
+            }
+        }
+        return holders;
+    }
+
+    /** 按引用判重：同一台控制器可能被部件返回多次。 */
+    private static boolean containsSame(List<Object> holders, Object candidate) {
+        for (Object holder : holders) {
+            if (holder == candidate) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

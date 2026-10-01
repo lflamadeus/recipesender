@@ -376,6 +376,11 @@ class BoundContainerPickScreen extends Screen {
             onClose();
             return true;
         }
+        // E 关界面（和原版背包一致）；焦点在搜索框里时 E 是普通字符，交给下面的分支转发。
+        if (keyCode == GLFW.GLFW_KEY_E && (searchBox == null || !searchBox.isFocused())) {
+            onClose();
+            return true;
+        }
         if (keyCode == GLFW.GLFW_KEY_UP) {
             moveSelection(-1);
             return true;
@@ -447,8 +452,11 @@ class BoundContainerPickScreen extends Screen {
         onClose();
     }
 
+    /** 高亮：关掉弹窗回到世界，否则红框画在界面后面根本看不见。 */
     private void highlight(BoundContainer binding) {
-        RecipeSenderClient.notifyHighlightUnavailable(binding.name());
+        BoundHighlightState.show(binding);
+        onClose();
+        minecraft.setScreen(null);
     }
 
     @Override

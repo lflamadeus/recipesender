@@ -40,6 +40,7 @@ import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.InputEvent;
 import net.minecraftforge.client.event.RegisterKeyMappingsEvent;
 import net.minecraftforge.client.event.RenderGuiEvent;
+import net.minecraftforge.client.event.RenderLevelStageEvent;
 import net.minecraftforge.client.event.ScreenEvent;
 import net.minecraftforge.client.settings.KeyConflictContext;
 import net.minecraftforge.client.settings.KeyModifier;
@@ -142,6 +143,17 @@ public final class RecipeSenderClient {
      * {@code false}：发送时既不会写电路也不会置空，所以连提示都不该显示。
      */
     private static boolean activeTargetHasCircuit;
+    /**
+     * 本次选择解析出的电路要求，供「发送到已绑定容器」随包带给服务端。
+     *
+     * <p>与 {@link #activeCircuit} 的差别只在生命周期：多候选时的选择弹窗是在
+     * {@code cancelSelection()} <b>之后</b>才把包发出去的，那时 {@code activeCircuit} 已经被清空，
+     * 所以这里单独留一份，只在下一次 {@code beginSelection()} 时被覆盖。
+     *
+     * <p>绑定模式的落点是远程方块，客户端拿不到它的机器实例，<b>有没有电路槽只有服务端知道</b>；
+     * 客户端能做的只是把「配方要什么」原样说出去，服务端按真实实例决定要不要写。
+     */
+    private static GtCircuitSupport.CircuitRequirement resolvedCircuit;
     private static long clientTicks;
     private static long nextAvailabilityRefreshTick;
     private static long availabilityRequestTick;
@@ -350,6 +362,8 @@ public final class RecipeSenderClient {
         // 提示的生命周期与界面无关，必须每 tick 都走：下面的 selecting 早退不能把它挡掉，
         // 否则「绑定成功」这种在非选择状态下发出的提示会一直挂在屏幕上。
         NoticeOverlay.tick();
+        // 高亮的倒计时与界面无关，同样不能被下面的早退挡掉。
+        BoundHighlightState.tick();
         Minecraft minecraft = Minecraft.getInstance();
         if (!bindingLogged) {
             logReverseBinding(minecraft);
@@ -458,6 +472,31 @@ public final class RecipeSenderClient {
     @SubscribeEvent
     public static void onRenderGui(RenderGuiEvent.Post event) {
         NoticeOverlay.renderInHud(event.getGuiGraphics());
+    }
+
+    /**
+     * ⑪ 世界内高亮：在关卡渲染收尾时画出红框。
+     *
+     * <p>**必须用 {@code AFTER_WEATHER}，不能用 {@code AFTER_LEVEL}。** 两者给的 poseStack 不是同一个东西：
+     * {@code AFTER_LEVEL} 由 {@code GameRenderer.renderLevel} 派发，传进去的是它自己新建的「投影栈」
+     * （{@code new PoseStack()} + {@code mulPoseMatrix(getProjectionMatrix(fov))} + bob，内容是 P·bob），
+     * 不含相机旋转；{@code AFTER_WEATHER} 由 {@code LevelRenderer.renderLevel} 内部派发，传的是它的
+     * {@code pPoseStack} 参数，也就是 GameRenderer 乘完相机旋转的那条「视图栈」（内容 = V）——
+     * 和 FindMeExtended 的 {@code BlacklistHighlighter}（Mixin 注入 {@code LevelRenderer.renderLevel}
+     * 的 TAIL）拿到的是同一个对象。用 {@code AFTER_LEVEL} 的话 model-view 会变成 (P·bob)·(P·bob)，
+     * 框被画到屏幕外，表现就是「一点反应都没有」。
+     */
+    @SubscribeEvent
+    public static void onRenderLevelStage(RenderLevelStageEvent event) {
+        if (event.getStage() != RenderLevelStageEvent.Stage.AFTER_WEATHER) {
+            return;
+        }
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.level == null) {
+            return;
+        }
+        BoundHighlightRenderer.render(event.getPoseStack(), event.getCamera(),
+                BoundHighlightState.positionsFor(minecraft.level.dimension()));
     }
 
     /** 生成带语言文件回退文本的「已发送 N 份到 X」提示。 */
@@ -759,9 +798,11 @@ public final class RecipeSenderClient {
         activeIngredient = hovered.getStack();
         activeRecipe = recipe;
         // 电路只影响机器的配方匹配，不参与材料统计，因此在开始选择时解析一次即可。
-        // 绑定模式的落点是远程方块，客户端拿不到它的机器实例，电路衔接在后续切片处理。
-        activeCircuit = boundMode ? null : GtCircuitSupport.findCircuit(recipe);
-        activeTargetHasCircuit = !boundMode && container != null
+        // 绑定模式也照常解析：落点是远程方块，客户端不知道它有没有电路槽，但要求可以先带上，
+        // 由服务端按真实实例决定写不写（没有电路槽就静默跳过）。
+        activeCircuit = GtCircuitSupport.findCircuit(recipe);
+        resolvedCircuit = activeCircuit;
+        activeTargetHasCircuit = container != null
                 && GtCircuitSupport.canAdjustCircuit(
                         GtCircuitSupport.findCircuitHolder(container.getMenu()));
         highlightedInventorySlots = RecipeMaterialCollector.findMatchingInventorySlots(recipe,
@@ -878,14 +919,21 @@ public final class RecipeSenderClient {
      * 把一份材料发往指定绑定，并记下这次的请求号用于认领回执。
      *
      * <p>这个入口同时被选择界面调用，所以请求号的分配收在这里，避免两处各写一遍。
+     *
+     * <p>电路要求随包带上（读 {@link #resolvedCircuit}，不是 {@code activeCircuit}——选择界面那条
+     * 路径发包时选择已经取消了）：落点是远程方块，服务端手里没有配方信息，不带上就只能不调电路。
+     * 认不出格雷配方时带 {@link GtCircuitSupport#NO_CIRCUIT}，服务端据此一律不动电路。
      */
     public static void sendBoundInsert(UUID bindingId, List<ItemStack> requirements, int batches) {
         if (bindingId == null || requirements.isEmpty() || batches <= 0) {
             return;
         }
+        GtCircuitSupport.CircuitRequirement circuit = resolvedCircuit;
+        int circuitNumber = circuit == null ? GtCircuitSupport.NO_CIRCUIT : circuit.circuit();
+        boolean gregRecipe = circuit != null && circuit.gregRecipe();
         boundRequestId = BOUND_REQUEST_SEQUENCE.incrementAndGet();
         ModNetwork.CHANNEL.sendToServer(new InsertRecipeItemsToBoundPacket(boundRequestId, bindingId,
-                requirements, batches));
+                requirements, batches, circuitNumber, gregRecipe));
     }
 
     /**
@@ -905,11 +953,6 @@ public final class RecipeSenderClient {
     /** 给玩家显示一条屏幕下方的提示。界面代码拿不到私有发送方法，所以开这个口子。 */
     public static void notifyPlayer(Component text) {
         sendMessage(Minecraft.getInstance(), text);
-    }
-
-    /** S1 的高亮还只是占位，真正的世界内红色描边在后续切片实现。 */
-    public static void notifyHighlightUnavailable(String name) {
-        notifyPlayer(Component.translatable("text.recipe_sender.highlight_pending", name));
     }
 
     /** 判断某个按键事件是不是绑定发送键（带修饰键判定）。 */
@@ -945,7 +988,9 @@ public final class RecipeSenderClient {
      * 拿机器实例判断（写不进去时服务端直接返回，不会误删别的东西）。
      */
     private static void sendCircuitRequest() {
-        if (reverseMode || activeCircuit == null || activeContainer == null) {
+        // 绑定模式不走这条：它的电路要求随投放包一起交给服务端（见 sendBoundInsert）。绑定模式下
+        // 玩家可能正开着某台机器的界面，走菜单通路会改到「当前开着的机器」而不是「绑定的机器」。
+        if (reverseMode || boundMode || activeCircuit == null || activeContainer == null) {
             return;
         }
         if (!GtCircuitSupport.isModularUiContainer(activeContainer.getMenu())) {
@@ -1192,37 +1237,60 @@ public final class RecipeSenderClient {
     /**
      * 描述这次发送会怎样改动机器电路。
      *
+     * <p>绑定模式与正向模式的文案必须分开：正向模式的目标就是玩家开着的容器，客户端能直接判定
+     * 它有没有电路槽，所以可以断言；绑定模式的落点在远处，客户端拿不到机器实例，只能写成
+     * 「目标有电路槽时生效」——最终写不写由服务端按真实实例决定。
+     *
      * @return 提示行；目标没有电路槽、或不是格雷配方（识别失败、只从 EMI 原料看到电路）时返回
      *         {@code null}
      */
     private static Component describeCircuitChange() {
-        if (activeCircuit == null || !activeTargetHasCircuit) {
+        if (activeCircuit == null) {
+            return null;
+        }
+        if (boundMode) {
+            if (activeCircuit.requiresCircuit()) {
+                return getCircuitText(activeCircuit.circuit(), true);
+            }
+            return activeCircuit.gregRecipe() ? getCircuitClearText(true) : null;
+        }
+        if (!activeTargetHasCircuit) {
             // 目标没有电路槽（原版箱子、漏斗等）时什么都不会发，别提示得像是会改电路。
             return null;
         }
         if (activeCircuit.requiresCircuit()) {
-            return getCircuitText(activeCircuit.circuit());
+            return getCircuitText(activeCircuit.circuit(), false);
         }
         // 认出了配方对象、且它确实不使用电路：目标有电路槽（上面已判）就会置空。
-        return activeCircuit.gregRecipe() ? getCircuitClearText() : null;
+        return activeCircuit.gregRecipe() ? getCircuitClearText(false) : null;
     }
 
-    /** 生成带语言文件回退文本的电路提示。 */
-    private static Component getCircuitText(int circuit) {
-        String key = "text.recipe_sender.circuit";
+    /**
+     * 生成带语言文件回退文本的电路提示。
+     *
+     * @param remote 落点是否为远程方块（绑定模式）；为真时用「目标有电路槽时生效」那一组文案
+     */
+    private static Component getCircuitText(int circuit, boolean remote) {
+        String key = remote ? "text.recipe_sender.circuit_bound" : "text.recipe_sender.circuit";
         String text = I18n.get(key, circuit);
         if (text.equals(key) || text.startsWith("Format error:")) {
-            return Component.literal("电路 #" + circuit);
+            return Component.literal(remote ? "电路 #" + circuit + "（目标有电路槽时生效）"
+                    : "电路 #" + circuit);
         }
         return Component.literal(text);
     }
 
-    /** 生成带语言文件回退文本的置空提示。 */
-    private static Component getCircuitClearText() {
-        String key = "text.recipe_sender.circuit_clear";
+    /**
+     * 生成带语言文件回退文本的置空提示。
+     *
+     * @param remote 落点是否为远程方块（绑定模式）
+     */
+    private static Component getCircuitClearText(boolean remote) {
+        String key = remote ? "text.recipe_sender.circuit_bound_clear"
+                : "text.recipe_sender.circuit_clear";
         String text = I18n.get(key);
         if (text.equals(key) || text.startsWith("Format error:")) {
-            return Component.literal("电路置空");
+            return Component.literal(remote ? "电路置空（目标有电路槽时生效）" : "电路置空");
         }
         return Component.literal(text);
     }

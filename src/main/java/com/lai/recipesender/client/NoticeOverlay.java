@@ -21,8 +21,13 @@ final class NoticeOverlay {
     private static final int FADE_TICKS = 10;
     private static final int PADDING_X = 8;
     private static final int PADDING_Y = 4;
-    /** 提示框底边距屏幕底部的距离：让开快捷栏与手持物品名。 */
-    private static final int BOTTOM_MARGIN = 46;
+    /**
+     * 提示框底边距屏幕底部的距离。
+     *
+     * <p>要让开两样东西：快捷栏本身，以及快捷栏上方那行「手持物品名」——后者画在
+     * {@code guiHeight - 59} 附近，之前留 46 正好和它叠在一起。
+     */
+    private static final int BOTTOM_MARGIN = 62;
     private static final int BACKGROUND = 0xC0000000;
     private static final int ACCENT = 0xFF4F8A3F;
     private static final int TEXT = 0xFFFFFFFF;

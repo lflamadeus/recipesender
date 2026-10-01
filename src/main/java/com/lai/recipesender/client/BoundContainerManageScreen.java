@@ -14,10 +14,12 @@ import org.lwjgl.glfw.GLFW;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -30,11 +32,14 @@ import java.util.UUID;
  * <p>非模态：{@code isPauseScreen()} 返回 false，世界继续跑。
  * 全部操作都只是发一个网络包，界面显示的是服务端回推的最新状态，客户端不做乐观更新。
  *
- * <p>并列成员与从容器**默认收起**，工具栏的「展开 / 收起」按钮切换；一旦搜索就自动展开。
+ * <p>并列成员与从容器**默认收起**，点主容器行展开这一组（行首有 ▼ / ▶ 记号），
+ * 工具栏的「展开 / 收起」按钮则一次全开或全关；一旦搜索就自动展开，此时点行不再收起。
  * 搜索支持中文首字母与全拼（靠 {@link PinyinSupport}，没装 JEC 时静默降级为字面匹配），
  * 搜索框上点右键清空。
  *
- * <p>行内操作：「改名 / 关系 / 高亮（占位）/ 删除」。「类别」要等 S6 的类别选择器。
+ * <p>E 或 Esc 关界面（焦点在搜索框 / 改名框里时 E 让给输入框）。
+ *
+ * <p>行内操作：「改名 / 关系 / 高亮 / 删除」。「类别」要等 S6 的类别选择器。
  */
 class BoundContainerManageScreen extends Screen {
 
@@ -63,12 +68,19 @@ class BoundContainerManageScreen extends Screen {
     private int scrollOffset;
 
     /**
-     * 并列成员与从容器是否展开。
+     * 已经展开的主容器。
      *
-     * <p>默认**收起**：一级行（主容器）已经带 {@code ×N} 与「+N 并列成员 +M 从容器」的组头说明，
-     * 一眼能看出规模；展开才逐行看细节。搜索时无条件展开，否则搜到的子项会因为折叠而「看不见」。
+     * <p>默认**全收起**：一级行（主容器）已经带 {@code ×N} 与「+N 并列成员 +M 从容器」的组头说明，
+     * 一眼能看出规模；展开才逐行看细节。
+     *
+     * <p>按主容器各记各的，而不是一个全局开关：容器一多，想看的往往只有其中一组，
+     * 全局展开会把列表撑得很长。工具栏的「展开 / 收起」按钮仍然是全局的（一次全开或全关），
+     * 点主容器行则只翻这一组。
      */
-    private boolean expanded;
+    private final Set<UUID> expandedMasters = new HashSet<>();
+
+    /** 本帧是否处于搜索状态。{@link #buildEntries()} 里赋值，{@link #drawRow} 读。 */
+    private boolean searching;
 
     /** 上一帧的条目，供「一次滚一行」找行边界。 */
     private List<Entry> lastEntries = List.of();
@@ -114,7 +126,7 @@ class BoundContainerManageScreen extends Screen {
         });
         addRenderableWidget(searchBox);
 
-        expandButton = Button.builder(expandLabel(), button -> toggleExpanded())
+        expandButton = Button.builder(expandLabel(), button -> setAllExpanded(!allExpanded()))
                 .bounds(expandX, toolbarY, TOOLBAR_BUTTON_WIDTH, 18).build();
         addRenderableWidget(expandButton);
         addRenderableWidget(Button.builder(Component.translatable("text.recipe_sender.manage_close"),
@@ -126,16 +138,53 @@ class BoundContainerManageScreen extends Screen {
         }
     }
 
-    /** 展开 / 收起并列成员与从容器。 */
-    private void toggleExpanded() {
-        expanded = !expanded;
+    /** 工具栏的全局开关：一次全开或全关。 */
+    private void setAllExpanded(boolean value) {
+        expandedMasters.clear();
+        if (value) {
+            for (BoundContainer master : BoundContainerClient.masters()) {
+                expandedMasters.add(master.id());
+            }
+        }
         if (expandButton != null) {
             expandButton.setMessage(expandLabel());
         }
     }
 
+    /** 点主容器行：只翻这一组。 */
+    private void toggleExpanded(UUID masterId) {
+        if (searching) {
+            // 搜索时强制展开，点了也不该收起——否则搜出来的子项会突然消失。
+            return;
+        }
+        if (!expandedMasters.remove(masterId)) {
+            expandedMasters.add(masterId);
+        }
+        if (expandButton != null) {
+            expandButton.setMessage(expandLabel());
+        }
+    }
+
+    private boolean isExpanded(UUID masterId) {
+        return searching || expandedMasters.contains(masterId);
+    }
+
+    /** 全部主容器都展开时按钮显示「收起」，否则显示「展开」。 */
+    private boolean allExpanded() {
+        List<BoundContainer> masters = BoundContainerClient.masters();
+        if (masters.isEmpty()) {
+            return false;
+        }
+        for (BoundContainer master : masters) {
+            if (!expandedMasters.contains(master.id())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private Component expandLabel() {
-        return Component.translatable(expanded
+        return Component.translatable(allExpanded()
                 ? "text.recipe_sender.manage_collapse" : "text.recipe_sender.manage_expand");
     }
 
@@ -189,12 +238,12 @@ class BoundContainerManageScreen extends Screen {
 
         List<Entry> entries = new ArrayList<>();
         String needle = query.trim().toLowerCase(Locale.ROOT);
-        boolean searching = !needle.isEmpty();
-        // 收起时只列主容器；一搜索就自动展开，否则搜到的并列成员/从容器会因为折叠而「看不见」。
-        boolean showChildren = expanded || searching;
+        searching = !needle.isEmpty();
         int shown = 0;
 
         for (BoundContainer master : masters) {
+            // 收起时只列主容器；一搜索就自动展开，否则搜到的并列成员/从容器会因为折叠而「看不见」。
+            boolean showChildren = isExpanded(master.id());
             List<BoundContainer> group = children.getOrDefault(master.id(), List.of());
             List<BoundContainer> visibleChildren = new ArrayList<>();
             for (BoundContainer child : group) {
@@ -402,6 +451,15 @@ class BoundContainerManageScreen extends Screen {
         if (row.indent()) {
             graphics.drawString(font, "└", cursor, y + 4, BoundUi.TEXT_DIM, false);
             cursor += 8;
+        } else if (!orphan) {
+            // 主容器行前面的三角：▼ 展开、▶ 收起。点整行都能翻，这个记号只是让人知道「能点」。
+            // 没有子容器的（光杆主容器）不画记号也不给点——画了却点不动，比不画更让人困惑。
+            // 位置照留，让各行图标与名字对齐。
+            if (hasChildren(binding)) {
+                graphics.drawString(font, isExpanded(binding.id()) ? "▼" : "▶", cursor, y + 4,
+                        BoundUi.TEXT_DIM, false);
+            }
+            cursor += 9;
         }
         if (!binding.iconItem().isEmpty()) {
             graphics.renderItem(binding.iconItem(), cursor, y + 3);
@@ -430,6 +488,17 @@ class BoundContainerManageScreen extends Screen {
         }
 
         drawRowButtons(graphics, binding, x + width, y, mouseX, mouseY);
+        // 整行可点：展开 / 收起这一组。**必须加在按钮之后**——命中判定按列表顺序取第一个，
+        // 按钮先入列才能在点击时优先于整行，否则点「改名」会变成展开。
+        if (!row.indent() && !orphan && hasChildren(binding)) {
+            hitTargets.add(new HitTarget(x, y, width, height, binding.id(), "toggle"));
+        }
+    }
+
+    /** 这一组名下有没有子项（并列成员 / 从容器）；没有就没什么可展开的。 */
+    private static boolean hasChildren(BoundContainer master) {
+        return BoundContainerClient.memberCount(master.id()) > 1
+                || BoundContainerClient.slaveCount(master.id()) > 0;
     }
 
     private static String displayName(BoundContainer binding) {
@@ -542,10 +611,20 @@ class BoundContainerManageScreen extends Screen {
         switch (target.action()) {
             case "rename" -> beginRename(binding);
             case "relation" -> openRelation(binding);
-            case "highlight" -> RecipeSenderClient.notifyHighlightUnavailable(binding.name());
+            case "toggle" -> toggleExpanded(binding.id());
+            case "highlight" -> highlight(binding);
             case "delete" -> requestDelete(binding);
             default -> {
             }
+        }
+    }
+
+    /** 高亮：关掉界面回到世界，否则红框画在界面后面根本看不见。 */
+    private void highlight(BoundContainer binding) {
+        BoundHighlightState.show(binding);
+        cancelRename();
+        if (minecraft != null) {
+            minecraft.setScreen(null);
         }
     }
 
@@ -632,18 +711,32 @@ class BoundContainerManageScreen extends Screen {
     }
 
     /**
-     * 一次滚一行的目标偏移。
+     * 一次滚一个「单位」的目标偏移。
      *
      * <p>行高有三种（组头 16、一级行 30、子行 26），固定像素步长会让滚动停在一行中间。
-     * 这里按累积高度取行边界：向下取「第一个大于当前偏移的边界」，向上取「最后一个小于
-     * 当前偏移的边界」——无论从哪个位置开始，一次滚动都正好翻过一整行。
+     * 这里按累积高度取落点边界：向下取「第一个大于当前偏移的边界」，向上取「最后一个小于
+     * 当前偏移的边界」——无论从哪个位置开始，一次滚动都正好翻过一个单位。
+     *
+     * <p>组头（「标题行」）不算独立单位：它跟着紧随其后的那一行（主容器行）一起滚过去。
+     * 否则一次只滚 16px、下一次滚 30px，看起来忽快忽慢。子行各自算一个单位。
      */
     private int scrollTarget(int direction) {
         List<Integer> bounds = new ArrayList<>(lastEntries.size() + 1);
         bounds.add(0);
         int acc = 0;
+        boolean pendingHead = false;
         for (Entry entry : lastEntries) {
             acc += entry.height();
+            if (entry instanceof GroupEntry) {
+                // 标题行先记着，和下一行合成一个单位，这里不出边界。
+                pendingHead = true;
+                continue;
+            }
+            pendingHead = false;
+            bounds.add(acc);
+        }
+        if (pendingHead) {
+            // 末尾只剩标题（正常构造下不会出现），给它一个落点，免得滚不到底。
             bounds.add(acc);
         }
         if (direction > 0) {
@@ -666,6 +759,11 @@ class BoundContainerManageScreen extends Screen {
 
     @Override
     public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        // E 关界面（和原版背包一致），但焦点在输入框里时 E 是普通字符，得留给输入框。
+        if (keyCode == GLFW.GLFW_KEY_E && !isTextFocused()) {
+            onClose();
+            return true;
+        }
         if (renameBox != null) {
             if (keyCode == GLFW.GLFW_KEY_ENTER || keyCode == GLFW.GLFW_KEY_KP_ENTER) {
                 commitRename();
@@ -682,6 +780,11 @@ class BoundContainerManageScreen extends Screen {
             return true;
         }
         return super.keyPressed(keyCode, scanCode, modifiers);
+    }
+
+    /** 焦点是否落在某个输入框里。E 要留给输入框当普通字符。 */
+    private boolean isTextFocused() {
+        return (searchBox != null && searchBox.isFocused()) || (renameBox != null && renameBox.isFocused());
     }
 
     @Override

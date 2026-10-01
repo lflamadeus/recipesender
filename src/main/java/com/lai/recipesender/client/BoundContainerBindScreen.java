@@ -15,9 +15,11 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.state.BlockState;
+import org.lwjgl.glfw.GLFW;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 
 /**
@@ -29,6 +31,10 @@ import java.util.UUID;
  *
  * <p>同一个界面也承担「改关系」：管理界面的「关系」按钮会带着已有的绑定重新打开它，
  * 这时坐标与方块信息取自绑定自身（绑定的容器可能不在玩家当前维度，客户端读不到方块状态）。
+ *
+ * <p>主容器下拉带自己的搜索框：主容器一多，靠滚动找一个箱子非常难受。搜索走的是与管理界面、
+ * 选择弹窗同一套 {@code PinyinSupport}，所以中文名可以直接打拼音。下拉收起时按键焦点会被交还，
+ * 不会出现「界面看着正常、按键却全被看不见的输入框吃掉」。
  */
 public class BoundContainerBindScreen extends Screen {
 
@@ -55,6 +61,17 @@ public class BoundContainerBindScreen extends Screen {
     private UUID parentId;
     private boolean parentDropOpen;
     private int dropScroll;
+
+    /**
+     * 下拉里的搜索框。
+     *
+     * <p>刻意**不用 {@code addRenderableWidget}**：下拉面板画在 {@code super.render} 之后，
+     * 注册进去会被面板底色整个盖住。照管理界面 {@code renameBox} 的做法手动 {@code render}。
+     */
+    private EditBox dropSearch;
+
+    /** 下拉的搜索词，始终已 trim + 小写。由 {@link #dropSearch} 的 responder 维护。 */
+    private String dropQuery = "";
 
     private int left;
     private int top;
@@ -96,6 +113,17 @@ public class BoundContainerBindScreen extends Screen {
         nameBox.setValue(editing != null ? editing.name() : "");
         nameBox.setHint(Component.translatable("text.recipe_sender.bind_name_hint"));
         addRenderableWidget(nameBox);
+
+        // 下拉的第一行是搜索框，坐标与 drawDropdown 里的布局必须一致（面板内边距 +1，行高 14）。
+        dropSearch = new EditBox(font, left + PADDING + 1, top + 196, PANEL_WIDTH - PADDING * 2 - 2,
+                DROP_ROW_HEIGHT, Component.translatable("text.recipe_sender.bind_parent_search"));
+        dropSearch.setMaxLength(BoundContainer.MAX_NAME_LENGTH);
+        dropSearch.setHint(Component.translatable("text.recipe_sender.bind_parent_search"));
+        dropSearch.setValue(dropQuery);
+        dropSearch.setResponder(value -> {
+            dropQuery = value.trim().toLowerCase(Locale.ROOT);
+            dropScroll = 0;
+        });
 
         addRenderableWidget(Button.builder(Component.translatable("text.recipe_sender.bind_save"),
                         button -> save())
@@ -229,16 +257,19 @@ public class BoundContainerBindScreen extends Screen {
 
     private void drawDropdown(GuiGraphics graphics, int mouseX, int mouseY, int x, int y, int width) {
         List<BoundContainer> candidates = parentCandidates();
-        if (candidates.isEmpty()) {
-            return;
-        }
-        int visible = Math.min(DROP_MAX_VISIBLE, candidates.size());
-        int height = visible * DROP_ROW_HEIGHT + 2;
+        // 第一行留给搜索框，候选最多 5 行。
+        int visible = Math.min(DROP_MAX_VISIBLE - 1, candidates.size());
+        dropScroll = Math.max(0, Math.min(dropScroll, Math.max(0, candidates.size() - visible)));
+        // 一个候选都没有时也要把面板和搜索框画出来，否则玩家没法改掉那个搜不到东西的关键词。
+        int height = (visible + 1) * DROP_ROW_HEIGHT + 2;
         graphics.fill(x - 1, y - 1, x + width + 1, y + height + 1, BoundUi.BORDER_DARK);
         graphics.fill(x, y, x + width, y + height, 0xFFE0E0E0);
+        if (dropSearch != null) {
+            dropSearch.render(graphics, mouseX, mouseY, 0.0F);
+        }
         for (int index = 0; index < visible; index++) {
             BoundContainer candidate = candidates.get(dropScroll + index);
-            int rowY = y + 1 + index * DROP_ROW_HEIGHT;
+            int rowY = y + 1 + (index + 1) * DROP_ROW_HEIGHT;
             boolean hovered = BoundUi.inside(mouseX, mouseY, x, rowY, width, DROP_ROW_HEIGHT);
             if (hovered) {
                 graphics.fill(x, rowY, x + width, rowY + DROP_ROW_HEIGHT, BoundUi.ROW_HOVER);
@@ -277,7 +308,7 @@ public class BoundContainerBindScreen extends Screen {
         }
         BoundContainer chosen = findParent();
         if (chosen == null) {
-            return Component.translatable(parentCandidates().isEmpty()
+            return Component.translatable(masterCandidates().isEmpty()
                     ? "text.recipe_sender.bind_parent_empty"
                     : "text.recipe_sender.bind_parent_none");
         }
@@ -288,8 +319,8 @@ public class BoundContainerBindScreen extends Screen {
         return parentId == null ? null : BoundContainerClient.find(parentId);
     }
 
-    /** 可选的主容器：排除自己（自己不能当自己的父）。 */
-    private List<BoundContainer> parentCandidates() {
+    /** 全部可选的主容器：排除自己（自己不能当自己的父）。下拉与默认挂靠都基于它。 */
+    private List<BoundContainer> masterCandidates() {
         List<BoundContainer> result = new ArrayList<>();
         for (BoundContainer master : BoundContainerClient.masters()) {
             if (editing == null || !master.id().equals(editing.id())) {
@@ -299,16 +330,50 @@ public class BoundContainerBindScreen extends Screen {
         return result;
     }
 
+    /** 下拉里实际列出的主容器：在 {@link #masterCandidates()} 之上再按下拉搜索词过滤。 */
+    private List<BoundContainer> parentCandidates() {
+        if (dropQuery.isEmpty()) {
+            return masterCandidates();
+        }
+        List<BoundContainer> result = new ArrayList<>();
+        for (BoundContainer master : masterCandidates()) {
+            if (matches(master)) {
+                result.add(master);
+            }
+        }
+        return result;
+    }
+
+    /** 名称、方块名、坐标任一处命中即可；名称与方块名支持拼音。 */
+    private boolean matches(BoundContainer binding) {
+        if (PinyinSupport.match(binding.name(), dropQuery)
+                || PinyinSupport.match(BoundUi.blockText(binding), dropQuery)) {
+            return true;
+        }
+        BlockPos candidate = binding.pos();
+        return (candidate.getX() + " " + candidate.getY() + " " + candidate.getZ()).contains(dropQuery);
+    }
+
     // ------------------------------------------------------------------ 交互
 
     @Override
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        // 搜索框在 hits 之外，必须最先判：它的位置在候选行上面，落到 hits 循环里会被当成点空。
+        if (parentDropOpen && dropSearch != null && dropSearch.isMouseOver(mouseX, mouseY)) {
+            if (button == 1) {
+                // 右键清空，和本模组其它搜索框一致。
+                dropSearch.setValue("");
+                return true;
+            }
+            setFocused(dropSearch);
+            return dropSearch.mouseClicked(mouseX, mouseY, button);
+        }
         if (button == 0) {
             if (parentDropOpen) {
                 if (clickDropdown(mouseX, mouseY)) {
                     return true;
                 }
-                parentDropOpen = false;
+                closeDropdown();
                 return true;
             }
             for (Hit hit : hits) {
@@ -326,24 +391,39 @@ public class BoundContainerBindScreen extends Screen {
             if (hit.action.startsWith("parent:")
                     && BoundUi.inside(mouseX, mouseY, hit.x, hit.y, hit.width, hit.height)) {
                 parentId = UUID.fromString(hit.action.substring("parent:".length()));
-                parentDropOpen = false;
+                closeDropdown();
                 return true;
             }
         }
         return false;
     }
 
+    /** 收起下拉并把焦点交还给界面，免得收起后按键还被搜索框吃走。 */
+    private void closeDropdown() {
+        parentDropOpen = false;
+        setFocused(null);
+    }
+
     private void act(String action) {
         if ("parent".equals(action)) {
-            parentDropOpen = !parentDropOpen;
-            dropScroll = 0;
+            if (parentDropOpen) {
+                closeDropdown();
+            } else {
+                parentDropOpen = true;
+                dropScroll = 0;
+                if (dropSearch != null) {
+                    // 每次打开都从空搜索开始；留着上次的词只会让人以为候选变少了。
+                    dropSearch.setValue("");
+                    setFocused(dropSearch);
+                }
+            }
             return;
         }
         if (action.startsWith("role:")) {
             role = BoundContainer.Role.valueOf(action.substring("role:".length()));
             if (role == BoundContainer.Role.MASTER) {
                 parentId = null;
-                parentDropOpen = false;
+                closeDropdown();
             } else {
                 ensureParent();
             }
@@ -359,14 +439,15 @@ public class BoundContainerBindScreen extends Screen {
         if (parentId != null && findParent() != null) {
             return;
         }
-        List<BoundContainer> candidates = parentCandidates();
+        List<BoundContainer> candidates = masterCandidates();
         parentId = candidates.isEmpty() ? null : candidates.get(0).id();
     }
 
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double delta) {
         if (parentDropOpen) {
-            int max = Math.max(0, parentCandidates().size() - DROP_MAX_VISIBLE);
+            // 第一行是搜索框，能滚的候选只剩 DROP_MAX_VISIBLE - 1 行。
+            int max = Math.max(0, parentCandidates().size() - (DROP_MAX_VISIBLE - 1));
             dropScroll = Math.max(0, Math.min(max, dropScroll - (int) Math.signum(delta)));
             return true;
         }
@@ -375,15 +456,32 @@ public class BoundContainerBindScreen extends Screen {
 
     @Override
     public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
-        if (keyCode == 257 || keyCode == 335) {
+        // E 关界面（和原版背包一致）；焦点在输入框里时 E 是普通字符，交给 super 转发。
+        if (keyCode == GLFW.GLFW_KEY_E && !isTextFocused()) {
+            onClose();
+            return true;
+        }
+        if (parentDropOpen && dropSearch != null && dropSearch.isFocused()
+                && (keyCode == GLFW.GLFW_KEY_ENTER || keyCode == GLFW.GLFW_KEY_KP_ENTER)) {
+            // 在下拉的搜索框里按 Enter 是「过滤好了，收起来看候选」，不该触发保存。
+            closeDropdown();
+            return true;
+        }
+        if (keyCode == GLFW.GLFW_KEY_ENTER || keyCode == GLFW.GLFW_KEY_KP_ENTER) {
             save();
             return true;
         }
-        if (keyCode == 256 && parentDropOpen) {
-            parentDropOpen = false;
+        if (keyCode == GLFW.GLFW_KEY_ESCAPE && parentDropOpen) {
+            closeDropdown();
             return true;
         }
         return super.keyPressed(keyCode, scanCode, modifiers);
+    }
+
+    /** 焦点是否落在某个输入框里；是的话 E 应该当普通字符用。 */
+    private boolean isTextFocused() {
+        return (nameBox != null && nameBox.isFocused())
+                || (dropSearch != null && dropSearch.isFocused());
     }
 
     @Override

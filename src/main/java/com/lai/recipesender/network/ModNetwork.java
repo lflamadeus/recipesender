@@ -23,7 +23,14 @@ import net.minecraftforge.network.simple.SimpleChannel;
 
 /** 集中注册客户端与服务端之间的数据包。 */
 public final class ModNetwork {
-    private static final String PROTOCOL_VERSION = "8";
+    /**
+     * 协议版本。改动任何数据包的字段顺序或增删字段都必须改这个值，否则新旧客户端与服务端会
+     * 按各自的读法解析同一个字节流，静默读出垃圾数据。
+     *
+     * <p>1.0.23 由 8 升到 9：{@code InsertRecipeItemsToBoundPacket} 尾部加了电路编号与
+     * 「是否格雷配方」两个字段。
+     */
+    private static final String PROTOCOL_VERSION = "9";
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             ResourceLocation.fromNamespaceAndPath(RecipeSenderMod.MOD_ID, "main"),
             () -> PROTOCOL_VERSION, PROTOCOL_VERSION::equals, PROTOCOL_VERSION::equals);

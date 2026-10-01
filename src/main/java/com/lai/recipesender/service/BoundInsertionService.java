@@ -95,6 +95,10 @@ public final class BoundInsertionService {
                 overflow.add(new RemoteTransferPlanner.Target(target.handler(), target.blockEntity()));
                 resolved.add(target);
             }
+            // 电路必须在投料之前全部调完：材料一进机器，配方逻辑就会按当时的电路立刻开始匹配，
+            // 调晚了等于先跑错一次。从容器刻意不在这个列表里——它只是容量备份，溢出的材料进去
+            // 之后由玩家自己搬，改它的电路只会让玩家困惑。
+            applyCircuits(members, packet.circuit(), packet.gregRecipe());
             RemoteTransferPlanner.Applied applied =
                     RemoteTransferPlanner.applyBySharesDetailed(members, overflow, requirements, packet.batches());
             List<ItemStack> inserted = applied.inserted();
@@ -121,6 +125,21 @@ public final class BoundInsertionService {
         } catch (RuntimeException exception) {
             LOGGER.warn("向已绑定容器投放配方材料失败：玩家 {}", player.getGameProfile().getName(), exception);
             reply(player, packet, BoundStatus.FORBIDDEN, 0, 0, null);
+        }
+    }
+
+    /**
+     * 按配方要求把并列组里每台机器的电路调好。
+     *
+     * <p>只调主容器与并列成员（{@code members}）：从容器即使有电路槽也不动，它只是容量备份。
+     *
+     * <p>取不到电路槽（普通箱子、非格雷机器、多方块部件挂不到控制器）时静默跳过——绑定目标本来
+     * 就可能是箱子，电路调不了绝不能牵连材料投放。
+     */
+    private static void applyCircuits(List<RemoteTransferPlanner.Target> members,
+                                      int circuit, boolean gregRecipe) {
+        for (RemoteTransferPlanner.Target member : members) {
+            MachineCircuitService.applyToBlockEntity(member.blockEntity(), circuit, gregRecipe);
         }
     }
 
