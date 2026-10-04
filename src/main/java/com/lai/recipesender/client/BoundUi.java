@@ -1,6 +1,7 @@
 package com.lai.recipesender.client;
 
 import com.lai.recipesender.model.BoundContainer;
+import com.lai.recipesender.model.BoundStatus;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.screens.Screen;
@@ -43,6 +44,12 @@ final class BoundUi {
     static final int TAG_LAST = 0xFFB8860B;
     /** 已勾选的配方类别数量（S6 自动路由）。 */
     static final int TAG_ROUTE = 0xFF7A4FA8;
+    /** 目标容器已经不在了。 */
+    static final int TAG_DEAD = 0xFFA02020;
+    /** 判不出来（区块未加载）。 */
+    static final int TAG_UNKNOWN = 0xFF8A8A8A;
+    /** 绑定记在别的维度。 */
+    static final int TAG_OTHER_DIMENSION = 0xFF6B6B6B;
 
     private BoundUi() {
     }
@@ -133,6 +140,52 @@ final class BoundUi {
             width += font.width(Component.translatable("text.recipe_sender.tag_last")) + 5 + 2;
         }
         return width;
+    }
+
+    /**
+     * 存活性短标签的文案；正常（或本地判不出来）时返回 {@code null}，表示什么都不画。
+     *
+     * <p>短标签只说「哪里不对」，完整原因（以及后果）放在悬停提示里，见 {@link #aliveTip}。
+     * 行内空间有限，一行上还有名字、角色标签和按钮。
+     */
+    static Component aliveLabel(BoundStatus status) {
+        return switch (status) {
+            case MISSING -> Component.translatable("text.recipe_sender.bound_liveness.missing");
+            case CHUNK_UNLOADED -> Component.translatable("text.recipe_sender.bound_liveness.chunk_unloaded");
+            case DIMENSION_MISMATCH ->
+                    Component.translatable("text.recipe_sender.bound_liveness.dimension_mismatch");
+            default -> null;
+        };
+    }
+
+    private static int aliveTagColor(BoundStatus status) {
+        return switch (status) {
+            case MISSING -> TAG_DEAD;
+            case DIMENSION_MISMATCH -> TAG_OTHER_DIMENSION;
+            default -> TAG_UNKNOWN;
+        };
+    }
+
+    /** 悬停提示：完整原因。发送时用的是同一批 {@code bound_status.*} 文案，界面与回执说法一致。 */
+    static Component aliveTip(BoundStatus status) {
+        return switch (status) {
+            case MISSING -> Component.translatable("text.recipe_sender.bound_liveness.missing_tip");
+            case CHUNK_UNLOADED -> Component.translatable("text.recipe_sender.bound_status.chunk_unloaded");
+            case DIMENSION_MISMATCH -> Component.translatable("text.recipe_sender.bound_status.dimension_mismatch");
+            default -> null;
+        };
+    }
+
+    /** 画存活性短标签，返回它占用的宽度（含与下一个标签的间距）；不画时返回 0。 */
+    static int aliveTag(GuiGraphics graphics, int x, int y, BoundStatus status) {
+        Component label = aliveLabel(status);
+        return label == null ? 0 : tag(graphics, x, y, label, aliveTagColor(status)) + 2;
+    }
+
+    /** 与 {@link #aliveTag} 对应的宽度，只测量不绘制。 */
+    static int aliveTagWidth(BoundStatus status) {
+        Component label = aliveLabel(status);
+        return label == null ? 0 : Minecraft.getInstance().font.width(label) + 5 + 2;
     }
 
     /** 坐标的显示形式：{@code (x, y, z)}。 */

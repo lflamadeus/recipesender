@@ -1,6 +1,7 @@
 package com.lai.recipesender.client;
 
 import com.lai.recipesender.model.BoundContainer;
+import com.lai.recipesender.model.BoundStatus;
 import com.lai.recipesender.network.ModNetwork;
 import com.lai.recipesender.network.packet.UnbindContainerPacket;
 import com.lai.recipesender.network.packet.UpdateBindingPacket;
@@ -60,6 +61,8 @@ class BoundContainerManageScreen extends Screen {
     private static final int TOOLBAR_BUTTON_WIDTH = 56;
     /** 打开界面后的键盘静默期，见 {@link #swallowOpeningInput()}。 */
     private static final long OPEN_INPUT_GRACE_MS = 250L;
+    /** 存活性判定的刷新节拍（20 tick = 1 秒），见 {@link #tick()}。 */
+    private static final int LIVENESS_REFRESH_TICKS = 20;
 
     private final Screen parent;
 
@@ -108,6 +111,20 @@ class BoundContainerManageScreen extends Screen {
     /** 本帧悬停中的行内按钮提示，最后统一画（画早了会被后画的控件盖住）。 */
     private Component pendingTooltip;
 
+    /**
+     * 每个绑定的本地存活性（见 {@link BoundLiveness}）。
+     *
+     * <p>1.0.27 新增。破坏方块不会触发服务端同步，所以列表里的数据永远是「上次同步时」的样子；
+     * 这张表是界面自己按当前世界问出来的答案，只在打开界面时与之后每秒问一次。
+     *
+     * <p>只存判定结果、不改任何数据：方块被拆掉之后，这里只是让那一行变红，
+     * 绑定本身仍然保留（拆了准备搬走、之后再放回来是常见操作，自动解绑反而更糟）。
+     */
+    private final Map<UUID, BoundStatus> liveness = new HashMap<>();
+
+    /** {@link #liveness} 的刷新节拍，见 {@link #tick()}。 */
+    private int livenessTicks;
+
     /** 打开时刻，配合 {@link #OPEN_INPUT_GRACE_MS} 用。 */
     private long openedAt;
 
@@ -136,6 +153,8 @@ class BoundContainerManageScreen extends Screen {
         setFocused(null);
         // 记下打开时刻：开界面那一按的字符事件会落到下面刚建出来的搜索框上（见 swallowOpeningInput）。
         openedAt = Util.getMillis();
+        // 打开界面即校验一次：拆掉方块不会触发服务端同步，不主动问一次的话那一行看起来完全正常。
+        refreshLiveness();
         panelWidth = Math.min(PANEL_MAX_WIDTH, width - PANEL_MARGIN * 2);
         panelHeight = Math.min(height - PANEL_MARGIN, 320);
         left = (width - panelWidth) / 2;
@@ -238,6 +257,36 @@ class BoundContainerManageScreen extends Screen {
                 pendingDeleteId = null;
             }
         }
+        // 每秒重问一次存活性：界面是非模态的（世界继续跑），区块可能在界面开着的时候才加载完，
+        // 别人也可能在你盯着界面时把容器拆了。判定只是几次方块实体查询，不联网、不改数据。
+        if (++livenessTicks >= LIVENESS_REFRESH_TICKS) {
+            livenessTicks = 0;
+            refreshLiveness();
+        }
+    }
+
+    /** 重算每个绑定的存活性。只在打开界面时与之后每秒各一次，不做每帧查询。 */
+    private void refreshLiveness() {
+        liveness.clear();
+        for (BoundContainer binding : BoundContainerClient.all()) {
+            liveness.put(binding.id(), BoundLiveness.of(binding));
+        }
+    }
+
+    /** 某个绑定的存活性；还没问过时按正常处理。 */
+    private BoundStatus livenessOf(BoundContainer binding) {
+        return liveness.getOrDefault(binding.id(), BoundStatus.OK);
+    }
+
+    /** 页脚用：当前有几个绑定指向的方块已经不存在。 */
+    private int deadCount() {
+        int count = 0;
+        for (BoundStatus status : liveness.values()) {
+            if (status == BoundStatus.MISSING) {
+                count++;
+            }
+        }
+        return count;
     }
 
     // ------------------------------------------------------------------ 数据组织
@@ -421,8 +470,13 @@ class BoundContainerManageScreen extends Screen {
         }
 
         int footerY = top + panelHeight - FOOTER_HEIGHT + 3;
-        BoundUi.centered(graphics, Component.translatable("text.recipe_sender.manage_footer",
-                entryCount), left + panelWidth / 2, footerY, BoundUi.TEXT_DIM);
+        // 失效条数写进页脚：列表能滚，滚到屏幕外的失效项也该被看见。
+        int dead = deadCount();
+        Component footer = dead > 0
+                ? Component.translatable("text.recipe_sender.manage_footer_dead", entryCount, dead)
+                : Component.translatable("text.recipe_sender.manage_footer", entryCount);
+        BoundUi.centered(graphics, footer, left + panelWidth / 2, footerY,
+                dead > 0 ? BoundUi.TEXT_DANGER : BoundUi.TEXT_DIM);
 
         super.render(graphics, mouseX, mouseY, partialTick);
 
@@ -467,8 +521,11 @@ class BoundContainerManageScreen extends Screen {
         int x = left + PADDING + indent;
         int width = panelWidth - PADDING * 2 - indent;
         boolean orphan = row.orphan();
+        BoundStatus status = livenessOf(binding);
 
-        if (orphan) {
+        // 目标已经不在了的行整行铺一层红底：标签行可能因为名字太长而整体不画，
+        // 底色是「这一行有问题」最不容易被漏看的表达。
+        if (orphan || status == BoundStatus.MISSING) {
             graphics.fill(x, y, x + width, y + height - 1, BoundUi.WARN_BACKGROUND);
         } else if (BoundUi.inside(mouseX, mouseY, x, y, width, height)) {
             graphics.fill(x, y, x + width, y + height - 1, 0x18000000);
@@ -506,7 +563,9 @@ class BoundContainerManageScreen extends Screen {
         // 先把右边要占的宽度量出来，再把名字裁到剩下的宽度（超出用 … 收尾）。
         int rightEdge = x + width - 4;
         int reserved = actionsWidth(binding) + 6;
-        int tagsWidth = BoundUi.tagsWidth(binding, parallel, slave, false) + routeTagWidth(binding);
+        int aliveWidth = BoundUi.aliveTagWidth(status);
+        int tagsWidth = aliveWidth + BoundUi.tagsWidth(binding, parallel, slave, false)
+                + routeTagWidth(binding);
         int nameWidth;
         if (renaming) {
             nameWidth = font.width(displayName(binding));
@@ -516,10 +575,16 @@ class BoundContainerManageScreen extends Screen {
                     nameMax, BoundUi.TEXT);
             int tagsX = cursor + nameWidth + 4;
             if (tagsX + tagsWidth <= rightEdge - reserved) {
-                int drawn = BoundUi.tags(graphics, tagsX, y + 3, binding, parallel, slave, false);
+                // 存活性标签排在最前：这一行还能不能用，比「它是什么角色」更要紧。
+                int drawn = BoundUi.aliveTag(graphics, tagsX, y + 3, status);
+                drawn += BoundUi.tags(graphics, tagsX + drawn, y + 3, binding, parallel, slave, false);
                 // 类别标签只给主容器画：并列成员与从容器跟随父容器，它们身上永远没有类别。
                 if (binding.isMaster() && !binding.routeKeys().isEmpty()) {
                     BoundUi.tag(graphics, tagsX + drawn, y + 3, routeTag(binding), BoundUi.TAG_ROUTE);
+                }
+                // 短标签说不全（「容器已不在」没有解释后果），鼠标停在标签上时补一句整话。
+                if (aliveWidth > 0 && BoundUi.inside(mouseX, mouseY, tagsX, y + 3, aliveWidth - 2, 11)) {
+                    pendingTooltip = BoundUi.aliveTip(status);
                 }
             }
         }
