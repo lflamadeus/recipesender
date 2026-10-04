@@ -1,6 +1,7 @@
 package com.lai.recipesender.client;
 
 import com.lai.recipesender.model.BoundContainer;
+import com.lai.recipesender.model.NoticeSeverity;
 import com.lai.recipesender.network.ModNetwork;
 import com.lai.recipesender.network.packet.BindContainerPacket;
 import com.lai.recipesender.network.packet.UpdateBindingPacket;
@@ -73,6 +74,22 @@ public class BoundContainerBindScreen extends Screen {
     private int dropScroll;
 
     /**
+     * 面板实际高度与「为了塞进屏幕而挤掉的像素」。
+     *
+     * <p>{@code PANEL_HEIGHT = 244} 在正常窗口下够用，但 GUI 缩放较大或窗口很小时会被顶出屏幕
+     * （240 高的 GUI 里 244 的面板连标题都看不全）。这里把面板压到屏幕内，缺的像素从下半部分的
+     * 段间距里挤——文字行高本身压不了。</p>
+     */
+    private int panelHeight = PANEL_HEIGHT;
+    private int squeeze;
+
+    /** 由 {@code squeeze} 决定的纵向锚点，在 {@link #init()} 里算好，render 直接读。 */
+    private int roleY;
+    private int parentLabelY;
+    private int parentY;
+    private int categoryY;
+
+    /**
      * 下拉里的搜索框。
      *
      * <p>刻意**不用 {@code addRenderableWidget}**：下拉面板画在 {@code super.render} 之后，
@@ -96,6 +113,9 @@ public class BoundContainerBindScreen extends Screen {
 
     private final List<Hit> hits = new ArrayList<>();
 
+    /** 本帧悬停中的自绘控件提示，最后统一画（画早了会被后画的控件盖住）。 */
+    private Component pendingTooltip;
+
     /** 新建绑定。 */
     public BoundContainerBindScreen(Screen parent, ResourceLocation dimension, BlockPos pos) {
         this(parent, dimension, pos, null);
@@ -111,6 +131,12 @@ public class BoundContainerBindScreen extends Screen {
         this.pos = editing != null ? editing.pos() : pos;
         this.pendingRoutes = editing != null ? Set.copyOf(editing.routeKeys()) : Set.of();
         this.nameDraft = editing != null ? editing.name() : "";
+        // 关系与父容器也在这里定，**不能放 init()**：init() 每次重建控件（去类别选择器再回来、
+        // 改窗口大小都会再跑一遍），放进去等于每次回到这个界面都把玩家刚选的关系重置回绑定里的旧值。
+        if (editing != null) {
+            this.role = editing.role();
+            this.parentId = editing.parentId();
+        }
     }
 
     // ------------------------------------------------------------------ 布局
@@ -118,14 +144,16 @@ public class BoundContainerBindScreen extends Screen {
     @Override
     protected void init() {
         left = (width - PANEL_WIDTH) / 2;
-        top = Math.max(PANEL_MARGIN, (height - PANEL_HEIGHT) / 2);
+        panelHeight = Math.min(PANEL_HEIGHT, Math.max(140, height - PANEL_MARGIN * 2));
+        // 挤掉的像素按「谁下面留白最多谁先让」分配给下半部分的几处段间距。
+        squeeze = Math.min(PANEL_HEIGHT - panelHeight, 60);
+        top = Math.max(2, (height - panelHeight) / 2);
+        roleY = top + 108 - Math.min(squeeze, 10);
+        parentLabelY = top + 166 - Math.min(squeeze, 18);
+        parentY = parentLabelY + 10;
+        categoryY = top + 196 - Math.min(squeeze, 28);
 
         resolveBlockInfo();
-
-        if (editing != null) {
-            role = editing.role();
-            parentId = editing.parentId();
-        }
 
         nameBox = new BoundEditBox(font, left + PADDING, top + 72, PANEL_WIDTH - PADDING * 2, 18,
                 Component.translatable("text.recipe_sender.bind_name_label"));
@@ -137,7 +165,7 @@ public class BoundContainerBindScreen extends Screen {
         addRenderableWidget(nameBox);
 
         // 下拉的第一行是搜索框，坐标与 drawDropdown 里的布局必须一致（面板内边距 +1，行高 14）。
-        dropSearch = new BoundEditBox(font, left + PADDING + 1, top + 196, PANEL_WIDTH - PADDING * 2 - 2,
+        dropSearch = new BoundEditBox(font, left + PADDING + 1, categoryY, PANEL_WIDTH - PADDING * 2 - 2,
                 DROP_ROW_HEIGHT, Component.translatable("text.recipe_sender.bind_parent_search"));
         dropSearch.setMaxLength(BoundContainer.MAX_NAME_LENGTH);
         dropSearch.setHint(Component.translatable("text.recipe_sender.bind_parent_search"));
@@ -149,7 +177,7 @@ public class BoundContainerBindScreen extends Screen {
 
         addRenderableWidget(Button.builder(Component.translatable("text.recipe_sender.bind_save"),
                         button -> save())
-                .bounds(left + PANEL_WIDTH - PADDING - 64, top + PANEL_HEIGHT - 28, 64, 18)
+                .bounds(left + PANEL_WIDTH - PADDING - 64, top + panelHeight - 28, 64, 18)
                 .build());
 
         setInitialFocus(nameBox);
@@ -182,7 +210,7 @@ public class BoundContainerBindScreen extends Screen {
     @Override
     public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
         renderBackground(graphics);
-        BoundUi.panel(graphics, left, top, PANEL_WIDTH, PANEL_HEIGHT);
+        BoundUi.panel(graphics, left, top, PANEL_WIDTH, panelHeight);
         hits.clear();
 
         int textX = left + PADDING;
@@ -196,16 +224,17 @@ public class BoundContainerBindScreen extends Screen {
         drawSeparator(graphics, top + 34);
 
         graphics.renderItem(blockIcon, textX, top + 40);
-        graphics.drawString(font, blockName, textX + 20, top + 40, BoundUi.TEXT, false);
-        graphics.drawString(font, Component.translatable("text.recipe_sender.bind_block_source",
-                        blockId), textX + 20, top + 51, BoundUi.TEXT_DIM, false);
+        int textRight = left + PANEL_WIDTH - PADDING;
+        BoundUi.clipText(graphics, Component.literal(blockName), textX + 20, top + 40,
+                textRight - textX - 20, BoundUi.TEXT);
+        BoundUi.clipText(graphics, Component.translatable("text.recipe_sender.bind_block_source",
+                blockId), textX + 20, top + 51, textRight - textX - 20, BoundUi.TEXT_DIM);
 
         graphics.drawString(font, Component.translatable("text.recipe_sender.bind_name_label"),
                 textX, top + 62, BoundUi.TEXT_DIM, false);
 
         graphics.drawString(font, Component.translatable("text.recipe_sender.bind_relation_label"),
-                textX, top + 96, BoundUi.TEXT_DIM, false);
-        int roleY = top + 108;
+                textX, roleY - 12, BoundUi.TEXT_DIM, false);
         drawRoleRow(graphics, mouseX, mouseY, textX, roleY, BoundContainer.Role.MASTER,
                 "text.recipe_sender.bind_role_master");
         drawRoleRow(graphics, mouseX, mouseY, textX, roleY + ROLE_ROW_HEIGHT,
@@ -219,39 +248,43 @@ public class BoundContainerBindScreen extends Screen {
         // 角色区与父容器区靠标签本身的颜色差异已经能区分开，索性去掉。
         boolean needsParent = role != BoundContainer.Role.MASTER;
         graphics.drawString(font, Component.translatable("text.recipe_sender.bind_parent_label"),
-                textX, top + 166, needsParent ? BoundUi.TEXT_DIM : BoundUi.TEXT_DISABLED, false);
-        drawParentSelect(graphics, mouseX, mouseY, textX, top + 176, innerWidth, needsParent);
+                textX, parentLabelY, needsParent ? BoundUi.TEXT_DIM : BoundUi.TEXT_DISABLED, false);
+        drawParentSelect(graphics, mouseX, mouseY, textX, parentY, innerWidth, needsParent);
 
         // S6：类别按钮。只有主容器需要勾（并列成员与从容器跟随父容器，服务端也会把它们清空）。
         if (role == BoundContainer.Role.MASTER) {
             Component label = Component.translatable("text.recipe_sender.button_category");
-            int buttonWidth = font.width(label) + 12;
-            int buttonY = top + 196;
-            boolean hovered = BoundUi.inside(mouseX, mouseY, textX, buttonY, buttonWidth, 16);
-            graphics.fill(textX, buttonY, textX + buttonWidth, buttonY + 16,
-                    hovered ? BoundUi.BORDER_LIGHT : BoundUi.PANEL);
-            graphics.renderOutline(textX, buttonY, buttonWidth, 16, BoundUi.BORDER_DARK);
-            graphics.drawString(font, label, textX + 6, buttonY + 4, BoundUi.TEXT, false);
+            int buttonWidth = BoundUi.buttonWidth(label);
+            boolean hovered = BoundUi.inside(mouseX, mouseY, textX, categoryY, buttonWidth,
+                    BoundUi.BUTTON_HEIGHT);
+            BoundUi.button(graphics, textX, categoryY, label, hovered, true, false);
+            if (hovered) {
+                pendingTooltip = Component.translatable("text.recipe_sender.tooltip_category");
+            }
             // 空集合在服务端是「什么都收」，所以这里必须说清楚，而不是显示「已选 0 个类别」。
             Component summary = pendingRoutes.isEmpty()
                     ? Component.translatable("text.recipe_sender.bind_category_all")
                     : Component.translatable("text.recipe_sender.bind_category_count",
                             pendingRoutes.size());
-            graphics.drawString(font, summary, textX + buttonWidth + 6, buttonY + 4,
+            graphics.drawString(font, summary, textX + buttonWidth + 6, categoryY + 4,
                     BoundUi.TEXT_DIM, false);
-            hits.add(new Hit(textX, buttonY, buttonWidth, 16, "category"));
+            hits.add(new Hit(textX, categoryY, buttonWidth, BoundUi.BUTTON_HEIGHT, "category"));
         } else {
             graphics.drawString(font, Component.translatable("text.recipe_sender.bind_category_hint"),
-                    textX, top + 200, BoundUi.TEXT_DISABLED, false);
+                    textX, categoryY + 4, BoundUi.TEXT_DISABLED, false);
         }
 
         graphics.drawString(font, Component.translatable("text.recipe_sender.bind_footer"),
-                textX, top + PANEL_HEIGHT - 22, BoundUi.TEXT_DIM, false);
+                textX, top + panelHeight - 22, BoundUi.TEXT_DIM, false);
 
         super.render(graphics, mouseX, mouseY, partialTick);
 
         if (parentDropOpen) {
-            drawDropdown(graphics, mouseX, mouseY, textX, top + 195, innerWidth);
+            drawDropdown(graphics, mouseX, mouseY, textX, categoryY - 1, innerWidth);
+        }
+        if (pendingTooltip != null) {
+            BoundUi.tooltip(graphics, mouseX, mouseY, pendingTooltip);
+            pendingTooltip = null;
         }
     }
 
@@ -269,11 +302,7 @@ public class BoundContainerBindScreen extends Screen {
                     BoundUi.ROW_HOVER);
         }
         int boxY = y + 1;
-        graphics.fill(x, boxY, x + 11, boxY + 11, BoundUi.BORDER_DARK);
-        graphics.fill(x + 1, boxY + 1, x + 10, boxY + 10, 0xFFE8E8E8);
-        if (selected) {
-            graphics.fill(x + 3, boxY + 3, x + 8, boxY + 8, BoundUi.TAG_MASTER);
-        }
+        BoundUi.checkbox(graphics, x, boxY, selected, true);
         graphics.drawString(font, Component.translatable(labelKey), x + 16, y + 2,
                 selected ? BoundUi.TEXT : BoundUi.TEXT_DIM, false);
         hits.add(new Hit(x - 2, y - 1, PANEL_WIDTH - PADDING * 2, ROLE_ROW_HEIGHT,
@@ -288,8 +317,8 @@ public class BoundContainerBindScreen extends Screen {
         graphics.fill(x, y + 17, x + width, y + 18, BoundUi.BORDER_LIGHT);
         graphics.fill(x, y, x + 1, y + 18, BoundUi.BORDER_DARK);
         graphics.fill(x + width - 1, y, x + width, y + 18, BoundUi.BORDER_LIGHT);
-        graphics.drawString(font, parentText(), x + 4, y + 5,
-                enabled ? BoundUi.TEXT : BoundUi.TEXT_DISABLED, false);
+        BoundUi.clipText(graphics, parentText(), x + 4, y + 5, width - 20,
+                enabled ? BoundUi.TEXT : BoundUi.TEXT_DISABLED);
         graphics.drawString(font, "▼", x + width - 12, y + 5,
                 enabled ? BoundUi.TEXT_DIM : BoundUi.TEXT_DISABLED, false);
         if (enabled) {
@@ -316,8 +345,9 @@ public class BoundContainerBindScreen extends Screen {
             if (hovered) {
                 graphics.fill(x, rowY, x + width, rowY + DROP_ROW_HEIGHT, BoundUi.ROW_HOVER);
             }
-            graphics.drawString(font, BoundContainerClient.displayName(candidate), x + 3, rowY + 3,
-                    candidate.id().equals(parentId) ? BoundUi.TEXT : BoundUi.TEXT_DIM, false);
+            BoundUi.clipText(graphics, Component.literal(BoundContainerClient.displayName(candidate)),
+                    x + 3, rowY + 3, width - 6,
+                    candidate.id().equals(parentId) ? BoundUi.TEXT : BoundUi.TEXT_DIM);
             hits.add(new Hit(x, rowY, width, DROP_ROW_HEIGHT, "parent:" + candidate.id()));
         }
     }
@@ -485,6 +515,8 @@ public class BoundContainerBindScreen extends Screen {
         String target = nameBox == null || nameBox.getValue().trim().isEmpty()
                 ? blockName : nameBox.getValue().trim();
         minecraft.setScreen(new CategoryPickerScreen(this, target, blockIcon, pendingRoutes,
+                routes -> pendingRoutes = Set.copyOf(routes),
+                // 右键去 EMI 看类别时选择器会被关掉：把当前勾选先交回来，回来再打开才不会白勾。
                 routes -> pendingRoutes = Set.copyOf(routes)));
     }
 
@@ -558,7 +590,8 @@ public class BoundContainerBindScreen extends Screen {
             name = name.substring(0, BoundContainer.MAX_NAME_LENGTH);
         }
         if (role != BoundContainer.Role.MASTER && parentId == null) {
-            RecipeSenderClient.notifyPlayer(Component.translatable("text.recipe_sender.bind_need_parent"));
+            RecipeSenderClient.notifyPlayer(Component.translatable("text.recipe_sender.bind_need_parent"),
+                    NoticeSeverity.ERROR);
             return;
         }
         if (editing == null) {

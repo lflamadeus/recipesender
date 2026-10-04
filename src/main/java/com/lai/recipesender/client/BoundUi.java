@@ -5,6 +5,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
+import org.lwjgl.glfw.GLFW;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -108,6 +109,32 @@ final class BoundUi {
         return cursor - x;
     }
 
+    /**
+     * 与 {@link #tags} 同样条件下的标签总宽度，只测量不绘制。
+     *
+     * <p>给「名字先裁到不压住标签」用：先知道右边要占多少，才知道名字能画多宽。</p>
+     */
+    static int tagsWidth(BoundContainer binding, int parallelCount, int slaveCount, boolean last) {
+        var font = Minecraft.getInstance().font;
+        int width = 0;
+        if (binding.isMaster()) {
+            width += font.width(Component.translatable("text.recipe_sender.tag_master")) + 5 + 2;
+            if (parallelCount <= 1) {
+                width += font.width(Component.translatable("text.recipe_sender.tag_independent")) + 5 + 2;
+            }
+        }
+        if (parallelCount > 1) {
+            width += font.width(Component.translatable("text.recipe_sender.tag_parallel")) + 5 + 2;
+        }
+        if (slaveCount > 0) {
+            width += font.width(Component.translatable("text.recipe_sender.tag_slave", slaveCount)) + 5 + 2;
+        }
+        if (last) {
+            width += font.width(Component.translatable("text.recipe_sender.tag_last")) + 5 + 2;
+        }
+        return width;
+    }
+
     /** 坐标的显示形式：{@code (x, y, z)}。 */
     static String posText(BoundContainer binding) {
         var pos = binding.pos();
@@ -157,22 +184,147 @@ final class BoundUi {
         return mouseX >= x && mouseX < x + width && mouseY >= y && mouseY < y + height;
     }
 
-    /** 把文本按宽度裁成多行（只用于提示段落，不做断词）。 */
+    /**
+     * 是不是「打字键」：字母、数字、空格。
+     *
+     * <p>给「打开界面直接打字就聚焦搜索框」用。不能反过来用 {@code setInitialFocus} 代替：
+     * 搜索框一开场就聚焦，玩家想按 E / B 关界面时这些键会被输入框吃掉，界面反而关不掉。</p>
+     */
+    static boolean isTypingKey(int keyCode) {
+        return (keyCode >= GLFW.GLFW_KEY_A && keyCode <= GLFW.GLFW_KEY_Z)
+                || (keyCode >= GLFW.GLFW_KEY_0 && keyCode <= GLFW.GLFW_KEY_9)
+                || (keyCode >= GLFW.GLFW_KEY_KP_0 && keyCode <= GLFW.GLFW_KEY_KP_9)
+                || keyCode == GLFW.GLFW_KEY_SPACE;
+    }
+
+    /** 没有输入框聚焦时，按下的键是否应该把焦点交给搜索框。 */
+    static boolean shouldTypeToSearch(Screen screen, int keyCode) {
+        return !(screen.getFocused() instanceof BoundEditBox) && isTypingKey(keyCode);
+    }
+
+    // ------------------------------------------------------------------ 通用控件
+
+    /**
+     * 自绘按钮的统一样式：浅灰底 + 深色描边，悬停变亮，危险动作红字。
+     *
+     * <p>1.0.27 之前四个界面各画各的（高度 16/18 混用、悬停色三套），同一个「删除」按钮在管理界面
+     * 和类别选择器里长得不一样。这里收成一份，顺便给所有调用方留出统一加 tooltip 的位置。</p>
+     *
+     * @return 这个按钮占用的宽度
+     */
+    static int button(GuiGraphics graphics, int x, int y, Component label, boolean hovered, boolean enabled,
+                      boolean danger) {
+        var font = Minecraft.getInstance().font;
+        int width = buttonWidth(label);
+        int background = !enabled ? ROW_DISABLED
+                : hovered ? (danger ? 0xFFD0D0D0 : BORDER_LIGHT) : PANEL;
+        graphics.fill(x, y, x + width, y + BUTTON_HEIGHT, background);
+        graphics.renderOutline(x, y, width, BUTTON_HEIGHT, BORDER_DARK);
+        int color = !enabled ? TEXT_DISABLED : danger ? TEXT_DANGER : TEXT;
+        graphics.drawString(font, label, x + (width - font.width(label)) / 2,
+                y + (BUTTON_HEIGHT - font.lineHeight) / 2 + 1, color, false);
+        return width;
+    }
+
+    /** 自绘按钮的标准高度。四个界面统一用这个值。 */
+    static final int BUTTON_HEIGHT = 16;
+
+    /** 自绘按钮的宽度：文字宽 + 左右各 5px 内边距。 */
+    static int buttonWidth(Component label) {
+        return Minecraft.getInstance().font.width(label) + 10;
+    }
+
+    /** 自绘勾选框（11×11，和原版观感一致）。 */
+    static void checkbox(GuiGraphics graphics, int x, int y, boolean checked, boolean enabled) {
+        graphics.fill(x, y, x + 11, y + 11, BORDER_DARK);
+        graphics.fill(x + 1, y + 1, x + 10, y + 10, enabled ? PANEL : ROW_DISABLED);
+        if (checked) {
+            graphics.fill(x + 3, y + 3, x + 8, y + 8, enabled ? TAG_MASTER : TEXT_DISABLED);
+        }
+    }
+
+    /**
+     * 列表滚动条（宽 3px，贴面板右内侧）。
+     *
+     * <p>原来只有类别选择器有，管理界面和材料弹窗都没有——长列表里玩家看不出自己在哪一段。</p>
+     */
+    static void scrollbar(GuiGraphics graphics, int trackX, int listTop, int listHeight, int contentHeight,
+                          int scrollOffset, int maxScroll) {
+        if (maxScroll <= 0 || listHeight <= 0) {
+            return;
+        }
+        graphics.fill(trackX, listTop, trackX + 3, listTop + listHeight, ROW_DISABLED);
+        int thumbHeight = Math.max(12, listHeight * listHeight / Math.max(1, contentHeight));
+        int travel = listHeight - thumbHeight;
+        int thumbY = listTop + travel * scrollOffset / maxScroll;
+        graphics.fill(trackX, thumbY, trackX + 3, thumbY + thumbHeight, BORDER_DARK);
+    }
+
+    /**
+     * 把一行文字裁到 {@code maxWidth} 以内，超出部分用 {@code …} 收尾。
+     *
+     * <p>行内的名字、标签、按钮原先互不避让：容器名一长就压到右侧标签和按钮上（1.0.26 的
+     * 改名框就是因为这个才和图标打架）。凡是「内容长度由玩家决定、右边还有别的东西」的地方
+     * 都要先过这里。</p>
+     *
+     * @return 实际画出来的宽度
+     */
+    static int clipText(GuiGraphics graphics, Component text, int x, int y, int maxWidth, int color) {
+        var font = Minecraft.getInstance().font;
+        String value = text.getString();
+        if (font.width(value) <= maxWidth) {
+            graphics.drawString(font, value, x, y, color, false);
+            return font.width(value);
+        }
+        String ellipsis = "…";
+        String clipped = font.plainSubstrByWidth(value, Math.max(0, maxWidth - font.width(ellipsis)));
+        String shown = clipped + ellipsis;
+        graphics.drawString(font, shown, x, y, color, false);
+        return font.width(shown);
+    }
+
+    /** 在鼠标位置画原版 tooltip。自绘控件没有原版 {@code Button} 的提示，靠这个补上。 */
+    static void tooltip(GuiGraphics graphics, int mouseX, int mouseY, Component text) {
+        graphics.renderTooltip(Minecraft.getInstance().font, text, mouseX, mouseY);
+    }
+
+    /**
+     * 把文本按像素宽度裁成多行。
+     *
+     * <p>原来的版本只按空格断词，对中文完全无效（中文没有空格，一整段会原样返回）。
+     * 现在按「先找得到空格就断在空格，否则逐字符断」处理，中英混排都能用。</p>
+     */
     static List<String> wrap(String text, int width) {
         var font = Minecraft.getInstance().font;
         List<String> lines = new ArrayList<>();
-        StringBuilder current = new StringBuilder();
-        for (String word : text.split(" ")) {
-            String candidate = current.length() == 0 ? word : current + " " + word;
-            if (font.width(candidate) > width && current.length() > 0) {
-                lines.add(current.toString());
-                current = new StringBuilder(word);
-            } else {
-                current = new StringBuilder(candidate);
-            }
+        if (text == null || text.isEmpty() || width <= 0) {
+            return lines;
         }
-        if (current.length() > 0) {
-            lines.add(current.toString());
+        int start = 0;
+        while (start < text.length()) {
+            int end = start;
+            int lastSpace = -1;
+            while (end < text.length() && font.width(text.substring(start, end + 1)) <= width) {
+                if (text.charAt(end) == ' ') {
+                    lastSpace = end;
+                }
+                end++;
+            }
+            if (end >= text.length()) {
+                lines.add(text.substring(start));
+                break;
+            }
+            if (end == start) {
+                // 单个字符都放不下（宽度给得太小）：至少吃掉一个字符，避免死循环。
+                end = start + 1;
+            } else if (lastSpace > start) {
+                end = lastSpace;
+            }
+            lines.add(text.substring(start, end).trim());
+            start = end;
+            while (start < text.length() && text.charAt(start) == ' ') {
+                start++;
+            }
         }
         return lines;
     }

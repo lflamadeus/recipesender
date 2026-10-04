@@ -61,6 +61,8 @@ class CategoryPickerScreen extends Screen {
     private final Screen parent;
     private final String targetName;
     private final Consumer<Set<ResourceLocation>> onConfirm;
+    /** 因为「右键去 EMI 看类别」而关掉界面时，把当前勾选交回父界面用（否则这一轮白勾）。 */
+    private final Consumer<Set<ResourceLocation>> onSuspend;
     private final Set<ResourceLocation> selected;
     private final Set<String> collapsed = new LinkedHashSet<>();
 
@@ -105,16 +107,20 @@ class CategoryPickerScreen extends Screen {
      *                   用来默认筛出「这台机器能跑」的类别
      * @param selected   当前已勾选的类别
      * @param onConfirm  按下确定时的回调；取消不会调用
+     * @param onSuspend  因「右键去 EMI 看类别」而关掉界面时回调，把当前勾选交回父界面；
+     *                   按 Esc / 取消按钮不会调用（那才是真的「这一轮白勾」）
      */
     CategoryPickerScreen(Screen parent, String targetName, ItemStack machine,
                          Set<ResourceLocation> selected,
-                         Consumer<Set<ResourceLocation>> onConfirm) {
+                         Consumer<Set<ResourceLocation>> onConfirm,
+                         Consumer<Set<ResourceLocation>> onSuspend) {
         super(Component.translatable("text.recipe_sender.category_title"));
         this.parent = parent;
         this.targetName = targetName == null ? "" : targetName;
         this.machineItem = machine == null || machine.isEmpty() ? null : machine.getItem();
         this.selected = new LinkedHashSet<>(selected == null ? Set.of() : selected);
         this.onConfirm = onConfirm;
+        this.onSuspend = onSuspend;
     }
 
     @Override
@@ -235,18 +241,8 @@ class CategoryPickerScreen extends Screen {
             drawRow(graphics, rows.get(index), y, mouseX, mouseY, partialTick);
         }
         graphics.disableScissor();
-        if (maxScroll() > 0) {
-            drawScrollbar(graphics, listBottom);
-        }
-    }
-
-    private void drawScrollbar(GuiGraphics graphics, int listBottom) {
-        int trackX = left + panelWidth - 5;
-        graphics.fill(trackX, listTop, trackX + 3, listBottom, BoundUi.ROW_DISABLED);
-        int thumbHeight = Math.max(12, listHeight * listHeight / Math.max(1, rows.size() * ROW_HEIGHT));
-        int travel = listHeight - thumbHeight;
-        int thumbY = listTop + (maxScroll() == 0 ? 0 : travel * scrollOffset / maxScroll());
-        graphics.fill(trackX, thumbY, trackX + 3, thumbY + thumbHeight, BoundUi.BORDER_DARK);
+        BoundUi.scrollbar(graphics, left + panelWidth - 5, listTop, listHeight, rows.size() * ROW_HEIGHT,
+                scrollOffset, maxScroll());
     }
 
     private void drawRow(GuiGraphics graphics, Row row, int y, int mouseX, int mouseY, float partialTick) {
@@ -269,29 +265,35 @@ class CategoryPickerScreen extends Screen {
         }
         drawCheckbox(graphics, left + PADDING + 8, y + 4, picked);
 
+        // 机器图标靠右：这是「这个类别由哪些机器出」的最直观提示。先算它们占多宽，名字才知道能画多长。
+        List<EmiIngredient> stations = entry.workstations();
+        int icons = Math.min(stations.size(), MAX_STATION_ICONS);
+        boolean overflow = stations.size() > MAX_STATION_ICONS;
+        int iconX = left + panelWidth - PADDING - (icons * 18 + (overflow ? 14 : 0));
+
         int textX = left + PADDING + 24;
         // 类别图标直接交给 EMI 画：它能处理 GT 那些不是物品的图标（多方块结构、流体仓……）。
         entry.category().render(graphics, textX, y + 1, partialTick);
         textX += 18;
-        graphics.drawString(font, entry.name(), textX, y + 5, BoundUi.TEXT, false);
-        int nameEnd = textX + font.width(entry.name());
+        // 类别名 + 配方条数一起裁到不压住右侧图标：名字长度由整合包决定，不能让它盖掉图标。
+        int nameWidth = BoundUi.clipText(graphics, Component.literal(entry.name()), textX, y + 5,
+                Math.max(24, iconX - 6 - textX), BoundUi.TEXT);
 
         // 配方条数只做参考，0 条的不写（写一排「0 个配方」只是噪声）。
         if (entry.recipeCount() > 0) {
-            graphics.drawString(font, Component.translatable("text.recipe_sender.category_count",
-                    entry.recipeCount()).getString(), nameEnd + 6, y + 5, BoundUi.TEXT_DIM, false);
+            int countX = textX + nameWidth + 6;
+            if (countX < iconX - 6) {
+                BoundUi.clipText(graphics, Component.translatable("text.recipe_sender.category_count",
+                        entry.recipeCount()), countX, y + 5, iconX - 6 - countX, BoundUi.TEXT_DIM);
+            }
         }
 
-        // 机器图标靠右：这是「这个类别由哪些机器出」的最直观提示。
-        List<EmiIngredient> stations = entry.workstations();
-        int icons = Math.min(stations.size(), MAX_STATION_ICONS);
-        int iconX = left + panelWidth - PADDING - icons * 18;
         for (int index = 0; index < icons; index++) {
             stations.get(index).render(graphics, iconX + index * 18, y + 1, partialTick);
         }
-        if (stations.size() > MAX_STATION_ICONS) {
+        if (overflow) {
             graphics.drawString(font, "+" + (stations.size() - MAX_STATION_ICONS),
-                    iconX + icons * 18 - 2, y + 5, BoundUi.TEXT_DIM, false);
+                    iconX + icons * 18, y + 5, BoundUi.TEXT_DIM, false);
         }
     }
 
@@ -319,7 +321,7 @@ class CategoryPickerScreen extends Screen {
     /** 画一个勾选框 + 文字，返回下一个勾选框的起点 x。 */
     private int drawToggle(GuiGraphics graphics, int x, int y, String key, boolean checked, String action) {
         Component label = Component.translatable(key);
-        drawCheckbox(graphics, x, y + 1, checked);
+        BoundUi.checkbox(graphics, x, y + 1, checked, true);
         graphics.drawString(font, label, x + 14, y + 4, BoundUi.TEXT_DIM, false);
         int width = 14 + font.width(label);
         buttons.add(new Button(x - 2, y - 1, width + 4, 16, "", action));
@@ -329,27 +331,23 @@ class CategoryPickerScreen extends Screen {
     private int addButton(GuiGraphics graphics, int mouseX, int mouseY, int rightX, int y,
                           String key, String action, boolean primary) {
         Component label = Component.translatable(key);
-        int buttonWidth = font.width(label) + 12;
+        int buttonWidth = BoundUi.buttonWidth(label);
         int x = rightX - buttonWidth;
-        boolean hovered = BoundUi.inside(mouseX, mouseY, x, y, buttonWidth, 16);
-        int background = hovered ? BoundUi.BORDER_LIGHT : BoundUi.PANEL;
-        graphics.fill(x, y, x + buttonWidth, y + 16, background);
-        graphics.renderOutline(x, y, buttonWidth, 16, BoundUi.BORDER_DARK);
-        graphics.drawString(font, label, x + 6, y + 4, primary ? BoundUi.TEXT : BoundUi.TEXT_DIM, false);
-        buttons.add(new Button(x, y, buttonWidth, 16, "", action));
+        boolean hovered = BoundUi.inside(mouseX, mouseY, x, y, buttonWidth, BoundUi.BUTTON_HEIGHT);
+        BoundUi.button(graphics, x, y, label, hovered, true, false);
+        buttons.add(new Button(x, y, buttonWidth, BoundUi.BUTTON_HEIGHT, "", action));
         return x - 2;
     }
 
     private void drawCheckbox(GuiGraphics graphics, int x, int y, boolean checked) {
-        graphics.fill(x, y, x + 11, y + 11, BoundUi.BORDER_DARK);
-        graphics.fill(x + 1, y + 1, x + 10, y + 10, BoundUi.PANEL);
-        if (checked) {
-            graphics.fill(x + 3, y + 3, x + 8, y + 8, BoundUi.TAG_MASTER);
-        }
+        BoundUi.checkbox(graphics, x, y, checked, true);
     }
 
     @Override
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        // 自绘的行/按钮不走控件焦点逻辑，点它们时搜索框自己收不到失焦通知：不补这一下，
+        // 点完列表再按回车会继续被当成「搜完了」。
+        BoundUi.blurFocusedIfOutside(this, mouseX, mouseY);
         if (super.mouseClicked(mouseX, mouseY, button)) {
             lastClickRow = -1;
             return true;
@@ -398,8 +396,10 @@ class CategoryPickerScreen extends Screen {
             return true;
         }
         if (button == 1) {
-            // 右键 = 先在 EMI 里看一眼这个类别：看完关掉界面就等于没勾，勾了才算。
+            // 右键 = 先在 EMI 里看一眼这个类别。关掉界面时把当前勾选交回父界面存成草稿：
+            // 原来直接 onClose()，看完回来勾的全没了（m01207 清单第 ② 条）。
             lastClickRow = -1;
+            onSuspend.accept(Set.copyOf(selected));
             EmiApi.displayRecipeCategory(row.entry().category());
             onClose();
             return true;
@@ -456,11 +456,29 @@ class CategoryPickerScreen extends Screen {
             return true;
         }
         if (keyCode == GLFW.GLFW_KEY_ENTER || keyCode == GLFW.GLFW_KEY_KP_ENTER) {
+            // 搜索框聚焦时回车是「搜完了」，不是「确定」。原来无条件确定，打字打到一半按回车
+            // 界面就关了（m01207 清单第 ② 条）。
+            if (searchBox != null && searchBox.isFocused()) {
+                setFocused(null);
+                return true;
+            }
             onConfirm.accept(Set.copyOf(selected));
             onClose();
             return true;
         }
+        if (BoundUi.shouldTypeToSearch(this, keyCode)) {
+            BoundUi.focus(this, searchBox);
+        }
         return super.keyPressed(keyCode, scanCode, modifiers);
+    }
+
+    @Override
+    public boolean charTyped(char codePoint, int modifiers) {
+        // 输入法（尤其是中文）常常只发 charTyped 不发可识别的 keyPressed，所以这里也补一次聚焦。
+        if (searchBox != null && getFocused() != searchBox && !Character.isISOControl(codePoint)) {
+            BoundUi.focus(this, searchBox);
+        }
+        return super.charTyped(codePoint, modifiers);
     }
 
     @Override

@@ -2,6 +2,7 @@ package com.lai.recipesender.service;
 
 import com.lai.recipesender.RecipeSenderMod;
 import com.lai.recipesender.model.BoundContainer;
+import com.lai.recipesender.model.NoticeSeverity;
 import com.lai.recipesender.network.ModNetwork;
 import com.lai.recipesender.network.packet.BindContainerPacket;
 import com.lai.recipesender.network.packet.BoundNoticePacket;
@@ -58,7 +59,7 @@ public final class BoundBindingService {
         ServerLevel level = player.serverLevel();
         BlockPos pos = packet.pos();
         if (!level.isLoaded(pos)) {
-            notice(player, "text.recipe_sender.bind_unloaded");
+            notice(player, NoticeSeverity.ERROR, "text.recipe_sender.bind_unloaded");
             return;
         }
         BlockState state = level.getBlockState(pos);
@@ -71,19 +72,19 @@ public final class BoundBindingService {
         // 玩家每按一次 B 就把名字往上顶一档，最后变成「箱子 #3」「箱子 #4」。
         for (BoundContainer binding : existing) {
             if (binding.samePos(player.level().dimension(), pos)) {
-                notice(player, "text.recipe_sender.bound_already", binding.name());
+                notice(player, NoticeSeverity.WARN, "text.recipe_sender.bound_already", binding.name());
                 return;
             }
         }
         // 没有物品容器的方块绑了也发不进去，当场拒绝而不是留一条永远失败的绑定。
         if (!BoundTargetResolver.hasItemHandler(level.getBlockEntity(pos))) {
-            notice(player, "text.recipe_sender.bind_no_container");
+            notice(player, NoticeSeverity.ERROR, "text.recipe_sender.bind_no_container");
             return;
         }
         BoundContainer.Role role = packet.role() == null ? BoundContainer.Role.MASTER : packet.role();
         String relationError = validateRelation(existing, null, role, packet.parentId());
         if (relationError != null) {
-            notice(player, relationError);
+            notice(player, NoticeSeverity.ERROR, relationError);
             return;
         }
         String name = packet.name() == null || packet.name().isBlank()
@@ -134,7 +135,7 @@ public final class BoundBindingService {
     private static void notifyRelation(ServerPlayer player, BoundContainer bound,
                                        List<BoundContainer> existing) {
         if (bound.isMaster()) {
-            notice(player, "text.recipe_sender.bound_added", bound.name());
+            notice(player, NoticeSeverity.INFO, "text.recipe_sender.bound_added", bound.name());
             return;
         }
         String parentName = "?";
@@ -146,17 +147,20 @@ public final class BoundBindingService {
         }
         String key = bound.role() == BoundContainer.Role.SLAVE
                 ? "text.recipe_sender.bound_added_slave" : "text.recipe_sender.bound_added_member";
-        notice(player, key, bound.name(), parentName);
+        notice(player, NoticeSeverity.INFO, key, bound.name(), parentName);
     }
 
     /**
      * 给玩家显示一条屏幕下方的提示。
      *
-     * <p>服务端手里只有 {@link ServerPlayer}，画不出客户端的浮层，所以只把语言键与参数推过去，
-     * 由客户端定稿文案（这样也顺带跟着客户端的语言走）。参数一律转成字符串：
-     * 语言模板用的是 {@code %s}，数字与名称都能直接填。
+     * <p>服务端手里只有 {@link ServerPlayer}，画不出客户端的浮层，所以只把语言键、参数与
+     * <b>严重程度</b>推过去，由客户端定稿文案与颜色（这样也顺带跟着客户端的语言走）。
+     * 参数一律转成字符串：语言模板用的是 {@code %s}，数字与名称都能直接填。
+     *
+     * <p>严重程度由调用点自己说清楚，而不是让客户端去猜键名：键名是可以随时改的，
+     * 一旦改了，失败提示会安静地变回绿色。
      */
-    private static void notice(ServerPlayer player, String key, Object... args) {
+    private static void notice(ServerPlayer player, NoticeSeverity severity, String key, Object... args) {
         if (player == null) {
             return;
         }
@@ -165,7 +169,7 @@ public final class BoundBindingService {
             text.add(String.valueOf(arg));
         }
         ModNetwork.CHANNEL.send(PacketDistributor.PLAYER.with(() -> player),
-                new BoundNoticePacket(key, text));
+                new BoundNoticePacket(key, text, severity));
     }
 
     /**
@@ -186,7 +190,7 @@ public final class BoundBindingService {
         List<BoundContainer> bindings = BoundContainerService.list(player);
         String error = validateRelation(bindings, existing.id(), role, packet.parentId());
         if (error != null) {
-            notice(player, error);
+            notice(player, NoticeSeverity.ERROR, error);
             return;
         }
         int orphaned = 0;
@@ -200,7 +204,7 @@ public final class BoundBindingService {
         if (BoundContainerService.setRelation(player, packet.id(), role, packet.parentId())) {
             sync(player);
             if (orphaned > 0) {
-                notice(player, "text.recipe_sender.relation_orphaned", orphaned);
+                notice(player, NoticeSeverity.WARN, "text.recipe_sender.relation_orphaned", orphaned);
             }
         }
     }

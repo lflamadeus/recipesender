@@ -1,6 +1,7 @@
 package com.lai.recipesender.client;
 
 import com.lai.recipesender.model.BoundContainer;
+import com.lai.recipesender.model.NoticeSeverity;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
@@ -34,7 +35,11 @@ class BoundContainerPickScreen extends Screen {
     private static final int SEARCH_HEIGHT = 20;
     private static final int PADDING = 8;
     private static final int ICON_SIZE = 16;
-    private static final int HIGHLIGHT_BUTTON_WIDTH = 26;
+
+    /** 行内「高亮」按钮宽度。走通用按钮的宽度算法，别写死一个和文字对不上的常数。 */
+    private static int highlightButtonWidth() {
+        return BoundUi.buttonWidth(Component.translatable("text.recipe_sender.button_highlight"));
+    }
 
     private final Screen parent;
     private final List<BoundContainer> candidates;
@@ -56,6 +61,9 @@ class BoundContainerPickScreen extends Screen {
 
     /** 打开弹窗时绑定发送键（B）往往还按着，必须先等玩家松手才认「再按一次 B」。 */
     private boolean awaitBoundRelease;
+
+    /** 本帧悬停中的自绘控件提示，最后统一画。 */
+    private Component pendingTooltip;
 
     private int left;
     private int top;
@@ -214,6 +222,7 @@ class BoundContainerPickScreen extends Screen {
 
     @Override
     public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
+        pendingTooltip = null;
         renderBackground(graphics);
         BoundUi.panel(graphics, left, top, panelWidth, panelHeight);
 
@@ -234,6 +243,9 @@ class BoundContainerPickScreen extends Screen {
                 drawRow(graphics, filtered.get(index), index, listTop + i * ROW_HEIGHT, mouseX, mouseY);
             }
             graphics.disableScissor();
+            BoundUi.scrollbar(graphics, left + panelWidth - 5, listTop, listHeight,
+                    filtered.size() * ROW_HEIGHT, scrollOffset,
+                    Math.max(0, filtered.size() - visibleRows));
         }
 
         int footerY = top + panelHeight - FOOTER_HEIGHT + 4;
@@ -241,6 +253,11 @@ class BoundContainerPickScreen extends Screen {
                 left + panelWidth / 2, footerY + 4, BoundUi.TEXT_DIM);
 
         super.render(graphics, mouseX, mouseY, partialTick);
+
+        if (pendingTooltip != null) {
+            BoundUi.tooltip(graphics, mouseX, mouseY, pendingTooltip);
+            pendingTooltip = null;
+        }
     }
 
     private void drawRow(GuiGraphics graphics, BoundContainer binding, int index, int rowY, int mouseX,
@@ -272,26 +289,28 @@ class BoundContainerPickScreen extends Screen {
 
         // 弹窗里一行 = 一个发送单元，所以名字带 ×N（N 含主容器自己、不含从容器），
         // 标签则显示「并列组」与「从容器 ×M」——数字只出现在从容器标签上。
-        String displayName = BoundContainerClient.displayName(binding);
-        graphics.drawString(font, displayName, cursor, rowY + 3, BoundUi.TEXT, false);
-        cursor += font.width(displayName) + 4;
-
+        int buttonX = x + rowWidth - highlightButtonWidth() - 2;
         int parallelCount = BoundContainerClient.memberCount(binding.id());
         int slaveCount = BoundContainerClient.slaveCount(binding.id());
         boolean last = isLastChoice(binding);
-        BoundUi.tags(graphics, cursor, rowY + 2, binding, parallelCount, slaveCount, last);
+        // 名字先裁到不压住右侧的标签与按钮：容器名是玩家自己起的，长起来没有上限。
+        int tagsWidth = BoundUi.tagsWidth(binding, parallelCount, slaveCount, last);
+        int nameWidth = BoundUi.clipText(graphics,
+                Component.literal(BoundContainerClient.displayName(binding)), cursor, rowY + 3,
+                Math.max(24, buttonX - cursor - tagsWidth - 6), BoundUi.TEXT);
+        BoundUi.tags(graphics, cursor + nameWidth + 4, rowY + 2, binding, parallelCount, slaveCount, last);
 
-        graphics.drawString(font, BoundUi.subText(binding), x + 22, rowY + 12, BoundUi.TEXT_DIM, false);
+        BoundUi.clipText(graphics, Component.literal(BoundUi.subText(binding)), x + 22, rowY + 12,
+                buttonX - x - 26, BoundUi.TEXT_DIM);
 
-        int buttonX = x + rowWidth - HIGHLIGHT_BUTTON_WIDTH - 2;
         int buttonY = rowY + 3;
-        boolean buttonHovered = BoundUi.inside(mouseX, mouseY, buttonX, buttonY, HIGHLIGHT_BUTTON_WIDTH,
-                ICON_SIZE - 2);
-        graphics.fill(buttonX, buttonY, buttonX + HIGHLIGHT_BUTTON_WIDTH, buttonY + ICON_SIZE - 2,
-                buttonHovered ? BoundUi.BORDER_LIGHT : BoundUi.PANEL);
-        graphics.renderOutline(buttonX, buttonY, HIGHLIGHT_BUTTON_WIDTH, ICON_SIZE - 2, BoundUi.BORDER_DARK);
-        graphics.drawString(font, Component.translatable("text.recipe_sender.button_highlight"),
-                buttonX + 3, buttonY + 3, BoundUi.TEXT, false);
+        int buttonWidth = highlightButtonWidth();
+        boolean buttonHovered = BoundUi.inside(mouseX, mouseY, buttonX, buttonY, buttonWidth, ICON_SIZE - 2);
+        BoundUi.button(graphics, buttonX, buttonY, Component.translatable("text.recipe_sender.button_highlight"),
+                buttonHovered, true, false);
+        if (buttonHovered) {
+            pendingTooltip = Component.translatable("text.recipe_sender.tooltip_highlight");
+        }
     }
 
     private boolean isLastChoice(BoundContainer binding) {
@@ -300,7 +319,7 @@ class BoundContainerPickScreen extends Screen {
     }
 
     private int highlightButtonX() {
-        return left + PADDING + (panelWidth - PADDING * 2) - HIGHLIGHT_BUTTON_WIDTH - 2;
+        return left + PADDING + (panelWidth - PADDING * 2) - highlightButtonWidth() - 2;
     }
 
     @Override
@@ -335,7 +354,7 @@ class BoundContainerPickScreen extends Screen {
                 continue;
             }
             BoundContainer binding = filtered.get(index);
-            if (BoundUi.inside(mouseX, mouseY, highlightButtonX(), rowY + 3, HIGHLIGHT_BUTTON_WIDTH,
+            if (BoundUi.inside(mouseX, mouseY, highlightButtonX(), rowY + 3, highlightButtonWidth(),
                     ICON_SIZE - 2)) {
                 highlight(binding);
             } else {
@@ -362,7 +381,8 @@ class BoundContainerPickScreen extends Screen {
 
     @Override
     public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
-        if (RecipeSenderClient.matchesBoundSendKey(keyCode, scanCode)) {
+        boolean searchFocused = searchBox != null && searchBox.isFocused();
+        if (!searchFocused && RecipeSenderClient.matchesBoundSendKey(keyCode, scanCode)) {
             if (awaitBoundRelease) {
                 // 玩家还按着打开弹窗的那一下 B，不能当成「再按一次」。
                 return true;
@@ -371,7 +391,9 @@ class BoundContainerPickScreen extends Screen {
             return true;
         }
         if (RecipeSenderClient.matchesManageKey(keyCode, scanCode)) {
-            minecraft.setScreen(new BoundContainerManageScreen(parent));
+            // 回到的必须是**本弹窗**：原来传的是 parent，从管理界面返回时会直接跳过选择弹窗，
+            // 玩家看到的是「材料清单没了、弹窗也没了」（m01207 清单第 ③ 条）。
+            minecraft.setScreen(new BoundContainerManageScreen(this));
             return true;
         }
         if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
@@ -379,7 +401,7 @@ class BoundContainerPickScreen extends Screen {
             return true;
         }
         // E 关界面（和原版背包一致）；焦点在搜索框里时 E 是普通字符，交给下面的分支转发。
-        if (keyCode == GLFW.GLFW_KEY_E && (searchBox == null || !searchBox.isFocused())) {
+        if (keyCode == GLFW.GLFW_KEY_E && !searchFocused) {
             onClose();
             return true;
         }
@@ -392,7 +414,6 @@ class BoundContainerPickScreen extends Screen {
             return true;
         }
 
-        boolean searchFocused = searchBox != null && searchBox.isFocused();
         if (!searchFocused && (keyCode == GLFW.GLFW_KEY_ENTER || keyCode == GLFW.GLFW_KEY_KP_ENTER)) {
             int index = indexOf(selectedId);
             if (index >= 0) {
@@ -431,7 +452,8 @@ class BoundContainerPickScreen extends Screen {
     private void sendToLastChoice() {
         BoundContainer last = BoundContainerClient.lastChoice(routeKey);
         if (last == null) {
-            RecipeSenderClient.notifyPlayer(Component.translatable("text.recipe_sender.pick_no_last"));
+            RecipeSenderClient.notifyPlayer(Component.translatable("text.recipe_sender.pick_no_last"),
+                    NoticeSeverity.WARN);
             return;
         }
         BoundContainer target = null;
@@ -442,7 +464,8 @@ class BoundContainerPickScreen extends Screen {
             }
         }
         if (target == null) {
-            RecipeSenderClient.notifyPlayer(Component.translatable("text.recipe_sender.pick_no_last"));
+            RecipeSenderClient.notifyPlayer(Component.translatable("text.recipe_sender.pick_no_last"),
+                    NoticeSeverity.WARN);
             return;
         }
         confirm(target);

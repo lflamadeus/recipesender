@@ -1,6 +1,7 @@
 package com.lai.recipesender.service;
 
 import com.lai.recipesender.model.BoundContainer;
+import com.lai.recipesender.model.BoundDetail;
 import com.lai.recipesender.model.BoundStatus;
 import com.lai.recipesender.network.ModNetwork;
 import com.lai.recipesender.network.packet.BoundInsertResultPacket;
@@ -63,8 +64,7 @@ public final class BoundInsertionService {
                 return;
             }
             if (InventoryDeduction.plan(player.getInventory(), requirements) == null) {
-                reply(player, packet, BoundStatus.OK, 0, 0,
-                        "text.recipe_sender.bound_detail.materials");
+                reply(player, packet, BoundStatus.OK, 0, 0, BoundDetail.MATERIALS);
                 return;
             }
             BoundTargetResolver.ResolvedTarget master = BoundTargetResolver.resolve(player, group.master());
@@ -103,7 +103,7 @@ public final class BoundInsertionService {
                     RemoteTransferPlanner.applyBySharesDetailed(members, overflow, requirements, packet.batches());
             List<ItemStack> inserted = applied.inserted();
             if (inserted.isEmpty()) {
-                reply(player, packet, BoundStatus.OK, 0, 0, "text.recipe_sender.bound_detail.target_full");
+                reply(player, packet, BoundStatus.OK, 0, 0, BoundDetail.TARGET_FULL);
                 return;
             }
             // 真实插入量可能少于计划量（个别 IItemHandler 会在模拟与执行之间给出不同答案），
@@ -119,8 +119,8 @@ public final class BoundInsertionService {
                 markChanged(target);
             }
             int insertedBatches = countInsertedBatches(requirements, inserted, packet.batches());
-            String detail = insertedBatches >= packet.batches()
-                    ? null : "text.recipe_sender.bound_detail.target_full";
+            BoundDetail detail = insertedBatches >= packet.batches()
+                    ? null : BoundDetail.TARGET_FULL;
             reply(player, packet, BoundStatus.OK, insertedBatches, applied.overflowBatches(), detail);
         } catch (RuntimeException exception) {
             LOGGER.warn("向已绑定容器投放配方材料失败：玩家 {}", player.getGameProfile().getName(), exception);
@@ -194,9 +194,9 @@ public final class BoundInsertionService {
 
     /** 把结果回执给发起请求的玩家。 */
     private static void reply(ServerPlayer player, InsertRecipeItemsToBoundPacket packet,
-                              BoundStatus status, int insertedBatches, int overflowBatches, String detailKey) {
+                              BoundStatus status, int insertedBatches, int overflowBatches, BoundDetail detail) {
         ModNetwork.CHANNEL.send(PacketDistributor.PLAYER.with(() -> player),
                 new BoundInsertResultPacket(packet.requestId(), packet.bindingId(), status,
-                        insertedBatches, packet.batches(), overflowBatches, detailKey));
+                        insertedBatches, packet.batches(), overflowBatches, detail));
     }
 }

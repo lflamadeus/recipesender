@@ -1,6 +1,7 @@
 package com.lai.recipesender.client;
 
 import com.lai.recipesender.model.BoundContainer;
+import com.lai.recipesender.model.NoticeSeverity;
 import com.lai.recipesender.service.BoundGroupResolver;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
@@ -60,7 +61,8 @@ final class BoundHighlightState {
         if (minecraft.level != null && !binding.dimension().equals(minecraft.level.dimension())) {
             // 坐标只在本维度里有意义，跨维度画出来的是别处的方块。
             RecipeSenderClient.notifyPlayer(
-                    Component.translatable("text.recipe_sender.highlight_other_dimension", binding.name()));
+                    Component.translatable("text.recipe_sender.highlight_other_dimension", binding.name()),
+                    NoticeSeverity.WARN);
             return false;
         }
 

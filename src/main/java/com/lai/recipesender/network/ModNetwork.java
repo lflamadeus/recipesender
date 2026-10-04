@@ -32,8 +32,11 @@ public final class ModNetwork {
      * 「是否格雷配方」两个字段。
      *
      * <p>1.0.25 由 9 升到 10：新增 {@code UpdateBindingRoutesPacket}（配方类别选择器）。
+     *
+     * <p>1.0.27 由 10 升到 11：{@code BoundNoticePacket} 尾部加了提示严重程度（失败红 / 警告黄），
+     * {@code BoundInsertResultPacket} 的补充说明由语言键字符串改成 {@code BoundDetail} 枚举。
      */
-    private static final String PROTOCOL_VERSION = "10";
+    private static final String PROTOCOL_VERSION = "11";
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             ResourceLocation.fromNamespaceAndPath(RecipeSenderMod.MOD_ID, "main"),
             () -> PROTOCOL_VERSION, PROTOCOL_VERSION::equals, PROTOCOL_VERSION::equals);

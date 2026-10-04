@@ -9,6 +9,7 @@ import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceLocation;
 import org.lwjgl.glfw.GLFW;
 
 import java.util.ArrayList;
@@ -87,6 +88,34 @@ class BoundContainerManageScreen extends Screen {
     /** 上一帧的条目，供「一次滚一行」找行边界。 */
     private List<Entry> lastEntries = List.of();
 
+    /**
+     * 行列表缓存。
+     *
+     * <p>原来 {@code render()} 每帧都调 {@code buildEntries()}：每帧新建 List / LinkedHashMap、
+     * 每组一个 ArrayList 再排序，还要为每个可见行重新数一遍并列成员与从容器（每帧 O(n²)）。
+     * 现在只在「服务端同步过（{@link BoundContainerClient#revision()} 变了）」或「本地搜索词、
+     * 展开状态变了」时重建。</p>
+     */
+    private List<Entry> cachedEntries = List.of();
+    private int builtRevision = -1;
+    private boolean entriesDirty = true;
+
+    /** 每个主容器的 {并列成员数, 从容器数}，在 {@link #buildEntries()} 里一次算好。 */
+    private final Map<UUID, int[]> groupCounts = new HashMap<>();
+
+    /** 本帧悬停中的行内按钮提示，最后统一画（画早了会被后画的控件盖住）。 */
+    private Component pendingTooltip;
+
+    /**
+     * 类别选择器的草稿：在类别界面里右键去 EMI 看类别时，那一轮的勾选交回来存这里。
+     *
+     * <p>只在「同一个容器、上一次是被右键打断的」时生效，而且**用一次就清掉**：之后无论确定
+     * 还是取消，再打开都以服务端数据为准。否则一次右键留下的草稿会一直压着真实勾选，
+     * 玩家在界面里取消掉的东西下次打开又冒出来。</p>
+     */
+    private UUID categoryDraftId;
+    private Set<ResourceLocation> categoryDraft = Set.of();
+
     private int left;
     private int top;
     private int panelWidth;
@@ -128,6 +157,8 @@ class BoundContainerManageScreen extends Screen {
         searchBox.setResponder(value -> {
             query = value;
             scrollOffset = 0;
+            // 行列表是按搜索词过滤出来的：词变了必须重建，否则界面上还是上一轮的搜索结果。
+            entriesDirty = true;
         });
         addRenderableWidget(searchBox);
 
@@ -154,6 +185,8 @@ class BoundContainerManageScreen extends Screen {
         if (expandButton != null) {
             expandButton.setMessage(expandLabel());
         }
+        // 展开状态决定行列表里有没有子行，必须让缓存失效。
+        entriesDirty = true;
     }
 
     /** 点主容器行：只翻这一组。 */
@@ -168,6 +201,7 @@ class BoundContainerManageScreen extends Screen {
         if (expandButton != null) {
             expandButton.setMessage(expandLabel());
         }
+        entriesDirty = true;
     }
 
     private boolean isExpanded(UUID masterId) {
@@ -211,6 +245,17 @@ class BoundContainerManageScreen extends Screen {
 
     // ------------------------------------------------------------------ 数据组织
 
+    /** 取行列表：只在数据或本地状态变化时重建（每帧重建是 1.0.26 的主要开销）。 */
+    private List<Entry> entries() {
+        int revision = BoundContainerClient.revision();
+        if (entriesDirty || revision != builtRevision) {
+            cachedEntries = buildEntries();
+            builtRevision = revision;
+            entriesDirty = false;
+        }
+        return cachedEntries;
+    }
+
     /** 分组：主容器 → 它名下的并列成员与从容器；找不到父容器的单独成组。 */
     private List<Entry> buildEntries() {
         List<BoundContainer> all = BoundContainerClient.all();
@@ -227,7 +272,7 @@ class BoundContainerManageScreen extends Screen {
             if (binding.isMaster()) {
                 continue;
             }
-            BoundContainer parent = findMaster(all, binding.parentId());
+            BoundContainer parent = BoundContainerClient.find(binding.parentId());
             if (parent == null) {
                 orphans.add(binding);
             } else {
@@ -239,6 +284,22 @@ class BoundContainerManageScreen extends Screen {
         // List.sort 是稳定排序，同一角色内部仍然保持绑定顺序。
         for (List<BoundContainer> group : children.values()) {
             group.sort(Comparator.comparingInt(BoundContainerManageScreen::roleOrder));
+        }
+
+        // 每个主容器的规模一次算好：行内标签与「有没有子项」都读这份结果，
+        // 不必再为每个可见行遍历整张绑定表（原来每帧 O(n²)）。
+        groupCounts.clear();
+        for (Map.Entry<UUID, List<BoundContainer>> group : children.entrySet()) {
+            int parallel = 1;
+            int slave = 0;
+            for (BoundContainer child : group.getValue()) {
+                if (child.role() == BoundContainer.Role.PARALLEL) {
+                    parallel++;
+                } else if (child.role() == BoundContainer.Role.SLAVE) {
+                    slave++;
+                }
+            }
+            groupCounts.put(group.getKey(), new int[]{parallel, slave});
         }
 
         List<Entry> entries = new ArrayList<>();
@@ -260,8 +321,8 @@ class BoundContainerManageScreen extends Screen {
             if (!masterVisible && visibleChildren.isEmpty()) {
                 continue;
             }
-            entries.add(new GroupEntry(Component.translatable("text.recipe_sender.manage_group",
-                    groupName(master, group)), groupDetail(group)));
+            // 这里原来还有一条组头（「名字 ×N」+ 规模说明），紧接着的主容器行又把名字写了一遍。
+            // 组头已经删掉：名字与 ×N 归主容器行，规模由行上的「并列组 / 从 ×N」标签表达。
             entries.add(new RowEntry(master, false, false, null));
             shown++;
             for (BoundContainer child : visibleChildren) {
@@ -298,45 +359,6 @@ class BoundContainerManageScreen extends Screen {
         return binding.role() == BoundContainer.Role.PARALLEL ? 0 : 1;
     }
 
-    private static BoundContainer findMaster(List<BoundContainer> all, UUID id) {
-        if (id == null) {
-            return null;
-        }
-        for (BoundContainer binding : all) {
-            if (binding.id().equals(id) && binding.isMaster()) {
-                return binding;
-            }
-        }
-        return null;
-    }
-
-    /** 并列组的名字带 {@code ×N} 后缀，N = 主容器 + 全部并列成员，**不含从容器**。 */
-    private static String groupName(BoundContainer master, List<BoundContainer> group) {
-        int parallelCount = 1;
-        for (BoundContainer child : group) {
-            if (child.role() == BoundContainer.Role.PARALLEL) {
-                parallelCount++;
-            }
-        }
-        return parallelCount > 1 ? master.name() + " ×" + parallelCount : master.name();
-    }
-
-    private static Component groupDetail(List<BoundContainer> group) {
-        int parallel = 0;
-        int slave = 0;
-        for (BoundContainer child : group) {
-            if (child.role() == BoundContainer.Role.PARALLEL) {
-                parallel++;
-            } else if (child.role() == BoundContainer.Role.SLAVE) {
-                slave++;
-            }
-        }
-        if (parallel == 0 && slave == 0) {
-            return Component.translatable("text.recipe_sender.manage_group_alone");
-        }
-        return Component.translatable("text.recipe_sender.manage_group_detail", parallel, slave);
-    }
-
     private static Component orphanReason(BoundContainer orphan) {
         // 父容器已经被删掉，名字无从查起，只能拿 id 的前 8 位当线索。
         UUID parentId = orphan.parentId();
@@ -371,8 +393,9 @@ class BoundContainerManageScreen extends Screen {
         BoundUi.centered(graphics, Component.translatable("text.recipe_sender.manage_subtitle"),
                 left + panelWidth / 2, top + 18, BoundUi.TEXT_DIM);
 
-        List<Entry> entries = buildEntries();
+        List<Entry> entries = entries();
         lastEntries = entries;
+        pendingTooltip = null;
         contentHeight = 0;
         for (Entry entry : entries) {
             contentHeight += entry.height();
@@ -396,6 +419,8 @@ class BoundContainerManageScreen extends Screen {
                 y += entry.height();
             }
             graphics.disableScissor();
+            BoundUi.scrollbar(graphics, left + panelWidth - 5, listTop, listHeight, contentHeight,
+                    scrollOffset, maxScroll);
         }
 
         int footerY = top + panelHeight - FOOTER_HEIGHT + 3;
@@ -406,6 +431,11 @@ class BoundContainerManageScreen extends Screen {
 
         if (renameBox != null) {
             renameBox.render(graphics, mouseX, mouseY, partialTick);
+        }
+        // tooltip 最后画：行内按钮是自绘的，没有原版 Button 的提示，只能自己收集、最后统一画，
+        // 否则会被后画的搜索框 / 工具栏按钮盖住。
+        if (pendingTooltip != null) {
+            BoundUi.tooltip(graphics, mouseX, mouseY, pendingTooltip);
         }
     }
 
@@ -473,30 +503,39 @@ class BoundContainerManageScreen extends Screen {
         // 名字文字的起点一并记下来：改名输入框就摆在这儿。图标画在 GUI 的更高深度上（物品渲染带
         // z 偏移），先画的输入框盖不住它，所以只能从图标右边开始，而不是压在它上面。
         rowBounds.put(binding.id(), new int[]{x, y, width, cursor});
-        if (!renaming) {
-            graphics.drawString(font, displayName(binding), cursor, y + 4, BoundUi.TEXT, false);
-        }
-        int nameWidth = font.width(displayName(binding));
-        int tagsX = cursor + nameWidth + 4;
-        if (!renaming) {
-            int tagsWidth = BoundUi.tags(graphics, tagsX, y + 3, binding, parallelCountOf(binding),
-                    slaveCountOf(binding), false);
-            // 类别标签只给主容器画：并列成员与从容器跟随父容器，它们身上永远没有类别。
-            if (binding.isMaster() && !binding.routeKeys().isEmpty()) {
-                BoundUi.tag(graphics, tagsX + tagsWidth, y + 3,
-                        Component.translatable("text.recipe_sender.manage_route_tag",
-                                binding.routeKeys().size()), BoundUi.TAG_ROUTE);
+        int parallel = parallelCountOf(binding);
+        int slave = slaveCountOf(binding);
+        // 名字右侧还有角色标签与行内按钮，三方原先互不避让：名字一长就压到标签和按钮上。
+        // 先把右边要占的宽度量出来，再把名字裁到剩下的宽度（超出用 … 收尾）。
+        int rightEdge = x + width - 4;
+        int reserved = actionsWidth(binding) + 6;
+        int tagsWidth = BoundUi.tagsWidth(binding, parallel, slave, false) + routeTagWidth(binding);
+        int nameWidth;
+        if (renaming) {
+            nameWidth = font.width(displayName(binding));
+        } else {
+            int nameMax = Math.max(30, rightEdge - reserved - tagsWidth - 4 - cursor);
+            nameWidth = BoundUi.clipText(graphics, Component.literal(displayName(binding)), cursor, y + 4,
+                    nameMax, BoundUi.TEXT);
+            int tagsX = cursor + nameWidth + 4;
+            if (tagsX + tagsWidth <= rightEdge - reserved) {
+                int drawn = BoundUi.tags(graphics, tagsX, y + 3, binding, parallel, slave, false);
+                // 类别标签只给主容器画：并列成员与从容器跟随父容器，它们身上永远没有类别。
+                if (binding.isMaster() && !binding.routeKeys().isEmpty()) {
+                    BoundUi.tag(graphics, tagsX + drawn, y + 3, routeTag(binding), BoundUi.TAG_ROUTE);
+                }
             }
         }
 
         int subY = row.indent() ? y + 14 : y + 17;
-        Component sub = Component.literal(row.indent()
-                ? roleText(binding) + " → " + parentNameOf(binding)
-                : BoundUi.subText(binding));
+        int subMax = Math.max(30, rightEdge - (x + 20));
         if (orphan) {
-            graphics.drawString(font, row.reason(), x + 20, subY, BoundUi.TEXT_DANGER, false);
+            BoundUi.clipText(graphics, row.reason(), x + 20, subY, subMax, BoundUi.TEXT_DANGER);
         } else {
-            graphics.drawString(font, sub, x + 20, subY, BoundUi.TEXT_DIM, false);
+            Component sub = Component.literal(row.indent()
+                    ? roleText(binding) + " → " + parentNameOf(binding)
+                    : BoundUi.subText(binding));
+            BoundUi.clipText(graphics, sub, x + 20, subY, subMax, BoundUi.TEXT_DIM);
         }
 
         if (renaming) {
@@ -512,13 +551,28 @@ class BoundContainerManageScreen extends Screen {
     }
 
     /** 这一组名下有没有子项（并列成员 / 从容器）；没有就没什么可展开的。 */
-    private static boolean hasChildren(BoundContainer master) {
-        return BoundContainerClient.memberCount(master.id()) > 1
-                || BoundContainerClient.slaveCount(master.id()) > 0;
+    private boolean hasChildren(BoundContainer master) {
+        int[] counts = groupCounts.get(master.id());
+        return counts != null && (counts[0] > 1 || counts[1] > 0);
     }
 
-    private static String displayName(BoundContainer binding) {
-        return binding.name();
+    /** 名字带 {@code ×N}（N = 主容器 + 并列成员，不含从容器）。组头删掉后，这个后缀归行名。 */
+    private String displayName(BoundContainer binding) {
+        int parallel = parallelCountOf(binding);
+        return parallel > 1 ? binding.name() + " ×" + parallel : binding.name();
+    }
+
+    /** 主容器的类别标签文案。 */
+    private static Component routeTag(BoundContainer binding) {
+        return Component.translatable("text.recipe_sender.manage_route_tag", binding.routeKeys().size());
+    }
+
+    /** 类别标签要占的宽度（没有类别时为 0）。 */
+    private int routeTagWidth(BoundContainer binding) {
+        if (!binding.isMaster() || binding.routeKeys().isEmpty()) {
+            return 0;
+        }
+        return font.width(routeTag(binding)) + 5 + 2;
     }
 
     private static String roleText(BoundContainer binding) {
@@ -533,45 +587,57 @@ class BoundContainerManageScreen extends Screen {
     }
 
     private int parallelCountOf(BoundContainer master) {
-        int count = 1;
-        for (BoundContainer binding : BoundContainerClient.all()) {
-            if (binding.role() == BoundContainer.Role.PARALLEL && master.id().equals(binding.parentId())) {
-                count++;
-            }
-        }
-        return count;
+        int[] counts = groupCounts.get(master.id());
+        return counts == null ? 1 : counts[0];
     }
 
     private int slaveCountOf(BoundContainer master) {
-        int count = 0;
-        for (BoundContainer binding : BoundContainerClient.all()) {
-            if (binding.role() == BoundContainer.Role.SLAVE && master.id().equals(binding.parentId())) {
-                count++;
-            }
+        int[] counts = groupCounts.get(master.id());
+        return counts == null ? 0 : counts[1];
+    }
+
+    /** 一行里全部按钮的总宽度（含按钮间距）。给名字裁剪留位置用。 */
+    private int actionsWidth(BoundContainer binding) {
+        List<Action> actions = actionsFor(binding);
+        int total = 0;
+        for (Action action : actions) {
+            total += actionWidth(action);
         }
-        return count;
+        return total + Math.max(0, actions.size() - 1) * 2;
+    }
+
+    /**
+     * 单个行内按钮的宽度。
+     *
+     * <p>删除按钮的宽度按「确认删除」算：二次确认时按钮文案从「删除」变成「确认删除」，
+     * 若按各自文案算宽，两次点击之间整排按钮会横向跳一下，玩家第二下很容易点偏。</p>
+     */
+    private int actionWidth(Action action) {
+        int width = BoundUi.buttonWidth(action.label());
+        if ("delete".equals(action.action())) {
+            width = Math.max(width, BoundUi.buttonWidth(
+                    Component.translatable("text.recipe_sender.button_delete_confirm")));
+        }
+        return width;
     }
 
     private void drawRowButtons(GuiGraphics graphics, BoundContainer binding, int rightX, int y, int mouseX,
                                 int mouseY) {
         List<Action> actions = actionsFor(binding);
-        int totalWidth = 0;
-        for (Action action : actions) {
-            totalWidth += font.width(action.label()) + 8;
-        }
-        totalWidth += Math.max(0, actions.size() - 1) * 2;
+        int totalWidth = actionsWidth(binding);
         int buttonY = y + (binding.role() == BoundContainer.Role.MASTER ? 6 : 4);
         int cursor = rightX - totalWidth;
         for (Action action : actions) {
-            int buttonWidth = font.width(action.label()) + 8;
-            boolean hovered = BoundUi.inside(mouseX, mouseY, cursor, buttonY, buttonWidth, 16);
-            int background = action.danger() ? (hovered ? 0xFFD0D0D0 : BoundUi.PANEL)
-                    : (hovered ? BoundUi.BORDER_LIGHT : BoundUi.PANEL);
-            graphics.fill(cursor, buttonY, cursor + buttonWidth, buttonY + 16, background);
-            graphics.renderOutline(cursor, buttonY, buttonWidth, 16, BoundUi.BORDER_DARK);
-            graphics.drawString(font, action.label(), cursor + 4, buttonY + 4,
-                    action.danger() ? BoundUi.TEXT_DANGER : BoundUi.TEXT, false);
-            hitTargets.add(new HitTarget(cursor, buttonY, buttonWidth, 16, binding.id(), action.action()));
+            int buttonWidth = actionWidth(action);
+            boolean hovered = BoundUi.inside(mouseX, mouseY, cursor, buttonY, buttonWidth,
+                    BoundUi.BUTTON_HEIGHT);
+            BoundUi.button(graphics, cursor, buttonY, action.label(), hovered, true, action.danger());
+            if (hovered) {
+                // 自绘按钮没有原版 Button 的提示，这里收集起来在 render() 末尾统一画。
+                pendingTooltip = action.tooltip();
+            }
+            hitTargets.add(new HitTarget(cursor, buttonY, buttonWidth, BoundUi.BUTTON_HEIGHT, binding.id(),
+                    action.action()));
             cursor += buttonWidth + 2;
         }
     }
@@ -579,18 +645,22 @@ class BoundContainerManageScreen extends Screen {
     private List<Action> actionsFor(BoundContainer binding) {
         if (binding.id().equals(pendingDeleteId)) {
             return List.of(new Action(Component.translatable("text.recipe_sender.button_delete_confirm"),
-                    true, "delete"));
+                    true, "delete", Component.translatable("text.recipe_sender.tooltip_delete_confirm")));
         }
         List<Action> actions = new ArrayList<>();
-        actions.add(new Action(Component.translatable("text.recipe_sender.button_rename"), false, "rename"));
-        actions.add(new Action(Component.translatable("text.recipe_sender.button_relation"), false, "relation"));
+        actions.add(new Action(Component.translatable("text.recipe_sender.button_rename"), false, "rename",
+                Component.translatable("text.recipe_sender.tooltip_rename")));
+        actions.add(new Action(Component.translatable("text.recipe_sender.button_relation"), false, "relation",
+                Component.translatable("text.recipe_sender.tooltip_relation")));
         // 「类别」只给主容器：并列成员与从容器跟随父容器，勾类别没有意义（方案 §6⑩ 明确不加）。
         if (binding.isMaster()) {
             actions.add(new Action(Component.translatable("text.recipe_sender.button_category"), false,
-                    "category"));
+                    "category", Component.translatable("text.recipe_sender.tooltip_category")));
         }
-        actions.add(new Action(Component.translatable("text.recipe_sender.button_highlight"), false, "highlight"));
-        actions.add(new Action(Component.translatable("text.recipe_sender.button_delete"), true, "delete"));
+        actions.add(new Action(Component.translatable("text.recipe_sender.button_highlight"), false, "highlight",
+                Component.translatable("text.recipe_sender.tooltip_highlight")));
+        actions.add(new Action(Component.translatable("text.recipe_sender.button_delete"), true, "delete",
+                Component.translatable("text.recipe_sender.tooltip_delete")));
         return actions;
     }
 
@@ -674,9 +744,18 @@ class BoundContainerManageScreen extends Screen {
         if (minecraft == null) {
             return;
         }
-        minecraft.setScreen(new CategoryPickerScreen(this, binding.name(), binding.iconItem(),
-                binding.routeKeys(), routes ->
-                ModNetwork.CHANNEL.sendToServer(new UpdateBindingRoutesPacket(binding.id(), routes))));
+        // 上次是「右键去 EMI」打断的话，用存下来的草稿当初始值（见 categoryDraft 的说明）。
+        Set<ResourceLocation> initial = binding.id().equals(categoryDraftId)
+                ? categoryDraft : binding.routeKeys();
+        categoryDraftId = null;
+        categoryDraft = Set.of();
+        minecraft.setScreen(new CategoryPickerScreen(this, binding.name(), binding.iconItem(), initial,
+                routes ->
+                        ModNetwork.CHANNEL.sendToServer(new UpdateBindingRoutesPacket(binding.id(), routes)),
+                routes -> {
+                    categoryDraftId = binding.id();
+                    categoryDraft = Set.copyOf(routes);
+                }));
     }
 
     private void beginRename(BoundContainer binding) {
@@ -825,6 +904,11 @@ class BoundContainerManageScreen extends Screen {
             onClose();
             return true;
         }
+        // 打字即聚焦搜索框：打开界面直接敲字就能搜，不必先用鼠标点一下输入框。
+        // （不改成 setInitialFocus 是有意的：搜索框一开场就聚焦，E 关界面会被输入框吃掉。）
+        if (BoundUi.shouldTypeToSearch(this, keyCode)) {
+            BoundUi.focus(this, searchBox);
+        }
         return super.keyPressed(keyCode, scanCode, modifiers);
     }
 
@@ -837,6 +921,10 @@ class BoundContainerManageScreen extends Screen {
     public boolean charTyped(char codePoint, int modifiers) {
         if (renameBox != null) {
             return renameBox.charTyped(codePoint, modifiers);
+        }
+        // 输入法常常只发 charTyped 不发可识别的 keyPressed，这里再补一次聚焦。
+        if (searchBox != null && getFocused() != searchBox && !Character.isISOControl(codePoint)) {
+            BoundUi.focus(this, searchBox);
         }
         return super.charTyped(codePoint, modifiers);
     }
@@ -868,7 +956,7 @@ class BoundContainerManageScreen extends Screen {
         }
     }
 
-    private record Action(Component label, boolean danger, String action) {
+    private record Action(Component label, boolean danger, String action, Component tooltip) {
     }
 
     private record HitTarget(int x, int y, int width, int height, UUID bindingId, String action) {

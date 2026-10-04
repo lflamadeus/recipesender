@@ -1,6 +1,7 @@
 package com.lai.recipesender.network.packet;
 
 import com.lai.recipesender.client.ClientPacketHandler;
+import com.lai.recipesender.model.BoundDetail;
 import com.lai.recipesender.model.BoundStatus;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraftforge.network.NetworkEvent;
@@ -20,11 +21,11 @@ import java.util.function.Supplier;
  * @param insertedBatches  实际完整送达的份数
  * @param requestedBatches 玩家要求的份数
  * @param overflowBatches  其中落到<b>从容器</b>的份数（主容器与并列成员都放满后溢出的部分）
- * @param detailKey        补充说明的语言键；没有补充说明时为 {@code null}
+ * @param detail           补充说明的结构化原因；没有补充说明时为 {@code null}
  */
 public record BoundInsertResultPacket(long requestId, UUID bindingId, BoundStatus status,
                                       int insertedBatches, int requestedBatches, int overflowBatches,
-                                      String detailKey) {
+                                      BoundDetail detail) {
 
     /** 编码回执。 */
     public static void encode(BoundInsertResultPacket packet, FriendlyByteBuf buffer) {
@@ -34,9 +35,9 @@ public record BoundInsertResultPacket(long requestId, UUID bindingId, BoundStatu
         buffer.writeVarInt(Math.max(0, packet.insertedBatches));
         buffer.writeVarInt(Math.max(0, packet.requestedBatches));
         buffer.writeVarInt(Math.max(0, packet.overflowBatches));
-        buffer.writeBoolean(packet.detailKey != null);
-        if (packet.detailKey != null) {
-            buffer.writeUtf(packet.detailKey, 128);
+        buffer.writeBoolean(packet.detail != null);
+        if (packet.detail != null) {
+            buffer.writeEnum(packet.detail);
         }
     }
 
@@ -48,9 +49,9 @@ public record BoundInsertResultPacket(long requestId, UUID bindingId, BoundStatu
         int insertedBatches = buffer.readVarInt();
         int requestedBatches = buffer.readVarInt();
         int overflowBatches = buffer.readVarInt();
-        String detailKey = buffer.readBoolean() ? buffer.readUtf(128) : null;
+        BoundDetail detail = buffer.readBoolean() ? buffer.readEnum(BoundDetail.class) : null;
         return new BoundInsertResultPacket(requestId, bindingId, status, insertedBatches,
-                requestedBatches, overflowBatches, detailKey);
+                requestedBatches, overflowBatches, detail);
     }
 
     /** 交给客户端界面提示。 */
@@ -58,7 +59,7 @@ public record BoundInsertResultPacket(long requestId, UUID bindingId, BoundStatu
         NetworkEvent.Context context = contextSupplier.get();
         context.enqueueWork(() -> ClientPacketHandler.acceptBoundInsertResult(packet.requestId(),
                 packet.bindingId(), packet.status(), packet.insertedBatches(),
-                packet.requestedBatches(), packet.overflowBatches(), packet.detailKey()));
+                packet.requestedBatches(), packet.overflowBatches(), packet.detail()));
         context.setPacketHandled(true);
     }
 }

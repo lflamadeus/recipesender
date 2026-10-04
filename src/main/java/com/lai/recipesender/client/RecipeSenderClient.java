@@ -4,7 +4,9 @@ import com.lai.recipesender.RecipeSenderMod;
 import com.lai.recipesender.integration.findme.FindMeExtendedAdapter;
 import com.lai.recipesender.integration.gt.GtCircuitSupport;
 import com.lai.recipesender.model.BoundContainer;
+import com.lai.recipesender.model.BoundDetail;
 import com.lai.recipesender.model.BoundStatus;
+import com.lai.recipesender.model.NoticeSeverity;
 import com.lai.recipesender.model.RecipeIngredientSpec;
 import com.lai.recipesender.network.ModNetwork;
 import com.lai.recipesender.network.packet.BindContainerPacket;
@@ -27,13 +29,13 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
-import net.minecraft.client.resources.language.I18n;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.Slot;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.BlockHitResult;
@@ -112,67 +114,96 @@ public final class RecipeSenderClient {
             "key.recipe_sender.manage", KeyConflictContext.UNIVERSAL, KeyModifier.CONTROL,
             InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_B, "key.categories.recipe_sender");
 
-    private static boolean selecting;
-    private static boolean reverseMode;
-    /** 当前选择是不是「发送到已绑定容器」；与 {@link #reverseMode} 互斥。 */
-    private static boolean boundMode;
-    /** 本次发送的目标；只在 {@link #boundMode} 为 true 时有值。 */
-    private static BoundContainer activeBinding;
-    /**
-     * 本次「发送到已绑定容器」的候选（已按配方类别与维度筛过，S6）。
-     *
-     * <p>开始选择时算一次就固定下来：松手那一刻鼠标下的配方可能已经变了，用两份不同的候选
-     * 会导致「弹窗里挑了 A，实际发给 B」这类对不上的行为。
-     */
-    private static List<BoundContainer> boundCandidates = List.of();
-    /** 最近一次绑定发送的请求号；只接受与它相等的回执。 */
-    private static long boundRequestId;
-    private static boolean awaitingAvailability;
-    private static boolean releasePending;
-    private static boolean selectAllRequested;
-    private static boolean nearbyAvailabilityReceived;
-    private static boolean bindingLogged;
-    /** 反转搜索不可用的提示每次会话只写一条日志，避免玩家反复按键刷屏。 */
-    private static boolean reverseUnavailableLogged;
-    /**
-     * 等待服务端统计结果期间攒下的滚轮格数（正数向上）。
-     * 这段窗口里滚轮不能直接改份数（可发送上限还没刷新），但事件必须被吞掉，
-     * 否则会漏给 EMI 去滚动侧栏/翻配方页，把鼠标下方的条目换掉。
-     */
-    private static int pendingScrollNotches;
-    private static int selectedBatches;
-    private static int availableBatches;
-    private static int insertableBatches;
-    /** 当前悬停配方对编程电路的要求；null 表示不动电路（不是格雷配方或识别失败）。 */
-    private static GtCircuitSupport.CircuitRequirement activeCircuit;
-    /**
-     * 当前打开的目标容器有没有可写的电路槽（客户端预判，只用来决定提示行）。
-     *
-     * <p>原版箱子、漏斗这类容器没有机器实例，{@link GtCircuitSupport#canAdjustCircuit} 给出
-     * {@code false}：发送时既不会写电路也不会置空，所以连提示都不该显示。
-     */
-    private static boolean activeTargetHasCircuit;
-    /**
-     * 本次选择解析出的电路要求，供「发送到已绑定容器」随包带给服务端。
-     *
-     * <p>与 {@link #activeCircuit} 的差别只在生命周期：多候选时的选择弹窗是在
-     * {@code cancelSelection()} <b>之后</b>才把包发出去的，那时 {@code activeCircuit} 已经被清空，
-     * 所以这里单独留一份，只在下一次 {@code beginSelection()} 时被覆盖。
-     *
-     * <p>绑定模式的落点是远程方块，客户端拿不到它的机器实例，<b>有没有电路槽只有服务端知道</b>；
-     * 客户端能做的只是把「配方要什么」原样说出去，服务端按真实实例决定要不要写。
-     */
-    private static GtCircuitSupport.CircuitRequirement resolvedCircuit;
     private static long clientTicks;
     private static long nextAvailabilityRefreshTick;
     private static long availabilityRequestTick;
+    /**
+     * 上一次统计（背包可制作份数 / 目标容器可容纳份数）算的是哪一份内容。
+     *
+     * <p>按住发送键时统计每 10 tick 重算一次，而背包内容在这两秒里几乎不会变；
+     * 内容指纹没变就跳过重算。见 {@code availabilityFingerprint}。
+     */
+    private static int lastAvailabilityFingerprint;
     private static long activeRequestId;
-    private static Set<Integer> highlightedInventorySlots = Set.of();
-    private static Screen activeScreen;
-    private static AbstractContainerScreen<?> activeContainer;
-    private static EmiIngredient activeIngredient;
-    private static EmiRecipe activeRecipe;
-    private static List<RecipeIngredientSpec> activeSpecs = List.of();
+    /** 反转搜索不可用的提示每次会话只写一条日志，避免玩家反复按键刷屏。 */
+    private static boolean reverseUnavailableLogged;
+    /**
+     * HUD 提示行与颜色的复用缓冲。
+     *
+     * <p>按住 Z 期间这段文字每帧都要重算（份数一直在变），但每帧新建两个 ArrayList 是纯浪费：
+     * 渲染是每秒六十次的热路径。复用后只 clear() 一下即可；只在渲染线程使用，不存在并发问题。
+     */
+    private static final List<Component> HUD_LINES = new ArrayList<>(6);
+    private static final List<Integer> HUD_COLORS = new ArrayList<>(6);
+
+    /** 一次选择的全部状态：开始选择时建立，结束选择时清空。 */
+    private static final Selection selection = new Selection();
+
+    /**
+     * 一次「发送材料」的完整状态。
+     *
+     * <p>这二十来个字段原来直接摊在 {@code RecipeSenderClient} 里，谁都能在任何时刻写它们，
+     * 于是「选择早就结束了、某个字段却还是上一次的值」这类问题只能靠通读全文发现。
+     * 收进一个对象后，生命周期有了明确边界：{@code beginSelection()} 建一份，
+     * {@code cancelSelection()} 清掉。
+     */
+    private static final class Selection {
+        boolean selecting;
+        boolean reverseMode;
+        /** 当前选择是不是「发送到已绑定容器」；与 {@link #reverseMode} 互斥。 */
+        boolean boundMode;
+        /** 本次发送的目标；只在 {@link #boundMode} 为 true 时有值。 */
+        BoundContainer activeBinding;
+        /**
+         * 本次「发送到已绑定容器」的候选（已按配方类别与维度筛过，S6）。
+         *
+         * <p>开始选择时算一次就固定下来：松手那一刻鼠标下的配方可能已经变了，用两份不同的候选
+         * 会导致「弹窗里挑了 A，实际发给 B」这类对不上的行为。
+         */
+        List<BoundContainer> boundCandidates = List.of();
+        /** 最近一次绑定发送的请求号；只接受与它相等的回执。 */
+        long boundRequestId;
+        boolean awaitingAvailability;
+        boolean releasePending;
+        boolean selectAllRequested;
+        boolean nearbyAvailabilityReceived;
+        boolean bindingLogged;
+        /**
+         * 等待服务端统计结果期间攒下的滚轮格数（正数向上）。
+         * 这段窗口里滚轮不能直接改份数（可发送上限还没刷新），但事件必须被吞掉，
+         * 否则会漏给 EMI 去滚动侧栏/翻配方页，把鼠标下方的条目换掉。
+         */
+        int pendingScrollNotches;
+        int selectedBatches;
+        int availableBatches;
+        int insertableBatches;
+        /** 当前悬停配方对编程电路的要求；null 表示不动电路（不是格雷配方或识别失败）。 */
+        GtCircuitSupport.CircuitRequirement activeCircuit;
+        /**
+         * 当前打开的目标容器有没有可写的电路槽（客户端预判，只用来决定提示行）。
+         *
+         * <p>原版箱子、漏斗这类容器没有机器实例，{@link GtCircuitSupport#canAdjustCircuit} 给出
+         * {@code false}：发送时既不会写电路也不会置空，所以连提示都不该显示。
+         */
+        boolean activeTargetHasCircuit;
+        /**
+         * 本次选择解析出的电路要求，供「发送到已绑定容器」随包带给服务端。
+         *
+         * <p>与 {@link #activeCircuit} 的差别只在生命周期：多候选时的选择弹窗是在
+         * {@code cancelSelection()} <b>之后</b>才把包发出去的，那时 {@code activeCircuit} 已经被清空，
+         * 所以这里单独留一份，只在下一次 {@code beginSelection()} 时被覆盖。
+         *
+         * <p>绑定模式的落点是远程方块，客户端拿不到它的机器实例，<b>有没有电路槽只有服务端知道</b>；
+         * 客户端能做的只是把「配方要什么」原样说出去，服务端按真实实例决定要不要写。
+         */
+        GtCircuitSupport.CircuitRequirement resolvedCircuit;
+        Set<Integer> highlightedInventorySlots = Set.of();
+        Screen activeScreen;
+        AbstractContainerScreen<?> activeContainer;
+        EmiIngredient activeIngredient;
+        EmiRecipe activeRecipe;
+        List<RecipeIngredientSpec> activeSpecs = List.of();
+    }
 
     private RecipeSenderClient() {
     }
@@ -226,15 +257,15 @@ public final class RecipeSenderClient {
     /** 处理 Alt、Z、配方反转键和绑定键的按下与松开事件。 */
     @SubscribeEvent
     public static void onKeyInput(InputEvent.Key event) {
-        if (event.getAction() == GLFW.GLFW_PRESS && selecting && isAltKey(event)) {
-            selectAllRequested = true;
-            selectedBatches = maxSendableBatches();
+        if (event.getAction() == GLFW.GLFW_PRESS && selection.selecting && isAltKey(event)) {
+            selection.selectAllRequested = true;
+            selection.selectedBatches = maxSendableBatches();
             return;
         }
         if (INSERT_RECIPE_KEY.matches(event.getKey(), event.getScanCode())) {
-            if (event.getAction() == GLFW.GLFW_PRESS && !selecting) {
+            if (event.getAction() == GLFW.GLFW_PRESS && !selection.selecting) {
                 beginSelection();
-            } else if (event.getAction() == GLFW.GLFW_RELEASE && selecting) {
+            } else if (event.getAction() == GLFW.GLFW_RELEASE && selection.selecting) {
                 finishSelection();
             }
             return;
@@ -248,7 +279,7 @@ public final class RecipeSenderClient {
         }
         // 管理界面键默认是 Ctrl + B，必须连修饰键一起判定：isActiveAndMatches 会检查 Ctrl 是否按下，
         // 所以裸键 B 不会走到这里，而是继续往下落到绑定键上。
-        if (event.getAction() == GLFW.GLFW_PRESS && !selecting
+        if (event.getAction() == GLFW.GLFW_PRESS && !selection.selecting
                 && MANAGE_KEY.isActiveAndMatches(
                         InputConstants.getKey(event.getKey(), event.getScanCode()))) {
             openManageScreen();
@@ -258,7 +289,7 @@ public final class RecipeSenderClient {
         // 所以真正的判定放在 bindLookedAtBlock() 里：那里会避开搜索框。
         // 这里只比键码（KeyModifier.NONE 的 isActive 恒为 true，比修饰键也区分不开 Ctrl+B），
         // 靠上面管理键分支先判并 return 把 Ctrl+B 截走。
-        if (event.getAction() == GLFW.GLFW_PRESS && !selecting
+        if (event.getAction() == GLFW.GLFW_PRESS && !selection.selecting
                 && BOUND_SEND_KEY.matches(event.getKey(), event.getScanCode())) {
             bindLookedAtBlock();
         }
@@ -276,7 +307,7 @@ public final class RecipeSenderClient {
      */
     @SubscribeEvent
     public static void onMouseInput(InputEvent.MouseButton.Post event) {
-        if (event.getAction() != GLFW.GLFW_PRESS || selecting || isOwnScreenOpen()) {
+        if (event.getAction() != GLFW.GLFW_PRESS || selection.selecting || isOwnScreenOpen()) {
             return;
         }
         InputConstants.Key button = InputConstants.Type.MOUSE.getOrCreate(event.getButton());
@@ -336,7 +367,7 @@ public final class RecipeSenderClient {
         LOGGER.info("绑定键已触发：取到的方块 = {}，EMI 搜索框聚焦 = {}", pos, EmiApi.isSearchFocused());
         if (pos == null) {
             sendMessage(minecraft, getMessage("text.recipe_sender.bind_no_target",
-                    "准星没有指向方块"));
+                    "准星没有指向方块"), NoticeSeverity.ERROR);
             return;
         }
         // 石头、混凝土这类没有方块实体的方块永远不可能提供物品容器，绑了也永远发不进去，
@@ -344,7 +375,7 @@ public final class RecipeSenderClient {
         // 客户端的能力表可能不全（某些模组只注册服务端），不能把它当成唯一依据。
         if (!BoundTargetResolver.hasItemHandler(minecraft.level.getBlockEntity(pos))) {
             sendMessage(minecraft, getMessage("text.recipe_sender.bind_no_container",
-                    "这个方块不是物品容器"));
+                    "这个方块不是物品容器"), NoticeSeverity.ERROR);
             return;
         }
         ResourceLocation dimension = minecraft.player.level().dimension().location();
@@ -353,7 +384,7 @@ public final class RecipeSenderClient {
         BoundContainer existing = BoundContainerClient.findAt(dimension, pos);
         if (existing != null) {
             sendMessage(minecraft, Component.translatable("text.recipe_sender.bound_already",
-                    existing.name()));
+                    existing.name()), NoticeSeverity.WARN);
             return;
         }
         // 名称、容器关系（主容器 / 并列成员 / 从容器）都在弹窗里定，服务端还会再校验一遍。
@@ -374,10 +405,10 @@ public final class RecipeSenderClient {
         // 高亮的倒计时与界面无关，同样不能被下面的早退挡掉。
         BoundHighlightState.tick();
         Minecraft minecraft = Minecraft.getInstance();
-        if (!bindingLogged) {
+        if (!selection.bindingLogged) {
             logReverseBinding(minecraft);
         }
-        if (!selecting) {
+        if (!selection.selecting) {
             return;
         }
         // 发送模式由「此刻按住哪些修饰键」实时决定，优先级固定为：反转 > 发送到已绑定容器 > 正向发送。
@@ -391,13 +422,13 @@ public final class RecipeSenderClient {
         // 锁定之后松键顺序不再影响结果，也就不需要给「同时松开」猜一个容差毫秒数。
         int wantedMode = isReverseKeyHeld() ? MODE_REVERSE
                 : (isBoundSendKeyHeld() ? MODE_BOUND : MODE_FORWARD);
-        int currentMode = reverseMode ? MODE_REVERSE : (boundMode ? MODE_BOUND : MODE_FORWARD);
+        int currentMode = selection.reverseMode ? MODE_REVERSE : (selection.boundMode ? MODE_BOUND : MODE_FORWARD);
         if (wantedMode > currentMode && canEnterMode(wantedMode)) {
             cancelSelection("发送模式已提升");
             beginSelection();
             return;
         }
-        if (minecraft.screen != activeScreen) {
+        if (minecraft.screen != selection.activeScreen) {
             cancelSelection("当前界面已改变");
             return;
         }
@@ -405,14 +436,17 @@ public final class RecipeSenderClient {
             cancelSelection("鼠标已不在目标配方上");
             return;
         }
-        if (awaitingAvailability && clientTicks - availabilityRequestTick >= AVAILABILITY_TIMEOUT_TICKS) {
+        if (selection.awaitingAvailability && clientTicks - availabilityRequestTick >= AVAILABILITY_TIMEOUT_TICKS) {
             onAvailabilityTimeout();
             return;
         }
-        if (!reverseMode && clientTicks >= nextAvailabilityRefreshTick) {
-            refreshInventoryAvailability(minecraft);
+        if (!selection.reverseMode && clientTicks >= nextAvailabilityRefreshTick) {
             nextAvailabilityRefreshTick = clientTicks + AVAILABILITY_REFRESH_INTERVAL_TICKS;
-        } else if (reverseMode && !awaitingAvailability
+            int fingerprint = availabilityFingerprint(minecraft);
+            if (fingerprint != lastAvailabilityFingerprint) {
+                refreshInventoryAvailability(minecraft);
+            }
+        } else if (selection.reverseMode && !selection.awaitingAvailability
                 && clientTicks >= nextAvailabilityRefreshTick) {
             requestNearbyAvailability();
         }
@@ -453,27 +487,33 @@ public final class RecipeSenderClient {
                 ? getMessage("text.recipe_sender.reverse_incompatible",
                         "反转搜索需要 FindMeExtended 1.0.2 或更高版本，当前版本不兼容")
                 : getMessage("text.recipe_sender.reverse_missing",
-                        "反转搜索需要安装 FindMeExtended"));
+                        "反转搜索需要安装 FindMeExtended"), NoticeSeverity.WARN);
     }
 
     /** 生成带语言文件回退文本的提示。 */
     private static Component getMessage(String key, String fallback) {
-        return Component.literal(getMessageText(key, fallback));
+        return Lang.message(key, fallback);
     }
 
     /** 取语言文件里的文本；缺失或格式错误时退回兜底文案。 */
     private static String getMessageText(String key, String fallback) {
-        String text = I18n.get(key);
-        if (text.equals(key) || text.startsWith("Format error:")) {
-            return fallback;
-        }
-        return text;
+        return Lang.text(key, fallback);
     }
 
     /** 把提示发给玩家；玩家还没准备好时静默丢弃。 */
     private static void sendMessage(Minecraft minecraft, Component text) {
+        sendMessage(minecraft, text, NoticeSeverity.INFO);
+    }
+
+    /**
+     * 把提示发给玩家，并指定严重程度。
+     *
+     * <p>失败必须是红的：玩家做完一个动作，最该一眼分出来的就是「成了」还是「没成」。
+     * 严重程度由每个调用点自己说清楚，而不是让浮层去猜文案里有没有「失败」两个字。
+     */
+    private static void sendMessage(Minecraft minecraft, Component text, NoticeSeverity severity) {
         if (minecraft.player != null) {
-            NoticeOverlay.show(text);
+            NoticeOverlay.show(text, severity);
         }
     }
 
@@ -510,26 +550,17 @@ public final class RecipeSenderClient {
 
     /** 生成带语言文件回退文本的「已发送 N 份到 X」提示。 */
     private static Component getBoundText(String key, Object[] args, String fallback) {
-        return Component.literal(getBoundTextText(key, args, fallback));
+        return Lang.message(key, fallback, args);
     }
 
     /** 与 {@link #getBoundText} 同源，但返回纯文本——供嵌进别的语言模板的 {@code %s}。 */
     private static String getBoundTextText(String key, Object[] args, String fallback) {
-        String text = I18n.get(key, args);
-        if (text.equals(key) || text.startsWith("Format error:")) {
-            return fallback;
-        }
-        return text;
+        return Lang.text(key, fallback, args);
     }
 
     /** 生成 HUD 上的「发送到「X」」目标行。 */
     private static Component getBoundTargetText(String name) {
-        String key = "text.recipe_sender.bound_target";
-        String text = I18n.get(key, name);
-        if (text.equals(key) || text.startsWith("Format error:")) {
-            return Component.literal("发送到「" + name + "」");
-        }
-        return Component.literal(text);
+        return Lang.message("text.recipe_sender.bound_target", "发送到「" + name + "」", name);
     }
 
     /**
@@ -541,7 +572,7 @@ public final class RecipeSenderClient {
      * 表现是“按住反转键毫无反应”，而日志里一条记录都没有，只能靠猜。
      */
     private static void logReverseBinding(Minecraft minecraft) {
-        bindingLogged = true;
+        selection.bindingLogged = true;
         LOGGER.info("反转键绑定 = {}，已进入控制设置列表 = {}，反转搜索可用 = {}",
                 REVERSE_KEY.getKey().getName(), isRegistered(minecraft, REVERSE_KEY),
                 FindMeExtendedAdapter.isAvailable());
@@ -577,7 +608,7 @@ public final class RecipeSenderClient {
      */
     @SubscribeEvent
     public static void onMouseScrolled(ScreenEvent.MouseScrolled.Pre event) {
-        if (!selecting || event.getScreen() != activeScreen) {
+        if (!selection.selecting || event.getScreen() != selection.activeScreen) {
             return;
         }
         if (!isActiveTarget(EmiApi.getHoveredStack((int) event.getMouseX(),
@@ -592,8 +623,8 @@ public final class RecipeSenderClient {
             // 横向滚轮等零增量事件同样要吞掉，否则会漏给 EMI。
             return;
         }
-        if (awaitingAvailability) {
-            pendingScrollNotches += direction;
+        if (selection.awaitingAvailability) {
+            selection.pendingScrollNotches += direction;
             return;
         }
         applyScroll(direction);
@@ -628,7 +659,7 @@ public final class RecipeSenderClient {
 
     /** 判断某个按键在选择期间是否应当被屏蔽。 */
     private static boolean shouldBlockKey(Screen screen, int keyCode) {
-        if (!selecting || screen != activeScreen) {
+        if (!selection.selecting || screen != selection.activeScreen) {
             return false;
         }
         if (keyCode == GLFW.GLFW_KEY_ESCAPE || isModifierKey(keyCode) || isModKeyMapping(keyCode)) {
@@ -660,14 +691,14 @@ public final class RecipeSenderClient {
     private static void applyScroll(int notches) {
         int step = notches > 0 ? 1 : -1;
         for (int index = 0; index < Math.abs(notches); index++) {
-            selectedBatches = adjustBatches(selectedBatches, step);
+            selection.selectedBatches = adjustBatches(selection.selectedBatches, step);
         }
     }
 
     /** 把等待统计结果期间攒下的滚轮格数补上。 */
     private static void applyPendingScroll() {
-        int notches = pendingScrollNotches;
-        pendingScrollNotches = 0;
+        int notches = selection.pendingScrollNotches;
+        selection.pendingScrollNotches = 0;
         if (notches != 0) {
             applyScroll(notches);
         }
@@ -683,7 +714,7 @@ public final class RecipeSenderClient {
     @SubscribeEvent(priority = EventPriority.LOWEST)
     public static void onScreenRender(ScreenEvent.Render.Post event) {
         NoticeOverlay.renderInScreen(event.getGuiGraphics());
-        if (!selecting || event.getScreen() != activeScreen) {
+        if (!selection.selecting || event.getScreen() != selection.activeScreen) {
             return;
         }
         int mouseX = event.getMouseX();
@@ -696,37 +727,39 @@ public final class RecipeSenderClient {
         GuiGraphics graphics = event.getGuiGraphics();
         renderInventoryHighlights(graphics, event.getScreen());
 
-        String availableKey = reverseMode
+        String availableKey = selection.reverseMode
                 ? "text.recipe_sender.nearby_available_count"
                 : "text.recipe_sender.available_count";
-        List<Component> lines = new ArrayList<>(5);
-        List<Integer> colors = new ArrayList<>(5);
-        if (boundMode) {
+        List<Component> lines = HUD_LINES;
+        List<Integer> colors = HUD_COLORS;
+        lines.clear();
+        colors.clear();
+        if (selection.boundMode) {
             // 落点在玩家看不到的远程方块上，所以第一行必须先说清楚发到哪儿。
             // 有多个候选时这里说不了具体是哪一个（等松开 Z 才由玩家挑），只说候选数量——
             // 数量取的是按配方类别筛过的候选（S6），不是全部主容器。
-            lines.add(activeBinding != null
-                    ? getBoundTargetText(activeBinding.name())
+            lines.add(selection.activeBinding != null
+                    ? getBoundTargetText(selection.activeBinding.name())
                     : getBoundText("text.recipe_sender.bound_target_pick",
-                            new Object[]{boundCandidates.size()}, "候选容器"));
+                            new Object[]{selection.boundCandidates.size()}, "候选容器"));
             colors.add(0x8FE08F);
         }
-        lines.add(getCountText(availableKey, availableBatches,
-                reverseMode ? "周围现有" : "背包现有"));
+        lines.add(getCountText(availableKey, selection.availableBatches,
+                selection.reverseMode ? "周围现有" : "背包现有"));
         colors.add(0xB8B8B8);
-        lines.add(getCountText(reverseMode
+        lines.add(getCountText(selection.reverseMode
                         ? "text.recipe_sender.pull_count" : "text.recipe_sender.send_count",
-                selectedBatches, reverseMode ? "取回" : "发送"));
+                selection.selectedBatches, selection.reverseMode ? "取回" : "发送"));
         colors.add(0xFFFFFF);
-        Component circuitLine = reverseMode ? null : describeCircuitChange();
+        Component circuitLine = selection.reverseMode ? null : describeCircuitChange();
         if (circuitLine != null) {
             // 提前显示这次发送会顺带把机器电路改成什么，避免玩家不知道配置被动过。
             lines.add(circuitLine);
             colors.add(0xFFD479);
         }
-        if (!reverseMode && insertableBatches < availableBatches) {
+        if (!selection.reverseMode && selection.insertableBatches < selection.availableBatches) {
             // 目标容器成为瓶颈时明确提示上限，避免玩家以为滚轮失效。
-            lines.add(getCountText("text.recipe_sender.target_limit", insertableBatches,
+            lines.add(getCountText("text.recipe_sender.target_limit", selection.insertableBatches,
                     "目标最多接收"));
             colors.add(0x9AD9FF);
         }
@@ -830,7 +863,7 @@ public final class RecipeSenderClient {
             List<BoundContainer> masters = BoundContainerClient.masters();
             if (masters.isEmpty()) {
                 sendMessage(minecraft, getMessage("text.recipe_sender.bound_none",
-                        "还没有绑定容器：对着方块按 B 绑定"));
+                        "还没有绑定容器：对着方块按 B 绑定"), NoticeSeverity.WARN);
                 return;
             }
             // S6 起按配方类别自动路由：只有「勾了这条配方所属类别」的主容器才是候选。
@@ -840,7 +873,7 @@ public final class RecipeSenderClient {
             if (candidates.isEmpty()) {
                 sendMessage(minecraft, getBoundText("text.recipe_sender.route_none",
                         new Object[]{RecipeRouteKeys.categoryName(recipe)},
-                        "没有为「%s」绑定容器 · 去管理界面点「类别」给主容器勾上"));
+                        "没有为「%s」绑定容器 · 去管理界面点「类别」给主容器勾上"), NoticeSeverity.WARN);
                 return;
             }
             // 只有一个候选时直接定下；有多个时这里不定，等松开 Z 再弹选择界面让玩家挑。
@@ -849,42 +882,42 @@ public final class RecipeSenderClient {
                 boundTarget = candidates.get(0);
             }
         }
-        selecting = true;
-        reverseMode = reverseRequested;
-        boundMode = boundRequested;
-        activeBinding = boundTarget;
-        boundCandidates = candidates;
-        selectAllRequested = isAltDown();
-        selectedBatches = reverseMode ? 0 : 1;
-        pendingScrollNotches = 0;
-        activeScreen = minecraft.screen;
-        activeContainer = container;
-        activeIngredient = hovered.getStack();
-        activeRecipe = recipe;
+        selection.selecting = true;
+        selection.reverseMode = reverseRequested;
+        selection.boundMode = boundRequested;
+        selection.activeBinding = boundTarget;
+        selection.boundCandidates = candidates;
+        selection.selectAllRequested = isAltDown();
+        selection.selectedBatches = selection.reverseMode ? 0 : 1;
+        selection.pendingScrollNotches = 0;
+        selection.activeScreen = minecraft.screen;
+        selection.activeContainer = container;
+        selection.activeIngredient = hovered.getStack();
+        selection.activeRecipe = recipe;
         // 电路只影响机器的配方匹配，不参与材料统计，因此在开始选择时解析一次即可。
         // 绑定模式也照常解析：落点是远程方块，客户端不知道它有没有电路槽，但要求可以先带上，
         // 由服务端按真实实例决定写不写（没有电路槽就静默跳过）。
-        activeCircuit = GtCircuitSupport.findCircuit(recipe);
-        resolvedCircuit = activeCircuit;
-        activeTargetHasCircuit = container != null
+        selection.activeCircuit = GtCircuitSupport.findCircuit(recipe);
+        selection.resolvedCircuit = selection.activeCircuit;
+        selection.activeTargetHasCircuit = container != null
                 && GtCircuitSupport.canAdjustCircuit(
                         GtCircuitSupport.findCircuitHolder(container.getMenu()));
-        highlightedInventorySlots = RecipeMaterialCollector.findMatchingInventorySlots(recipe,
+        selection.highlightedInventorySlots = RecipeMaterialCollector.findMatchingInventorySlots(recipe,
                 minecraft.player);
 
-        if (reverseMode) {
-            activeSpecs = RecipeMaterialCollector.createIngredientSpecs(recipe);
-            if (activeSpecs.isEmpty()) {
+        if (selection.reverseMode) {
+            selection.activeSpecs = RecipeMaterialCollector.createIngredientSpecs(recipe);
+            if (selection.activeSpecs.isEmpty()) {
                 cancelSelection();
                 return;
             }
-            awaitingAvailability = false;
-            nearbyAvailabilityReceived = false;
+            selection.awaitingAvailability = false;
+            selection.nearbyAvailabilityReceived = false;
             requestNearbyAvailability();
         } else {
             refreshInventoryAvailability(minecraft);
-            if (selectAllRequested) {
-                selectedBatches = maxSendableBatches();
+            if (selection.selectAllRequested) {
+                selection.selectedBatches = maxSendableBatches();
             }
             nextAvailabilityRefreshTick = clientTicks + AVAILABILITY_REFRESH_INTERVAL_TICKS;
         }
@@ -892,13 +925,13 @@ public final class RecipeSenderClient {
 
     /** 请求服务端统计周围材料，并通过节流避免高频扫描容器。 */
     private static void requestNearbyAvailability() {
-        if (!reverseMode || activeSpecs.isEmpty() || awaitingAvailability) {
+        if (!selection.reverseMode || selection.activeSpecs.isEmpty() || selection.awaitingAvailability) {
             return;
         }
-        awaitingAvailability = true;
+        selection.awaitingAvailability = true;
         activeRequestId = REQUEST_SEQUENCE.incrementAndGet();
         availabilityRequestTick = clientTicks;
-        ModNetwork.CHANNEL.sendToServer(new NearbyRecipeQueryPacket(activeRequestId, activeSpecs));
+        ModNetwork.CHANNEL.sendToServer(new NearbyRecipeQueryPacket(activeRequestId, selection.activeSpecs));
     }
 
     /** 松开 Z 时提交正向发送、反向取回或「发送到已绑定容器」请求。 */
@@ -907,9 +940,9 @@ public final class RecipeSenderClient {
             cancelSelection("松手时鼠标已不在目标配方上");
             return;
         }
-        if (reverseMode) {
-            if (awaitingAvailability) {
-                releasePending = true;
+        if (selection.reverseMode) {
+            if (selection.awaitingAvailability) {
+                selection.releasePending = true;
                 return;
             }
             sendPullRequest();
@@ -918,22 +951,22 @@ public final class RecipeSenderClient {
         }
 
         Minecraft minecraft = Minecraft.getInstance();
-        if (boundMode) {
+        if (selection.boundMode) {
             finishBoundSelection(minecraft);
             return;
         }
         // 选择的份数超过目标容器能容纳的数量时，按目标容器可容纳的份数发送；
         // 这里重新估算一次，避免使用最多 10 tick 前的旧值。
-        int batches = RecipeMaterialCollector.countInsertableBatches(activeRecipe, minecraft.player,
-                activeContainer.getMenu(), Math.min(selectedBatches, availableBatches));
+        int batches = RecipeMaterialCollector.countInsertableBatches(selection.activeRecipe, minecraft.player,
+                selection.activeContainer.getMenu(), Math.min(selection.selectedBatches, selection.availableBatches));
         RecipeMaterialCollector.CollectionResult result =
-                RecipeMaterialCollector.collect(activeRecipe, minecraft.player, batches);
+                RecipeMaterialCollector.collect(selection.activeRecipe, minecraft.player, batches);
         if (result.success()) {
             // 电路先于材料送达：机器可能在下一个 tick 就按新电路匹配配方，先设电路可以避免抢跑一次。
             sendCircuitRequest();
             List<ItemStack> requirements = result.requirements();
             ModNetwork.CHANNEL.sendToServer(new InsertRecipeItemsPacket(
-                    activeContainer.getMenu().containerId, requirements));
+                    selection.activeContainer.getMenu().containerId, requirements));
         }
         cancelSelection();
     }
@@ -950,23 +983,23 @@ public final class RecipeSenderClient {
     private static void finishBoundSelection(Minecraft minecraft) {
         // 用开始选择时算好的候选（已按配方类别与维度筛过），而不是重新取一遍主容器：
         // 中途可能又绑了新容器，重新筛会得到一份与界面上显示的不一样的候选。
-        List<BoundContainer> candidates = boundCandidates;
+        List<BoundContainer> candidates = selection.boundCandidates;
         if (candidates.isEmpty()) {
             sendMessage(minecraft, getMessage("text.recipe_sender.bound_none",
-                    "还没有绑定容器：对着方块按 B 绑定"));
+                    "还没有绑定容器：对着方块按 B 绑定"), NoticeSeverity.WARN);
             cancelSelection();
             return;
         }
-        int batches = Math.min(selectedBatches, availableBatches);
+        int batches = Math.min(selection.selectedBatches, selection.availableBatches);
         if (batches <= 0) {
             cancelSelection();
             return;
         }
         RecipeMaterialCollector.CollectionResult result =
-                RecipeMaterialCollector.collect(activeRecipe, minecraft.player, batches);
+                RecipeMaterialCollector.collect(selection.activeRecipe, minecraft.player, batches);
         if (!result.success()) {
             // 从背包里凑不齐材料：直接把原因说出来，不要静默什么都不做。
-            sendMessage(minecraft, Component.literal(result.message()));
+            sendMessage(minecraft, Component.literal(result.message()), NoticeSeverity.ERROR);
             cancelSelection();
             return;
         }
@@ -978,7 +1011,7 @@ public final class RecipeSenderClient {
         }
         Screen parent = minecraft.screen;
         // 路由键要在 cancelSelection() 之前取：它清掉的是这次选择的状态。
-        ResourceLocation routeKey = RecipeRouteKeys.primary(activeRecipe);
+        ResourceLocation routeKey = RecipeRouteKeys.primary(selection.activeRecipe);
         cancelSelection();
         minecraft.setScreen(new BoundContainerPickScreen(parent, candidates, requirements, batches, routeKey));
     }
@@ -996,11 +1029,11 @@ public final class RecipeSenderClient {
         if (bindingId == null || requirements.isEmpty() || batches <= 0) {
             return;
         }
-        GtCircuitSupport.CircuitRequirement circuit = resolvedCircuit;
+        GtCircuitSupport.CircuitRequirement circuit = selection.resolvedCircuit;
         int circuitNumber = circuit == null ? GtCircuitSupport.NO_CIRCUIT : circuit.circuit();
         boolean gregRecipe = circuit != null && circuit.gregRecipe();
-        boundRequestId = BOUND_REQUEST_SEQUENCE.incrementAndGet();
-        ModNetwork.CHANNEL.sendToServer(new InsertRecipeItemsToBoundPacket(boundRequestId, bindingId,
+        selection.boundRequestId = BOUND_REQUEST_SEQUENCE.incrementAndGet();
+        ModNetwork.CHANNEL.sendToServer(new InsertRecipeItemsToBoundPacket(selection.boundRequestId, bindingId,
                 requirements, batches, circuitNumber, gregRecipe));
     }
 
@@ -1023,7 +1056,12 @@ public final class RecipeSenderClient {
 
     /** 给玩家显示一条屏幕下方的提示。界面代码拿不到私有发送方法，所以开这个口子。 */
     public static void notifyPlayer(Component text) {
-        sendMessage(Minecraft.getInstance(), text);
+        notifyPlayer(text, NoticeSeverity.INFO);
+    }
+
+    /** 给玩家显示一条指定严重程度的提示。 */
+    public static void notifyPlayer(Component text, NoticeSeverity severity) {
+        sendMessage(Minecraft.getInstance(), text, severity);
     }
 
     /** 判断某个按键事件是不是绑定发送键（带修饰键判定）。 */
@@ -1061,45 +1099,45 @@ public final class RecipeSenderClient {
     private static void sendCircuitRequest() {
         // 绑定模式不走这条：它的电路要求随投放包一起交给服务端（见 sendBoundInsert）。绑定模式下
         // 玩家可能正开着某台机器的界面，走菜单通路会改到「当前开着的机器」而不是「绑定的机器」。
-        if (reverseMode || boundMode || activeCircuit == null || activeContainer == null) {
+        if (selection.reverseMode || selection.boundMode || selection.activeCircuit == null || selection.activeContainer == null) {
             return;
         }
-        if (!GtCircuitSupport.isModularUiContainer(activeContainer.getMenu())) {
+        if (!GtCircuitSupport.isModularUiContainer(selection.activeContainer.getMenu())) {
             return;
         }
-        int containerId = activeContainer.getMenu().containerId;
-        if (activeCircuit.requiresCircuit()) {
+        int containerId = selection.activeContainer.getMenu().containerId;
+        if (selection.activeCircuit.requiresCircuit()) {
             ModNetwork.CHANNEL.sendToServer(new SetContainerCircuitPacket(
-                    containerId, activeCircuit.circuit()));
+                    containerId, selection.activeCircuit.circuit()));
             return;
         }
-        if (activeCircuit.gregRecipe()) {
+        if (selection.activeCircuit.gregRecipe()) {
             ModNetwork.CHANNEL.sendToServer(new ClearContainerCircuitPacket(containerId));
         }
     }
 
     /** 处理服务端返回的周围配方份数。 */
     public static void acceptNearbyAvailability(long requestId, int batches) {
-        if (!selecting || !reverseMode || requestId != activeRequestId) {
+        if (!selection.selecting || !selection.reverseMode || requestId != activeRequestId) {
             return;
         }
-        awaitingAvailability = false;
-        availableBatches = Math.max(0, Math.min(RecipeIngredientSpec.MAX_BATCHES, batches));
-        if (availableBatches == 0) {
-            selectedBatches = 0;
-        } else if (!nearbyAvailabilityReceived) {
-            selectedBatches = selectAllRequested ? availableBatches : 1;
-        } else if (selectedBatches == 0) {
-            selectedBatches = 1;
+        selection.awaitingAvailability = false;
+        selection.availableBatches = Math.max(0, Math.min(RecipeIngredientSpec.MAX_BATCHES, batches));
+        if (selection.availableBatches == 0) {
+            selection.selectedBatches = 0;
+        } else if (!selection.nearbyAvailabilityReceived) {
+            selection.selectedBatches = selection.selectAllRequested ? selection.availableBatches : 1;
+        } else if (selection.selectedBatches == 0) {
+            selection.selectedBatches = 1;
         } else {
-            selectedBatches = Math.min(selectedBatches, availableBatches);
+            selection.selectedBatches = Math.min(selection.selectedBatches, selection.availableBatches);
         }
-        nearbyAvailabilityReceived = true;
+        selection.nearbyAvailabilityReceived = true;
         // 等待期间攒下的滚轮在这里补上；必须在 releasePending 之前，
         // 否则“松手前最后一格”会赶不上这次取回。
         applyPendingScroll();
         nextAvailabilityRefreshTick = clientTicks + AVAILABILITY_REFRESH_INTERVAL_TICKS;
-        if (releasePending) {
+        if (selection.releasePending) {
             sendPullRequest();
             cancelSelection();
         }
@@ -1112,8 +1150,8 @@ public final class RecipeSenderClient {
      * 继续下去只会在松手时拿到一条「绑定不存在」的失败回执，不如当场说清楚。
      */
     public static void onBoundContainersSynced() {
-        if (selecting && boundMode && (activeBinding == null
-                || BoundContainerClient.find(activeBinding.id()) == null)) {
+        if (selection.selecting && selection.boundMode && (selection.activeBinding == null
+                || BoundContainerClient.find(selection.activeBinding.id()) == null)) {
             cancelSelection("绑定的容器已被删除");
         }
     }
@@ -1121,11 +1159,11 @@ public final class RecipeSenderClient {
     /** 处理「发送到已绑定容器」的回执。 */
     public static void acceptBoundInsertResult(long requestId, UUID bindingId, BoundStatus status,
                                                int insertedBatches, int requestedBatches,
-                                               int overflowBatches, String detailKey) {
-        if (requestId != boundRequestId) {
+                                               int overflowBatches, BoundDetail detailReason) {
+        if (requestId != selection.boundRequestId) {
             return;
         }
-        boundRequestId = 0;
+        selection.boundRequestId = 0;
         Minecraft minecraft = Minecraft.getInstance();
         BoundContainer target = BoundContainerClient.find(bindingId);
         String name = target == null ? "已绑定容器" : target.name();
@@ -1134,7 +1172,7 @@ public final class RecipeSenderClient {
             String key = BoundContainerService.describe(status);
             String fallback = "发送失败：目标「" + name + "」不可用";
             sendMessage(minecraft, key == null ? Component.literal(fallback)
-                    : getMessage(key, fallback));
+                    : getMessage(key, fallback), NoticeSeverity.ERROR);
             return;
         }
         if (requestedBatches <= 0) {
@@ -1147,7 +1185,7 @@ public final class RecipeSenderClient {
                 sendMessage(minecraft, getBoundText("text.recipe_sender.bound_sent_overflow",
                         new Object[]{insertedBatches, name, overflowBatches},
                         "已发送 " + insertedBatches + " 份到「" + name + "」，其中 " + overflowBatches
-                                + " 份进了从容器"));
+                                + " 份进了从容器"), NoticeSeverity.WARN);
                 return;
             }
             sendMessage(minecraft, getBoundText("text.recipe_sender.bound_sent",
@@ -1155,8 +1193,8 @@ public final class RecipeSenderClient {
                     "已发送 " + insertedBatches + " 份到「" + name + "」"));
             return;
         }
-        String detail = detailKey == null ? ""
-                : getMessageText(detailKey, detailFallback(detailKey));
+        String detail = detailReason == null ? ""
+                : Lang.text(detailReason.key(), detailFallback(detailReason));
         if (overflowBatches > 0) {
             // 部分送达 + 已有溢出：先把「溢出到从容器的份数」说清楚，再补没发完的原因。
             String overflowNote = getBoundTextText("text.recipe_sender.bound_overflow_note",
@@ -1167,13 +1205,20 @@ public final class RecipeSenderClient {
         sendMessage(minecraft, getBoundText("text.recipe_sender.bound_partial",
                 new Object[]{insertedBatches, requestedBatches, name, detail},
                 "只发出 " + insertedBatches + "/" + requestedBatches + " 份到「" + name + "」："
-                        + detail));
+                        + detail), NoticeSeverity.WARN);
     }
 
-    /** 回执里 detailKey 的中文兜底文案（语言文件缺失时使用）。 */
-    private static String detailFallback(String detailKey) {
-        return detailKey.endsWith("target_full")
-                ? "目标容器放不下（可能已满或不允许该物品）" : "背包材料不足";
+    /**
+     * 回执里补充说明的中文兜底文案（语言文件缺失时使用）。
+     *
+     * <p>用穷尽的 {@code switch} 表达式而不是「按语言键名猜后缀」：以后服务端多出一种没送完的原因，
+     * 这里会直接编译不过，而不是安静地把「目标容器放不下」说成「背包材料不足」。
+     */
+    private static String detailFallback(BoundDetail detail) {
+        return switch (detail) {
+            case TARGET_FULL -> "目标容器放不下（可能已满或不允许该物品）";
+            case MATERIALS -> "背包材料不足";
+        };
     }
 
     /**
@@ -1181,10 +1226,10 @@ public final class RecipeSenderClient {
      * 否则一旦数据包丢失，滚轮和松开按键都会被 awaitingAvailability 永久阻断。
      */
     private static void onAvailabilityTimeout() {
-        awaitingAvailability = false;
+        selection.awaitingAvailability = false;
         applyPendingScroll();
         nextAvailabilityRefreshTick = clientTicks + AVAILABILITY_REFRESH_INTERVAL_TICKS;
-        if (releasePending) {
+        if (selection.releasePending) {
             sendPullRequest();
             cancelSelection();
         }
@@ -1192,8 +1237,8 @@ public final class RecipeSenderClient {
 
     /** 向服务端发送反向取回请求。 */
     private static void sendPullRequest() {
-        if (selectedBatches > 0 && !activeSpecs.isEmpty()) {
-            ModNetwork.CHANNEL.sendToServer(new NearbyRecipePullPacket(selectedBatches, activeSpecs));
+        if (selection.selectedBatches > 0 && !selection.activeSpecs.isEmpty()) {
+            ModNetwork.CHANNEL.sendToServer(new NearbyRecipePullPacket(selection.selectedBatches, selection.activeSpecs));
         }
     }
 
@@ -1214,11 +1259,11 @@ public final class RecipeSenderClient {
      * 选择于是按住没多久就自己中断——表现成“鼠标没动、选择却断了”。
      */
     private static boolean isActiveTarget(EmiStackInteraction hovered) {
-        if (hovered.isEmpty() || activeIngredient == null || activeRecipe == null) {
+        if (hovered.isEmpty() || selection.activeIngredient == null || selection.activeRecipe == null) {
             return false;
         }
-        return sameRecipe(getRecipe(hovered), activeRecipe)
-                && EmiIngredient.areEqual(hovered.getStack(), activeIngredient);
+        return sameRecipe(getRecipe(hovered), selection.activeRecipe)
+                && EmiIngredient.areEqual(hovered.getStack(), selection.activeIngredient);
     }
 
     /**
@@ -1241,23 +1286,58 @@ public final class RecipeSenderClient {
 
     /** 刷新背包可制作份数、目标槽可容纳份数和材料槽位高亮。 */
     private static void refreshInventoryAvailability(Minecraft minecraft) {
-        availableBatches = RecipeMaterialCollector.countAvailableBatches(activeRecipe,
+        selection.availableBatches = RecipeMaterialCollector.countAvailableBatches(selection.activeRecipe,
                 minecraft.player);
-        highlightedInventorySlots = RecipeMaterialCollector.findMatchingInventorySlots(
-                activeRecipe, minecraft.player);
+        selection.highlightedInventorySlots = RecipeMaterialCollector.findMatchingInventorySlots(
+                selection.activeRecipe, minecraft.player);
         // 绑定模式的落点是远程方块，客户端拿不到它的槽位，所以不做容量估计：
         // 报多少份由玩家决定，装不下由服务端回执说明。
-        insertableBatches = boundMode || activeContainer == null ? availableBatches
-                : RecipeMaterialCollector.countInsertableBatches(activeRecipe, minecraft.player,
-                        activeContainer.getMenu(), availableBatches);
+        selection.insertableBatches = selection.boundMode || selection.activeContainer == null ? selection.availableBatches
+                : RecipeMaterialCollector.countInsertableBatches(selection.activeRecipe, minecraft.player,
+                        selection.activeContainer.getMenu(), selection.availableBatches);
         int ceiling = maxSendableBatches();
         if (ceiling == 0) {
-            selectedBatches = 0;
-        } else if (selectedBatches == 0) {
-            selectedBatches = 1;
+            selection.selectedBatches = 0;
+        } else if (selection.selectedBatches == 0) {
+            selection.selectedBatches = 1;
         } else {
-            selectedBatches = Math.min(selectedBatches, ceiling);
+            selection.selectedBatches = Math.min(selection.selectedBatches, ceiling);
         }
+        // 记下这次算的是哪一份内容，好让下一次定时刷新能跳过白算（见 availabilityFingerprint）。
+        lastAvailabilityFingerprint = availabilityFingerprint(minecraft);
+    }
+
+    /**
+     * 背包与目标容器内容的轻量指纹。
+     *
+     * <p>按住发送键期间，上面那次统计每 10 tick 就要重算一遍（每秒两次），而它要遍历背包、
+     * 按配方逐项匹配、再扫一遍目标容器的全部槽位。玩家在两秒之间几乎不可能改变背包内容，
+     * 所以绝大多数刷新都是白算的。
+     *
+     * <p>指纹只按「物品 id + 数量」滚动一个 int，不比较 NBT、不产生任何对象，
+     * 代价远小于那三趟统计；内容一变指纹就变，于是既不会漏掉变化，也不会在没事发生时空转。
+     */
+    private static int availabilityFingerprint(Minecraft minecraft) {
+        int hash = 1;
+        if (minecraft.player != null) {
+            for (int slot = 0; slot < minecraft.player.getInventory().getContainerSize(); slot++) {
+                hash = mixStack(hash, minecraft.player.getInventory().getItem(slot));
+            }
+        }
+        if (selection.activeContainer != null) {
+            for (int slot = 0; slot < selection.activeContainer.getMenu().slots.size(); slot++) {
+                hash = mixStack(hash, selection.activeContainer.getMenu().getSlot(slot).getItem());
+            }
+        }
+        return hash;
+    }
+
+    /** 把一个物品堆折进指纹；空槽不参与（否则槽位编号会被当成内容差异）。 */
+    private static int mixStack(int hash, ItemStack stack) {
+        if (stack.isEmpty()) {
+            return hash;
+        }
+        return hash * 31 + Item.getId(stack.getItem()) * 31 + stack.getCount();
     }
 
     /**
@@ -1265,7 +1345,7 @@ public final class RecipeSenderClient {
      * 正向模式还要受目标容器容量限制。
      */
     private static int maxSendableBatches() {
-        return reverseMode ? availableBatches : Math.min(availableBatches, insertableBatches);
+        return selection.reverseMode ? selection.availableBatches : Math.min(selection.availableBatches, selection.insertableBatches);
     }
 
     /** 绘制当前配方匹配的背包槽位。 */
@@ -1283,7 +1363,7 @@ public final class RecipeSenderClient {
         int outlineAlpha = 190 + pulse;
         for (Slot slot : containerScreen.getMenu().slots) {
             if (slot.container != inventory
-                    || !highlightedInventorySlots.contains(slot.getContainerSlot())) {
+                    || !selection.highlightedInventorySlots.contains(slot.getContainerSlot())) {
                 continue;
             }
             int x = containerScreen.getGuiLeft() + slot.x;
@@ -1298,11 +1378,7 @@ public final class RecipeSenderClient {
 
     /** 生成带语言文件回退文本的数量提示。 */
     private static Component getCountText(String key, int count, String fallbackPrefix) {
-        String text = I18n.get(key, count);
-        if (text.equals(key) || text.startsWith("Format error:")) {
-            return Component.literal(fallbackPrefix + count + "份");
-        }
-        return Component.literal(text);
+        return Lang.message(key, fallbackPrefix + count + "份", count);
     }
 
     /**
@@ -1316,24 +1392,24 @@ public final class RecipeSenderClient {
      *         {@code null}
      */
     private static Component describeCircuitChange() {
-        if (activeCircuit == null) {
+        if (selection.activeCircuit == null) {
             return null;
         }
-        if (boundMode) {
-            if (activeCircuit.requiresCircuit()) {
-                return getCircuitText(activeCircuit.circuit(), true);
+        if (selection.boundMode) {
+            if (selection.activeCircuit.requiresCircuit()) {
+                return getCircuitText(selection.activeCircuit.circuit(), true);
             }
-            return activeCircuit.gregRecipe() ? getCircuitClearText(true) : null;
+            return selection.activeCircuit.gregRecipe() ? getCircuitClearText(true) : null;
         }
-        if (!activeTargetHasCircuit) {
+        if (!selection.activeTargetHasCircuit) {
             // 目标没有电路槽（原版箱子、漏斗等）时什么都不会发，别提示得像是会改电路。
             return null;
         }
-        if (activeCircuit.requiresCircuit()) {
-            return getCircuitText(activeCircuit.circuit(), false);
+        if (selection.activeCircuit.requiresCircuit()) {
+            return getCircuitText(selection.activeCircuit.circuit(), false);
         }
         // 认出了配方对象、且它确实不使用电路：目标有电路槽（上面已判）就会置空。
-        return activeCircuit.gregRecipe() ? getCircuitClearText(false) : null;
+        return selection.activeCircuit.gregRecipe() ? getCircuitClearText(false) : null;
     }
 
     /**
@@ -1343,12 +1419,8 @@ public final class RecipeSenderClient {
      */
     private static Component getCircuitText(int circuit, boolean remote) {
         String key = remote ? "text.recipe_sender.circuit_bound" : "text.recipe_sender.circuit";
-        String text = I18n.get(key, circuit);
-        if (text.equals(key) || text.startsWith("Format error:")) {
-            return Component.literal(remote ? "电路 #" + circuit + "（目标有电路槽时生效）"
-                    : "电路 #" + circuit);
-        }
-        return Component.literal(text);
+        return Lang.message(key, remote ? "电路 #" + circuit + "（目标有电路槽时生效）"
+                : "电路 #" + circuit, circuit);
     }
 
     /**
@@ -1359,11 +1431,7 @@ public final class RecipeSenderClient {
     private static Component getCircuitClearText(boolean remote) {
         String key = remote ? "text.recipe_sender.circuit_bound_clear"
                 : "text.recipe_sender.circuit_clear";
-        String text = I18n.get(key);
-        if (text.equals(key) || text.startsWith("Format error:")) {
-            return Component.literal(remote ? "电路置空（目标有电路槽时生效）" : "电路置空");
-        }
-        return Component.literal(text);
+        return Lang.message(key, remote ? "电路置空（目标有电路槽时生效）" : "电路置空");
     }
 
     /** 根据修饰键和滚轮方向计算新的份数。 */
@@ -1374,7 +1442,7 @@ public final class RecipeSenderClient {
         }
         int direction = scrollDelta > 0 ? 1 : -1;
         if (isAltDown()) {
-            selectAllRequested = true;
+            selection.selectAllRequested = true;
             return ceiling;
         }
         if (isControlDown()) {
@@ -1426,7 +1494,7 @@ public final class RecipeSenderClient {
      * 正常使用时不产生任何日志，需要时把 recipe_sender 的日志级别调到 debug 即可。
      */
     private static void cancelSelection(String reason) {
-        if (selecting) {
+        if (selection.selecting) {
             LOGGER.debug("取消配方选择：{}", reason);
         }
         cancelSelection();
@@ -1434,27 +1502,27 @@ public final class RecipeSenderClient {
 
     /** 清理当前选择状态，防止旧界面或旧请求继续生效。 */
     private static void cancelSelection() {
-        selecting = false;
-        reverseMode = false;
-        boundMode = false;
-        activeBinding = null;
-        boundCandidates = List.of();
-        awaitingAvailability = false;
-        releasePending = false;
-        selectAllRequested = false;
-        nearbyAvailabilityReceived = false;
-        pendingScrollNotches = 0;
-        selectedBatches = 0;
-        availableBatches = 0;
-        insertableBatches = 0;
+        selection.selecting = false;
+        selection.reverseMode = false;
+        selection.boundMode = false;
+        selection.activeBinding = null;
+        selection.boundCandidates = List.of();
+        selection.awaitingAvailability = false;
+        selection.releasePending = false;
+        selection.selectAllRequested = false;
+        selection.nearbyAvailabilityReceived = false;
+        selection.pendingScrollNotches = 0;
+        selection.selectedBatches = 0;
+        selection.availableBatches = 0;
+        selection.insertableBatches = 0;
         activeRequestId = 0;
-        activeScreen = null;
-        activeContainer = null;
-        activeIngredient = null;
-        activeRecipe = null;
-        activeSpecs = List.of();
-        activeCircuit = null;
-        activeTargetHasCircuit = false;
-        highlightedInventorySlots = Set.of();
+        selection.activeScreen = null;
+        selection.activeContainer = null;
+        selection.activeIngredient = null;
+        selection.activeRecipe = null;
+        selection.activeSpecs = List.of();
+        selection.activeCircuit = null;
+        selection.activeTargetHasCircuit = false;
+        selection.highlightedInventorySlots = Set.of();
     }
 }

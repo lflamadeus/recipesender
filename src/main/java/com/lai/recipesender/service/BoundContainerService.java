@@ -40,6 +40,15 @@ public final class BoundContainerService {
     private static final String KEY_LAST_CHOICE = "recipe_sender:last_choice";
 
     /**
+     * 「上次选择」最多记多少条路由键。
+     *
+     * <p>这张表原先没有任何上限，玩得越久键越多（每个用过的配方类别一条），而且随玩家存档永久
+     * 保留。256 条足够覆盖任何玩家真正在用的类别（GT 全类别也就约 250），超出时按 NBT 的无序
+     * 键集合随便丢掉几条最不常用的——丢掉的代价只是「那个类别下次要重新选一次」。</p>
+     */
+    private static final int MAX_LAST_CHOICES = 256;
+
+    /**
      * 「认不出路由键」时的兜底记忆键。
      *
      * <p>S1–S5 没有真实路由键，玩家在弹窗里手选的结果全部记在这一个键下；S6 起自动路由按各自的
@@ -243,7 +252,28 @@ public final class BoundContainerService {
         }
         CompoundTag stored = player.getPersistentData().getCompound(KEY_LAST_CHOICE).copy();
         stored.putString(routeKey.toString(), bindingId.toString());
+        evictOldestChoices(stored, routeKey.toString());
         player.getPersistentData().put(KEY_LAST_CHOICE, stored);
+    }
+
+    /**
+     * 「上次选择」表超过 {@link #MAX_LAST_CHOICES} 时丢掉多余的条目。
+     *
+     * <p>NBT 的复合标签是无序的，没有「写入时间」可依，所以这里丢掉的是任意条目（刚写的这条除外）。
+     * 这是有意的取舍：这张表只是「省一次选择」的便利缓存，丢一条的代价远小于让它随存档无限增长。</p>
+     */
+    private static void evictOldestChoices(CompoundTag stored, String keepKey) {
+        if (stored.getAllKeys().size() <= MAX_LAST_CHOICES) {
+            return;
+        }
+        for (String key : new ArrayList<>(stored.getAllKeys())) {
+            if (stored.getAllKeys().size() <= MAX_LAST_CHOICES) {
+                break;
+            }
+            if (!key.equals(keepKey)) {
+                stored.remove(key);
+            }
+        }
     }
 
     /**
