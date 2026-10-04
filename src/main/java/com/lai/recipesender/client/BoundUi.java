@@ -188,6 +188,17 @@ final class BoundUi {
         return label == null ? 0 : Minecraft.getInstance().font.width(label) + 5 + 2;
     }
 
+    /**
+     * 把存活性文案当普通文字画（不铺底色），返回实际画出来的宽度；正常时返回 0。
+     *
+     * <p>给副标题用：行内标签那一块有可能因为一行太窄而整块不画（名字太长），
+     * 副标题这一行没有按钮抢位置，一定画得出来。</p>
+     */
+    static int aliveText(GuiGraphics graphics, int x, int y, int maxWidth, BoundStatus status) {
+        Component label = aliveLabel(status);
+        return label == null ? 0 : clipText(graphics, label, x, y, maxWidth, aliveTagColor(status));
+    }
+
     /** 坐标的显示形式：{@code (x, y, z)}。 */
     static String posText(BoundContainer binding) {
         var pos = binding.pos();

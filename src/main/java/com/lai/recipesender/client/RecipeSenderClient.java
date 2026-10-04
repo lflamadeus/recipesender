@@ -873,7 +873,7 @@ public final class RecipeSenderClient {
             List<BoundContainer> masters = BoundContainerClient.masters();
             if (masters.isEmpty()) {
                 sendMessage(minecraft, getMessage("text.recipe_sender.bound_none",
-                        "还没有绑定容器：对着方块按 B 绑定"), NoticeSeverity.WARN);
+                        "还没有绑定容器：对着方块按绑定键绑定"), NoticeSeverity.WARN);
                 return;
             }
             // S6 起按配方类别自动路由：只有「勾了这条配方所属类别」的主容器才是候选。
@@ -996,7 +996,7 @@ public final class RecipeSenderClient {
         List<BoundContainer> candidates = selection.boundCandidates;
         if (candidates.isEmpty()) {
             sendMessage(minecraft, getMessage("text.recipe_sender.bound_none",
-                    "还没有绑定容器：对着方块按 B 绑定"), NoticeSeverity.WARN);
+                    "还没有绑定容器：对着方块按绑定键绑定"), NoticeSeverity.WARN);
             cancelSelection();
             return;
         }

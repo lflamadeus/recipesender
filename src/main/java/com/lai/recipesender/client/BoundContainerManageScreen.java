@@ -574,19 +574,26 @@ class BoundContainerManageScreen extends Screen {
             nameWidth = BoundUi.clipText(graphics, Component.literal(displayName(binding)), cursor, y + 4,
                     nameMax, BoundUi.TEXT);
             int tagsX = cursor + nameWidth + 4;
-            if (tagsX + tagsWidth <= rightEdge - reserved) {
-                // 存活性标签排在最前：这一行还能不能用，比「它是什么角色」更要紧。
-                int drawn = BoundUi.aliveTag(graphics, tagsX, y + 3, status);
+            // 存活性标签优先：一行太窄时先放弃角色标签，也不能放弃它——
+            // 「这个绑定还能不能用」比「它是什么角色」重要得多。
+            int drawn = 0;
+            if (aliveWidth > 0 && tagsX + aliveWidth <= rightEdge - reserved) {
+                drawn += BoundUi.aliveTag(graphics, tagsX, y + 3, status);
+            }
+            if (tagsX + drawn + (tagsWidth - aliveWidth) <= rightEdge - reserved) {
                 drawn += BoundUi.tags(graphics, tagsX + drawn, y + 3, binding, parallel, slave, false);
                 // 类别标签只给主容器画：并列成员与从容器跟随父容器，它们身上永远没有类别。
                 if (binding.isMaster() && !binding.routeKeys().isEmpty()) {
                     BoundUi.tag(graphics, tagsX + drawn, y + 3, routeTag(binding), BoundUi.TAG_ROUTE);
                 }
-                // 短标签说不全（「容器已不在」没有解释后果），鼠标停在标签上时补一句整话。
-                if (aliveWidth > 0 && BoundUi.inside(mouseX, mouseY, tagsX, y + 3, aliveWidth - 2, 11)) {
-                    pendingTooltip = BoundUi.aliveTip(status);
-                }
             }
+        }
+
+        // 悬停整行都给说明，而不是只有那个十来像素高的标签条：红底一定会画出来，标签却可能因为
+        // 一行太窄而整块没画，光有红底不给解释最让人摸不着头脑（用户实测反馈）。
+        // 鼠标停在行内按钮上时按钮的提示会覆盖它——drawRowButtons 在本方法末尾才调用。
+        if (aliveWidth > 0 && BoundUi.inside(mouseX, mouseY, x, y, width, height)) {
+            pendingTooltip = BoundUi.aliveTip(status);
         }
 
         int subY = row.indent() ? y + 14 : y + 17;
@@ -597,7 +604,12 @@ class BoundContainerManageScreen extends Screen {
             Component sub = Component.literal(row.indent()
                     ? roleText(binding) + " → " + parentNameOf(binding)
                     : BoundUi.subText(binding));
-            BoundUi.clipText(graphics, sub, x + 20, subY, subMax, BoundUi.TEXT_DIM);
+            int subWidth = BoundUi.clipText(graphics, sub, x + 20, subY, subMax, BoundUi.TEXT_DIM);
+            // 副标题后面再跟一句存活性说明：这一行没有按钮抢位置，一定画得出来，
+            // 于是「红底 + 为什么红」永远同时出现。
+            if (aliveWidth > 0) {
+                BoundUi.aliveText(graphics, x + 20 + subWidth + 4, subY, subMax - subWidth - 4, status);
+            }
         }
 
         if (renaming) {
