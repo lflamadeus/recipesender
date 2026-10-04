@@ -515,8 +515,6 @@ public class BoundContainerBindScreen extends Screen {
         String target = nameBox == null || nameBox.getValue().trim().isEmpty()
                 ? blockName : nameBox.getValue().trim();
         minecraft.setScreen(new CategoryPickerScreen(this, target, blockIcon, pendingRoutes,
-                routes -> pendingRoutes = Set.copyOf(routes),
-                // 右键去 EMI 看类别时选择器会被关掉：把当前勾选先交回来，回来再打开才不会白勾。
                 routes -> pendingRoutes = Set.copyOf(routes)));
     }
 

@@ -1,6 +1,5 @@
 package com.lai.recipesender.client;
 
-import dev.emi.emi.api.EmiApi;
 import dev.emi.emi.api.stack.EmiIngredient;
 import net.minecraft.Util;
 import net.minecraft.client.gui.GuiGraphics;
@@ -42,8 +41,7 @@ import java.util.function.Consumer;
  * 并且和其余绑定界面的观感、鼠标滚轮手感完全一致；{@code ObjectSelectionList} 的行高、内边距
  * 与自绘边框叠在一起反而更难对齐。
  *
- * <p>勾选是「本地改、按确定才落盘」：中途关掉界面等于什么都没发生。行上右键直接把该类别
- * 在 EMI 里打开，方便先看一眼再决定要不要勾。
+ * <p>勾选是「本地改、按确定才落盘」：中途关掉界面等于什么都没发生。
  */
 class CategoryPickerScreen extends Screen {
 
@@ -61,8 +59,6 @@ class CategoryPickerScreen extends Screen {
     private final Screen parent;
     private final String targetName;
     private final Consumer<Set<ResourceLocation>> onConfirm;
-    /** 因为「右键去 EMI 看类别」而关掉界面时，把当前勾选交回父界面用（否则这一轮白勾）。 */
-    private final Consumer<Set<ResourceLocation>> onSuspend;
     private final Set<ResourceLocation> selected;
     private final Set<String> collapsed = new LinkedHashSet<>();
 
@@ -107,20 +103,16 @@ class CategoryPickerScreen extends Screen {
      *                   用来默认筛出「这台机器能跑」的类别
      * @param selected   当前已勾选的类别
      * @param onConfirm  按下确定时的回调；取消不会调用
-     * @param onSuspend  因「右键去 EMI 看类别」而关掉界面时回调，把当前勾选交回父界面；
-     *                   按 Esc / 取消按钮不会调用（那才是真的「这一轮白勾」）
      */
     CategoryPickerScreen(Screen parent, String targetName, ItemStack machine,
                          Set<ResourceLocation> selected,
-                         Consumer<Set<ResourceLocation>> onConfirm,
-                         Consumer<Set<ResourceLocation>> onSuspend) {
+                         Consumer<Set<ResourceLocation>> onConfirm) {
         super(Component.translatable("text.recipe_sender.category_title"));
         this.parent = parent;
         this.targetName = targetName == null ? "" : targetName;
         this.machineItem = machine == null || machine.isEmpty() ? null : machine.getItem();
         this.selected = new LinkedHashSet<>(selected == null ? Set.of() : selected);
         this.onConfirm = onConfirm;
-        this.onSuspend = onSuspend;
     }
 
     @Override
@@ -395,15 +387,10 @@ class CategoryPickerScreen extends Screen {
             }
             return true;
         }
-        if (button == 1) {
-            // 右键 = 先在 EMI 里看一眼这个类别。关掉界面时把当前勾选交回父界面存成草稿：
-            // 原来直接 onClose()，看完回来勾的全没了（m01207 清单第 ② 条）。
-            lastClickRow = -1;
-            onSuspend.accept(Set.copyOf(selected));
-            EmiApi.displayRecipeCategory(row.entry().category());
-            onClose();
-            return true;
-        }
+        // 数据行上右键曾经是「去 EMI 里看一眼这个类别」，已移除：EMI 的 displayRecipeCategory 只在当前
+        // 界面是容器界面 / BoMScreen / RecipeScreen 时才接管，我们这种普通 Screen 上它什么都不做，
+        // 玩家看到的就成了「右键 = 直接返回上一界面」。要让它生效就得先把背后的容器界面交回给 EMI，
+        // 那样我们这一整条界面栈会被 EMI 顶掉（绑定界面里没保存的名字、关系、类别会一起丢），不划算。
         lastClickRow = -1;
         return false;
     }

@@ -242,6 +242,16 @@ public final class RecipeSenderClient {
         return isKeyHeld(BOUND_SEND_KEY);
     }
 
+    /**
+     * 判断「打开管理界面」快捷键当前是否按下。
+     *
+     * <p>用途：界面刚被这个键打开时，那一按（含 key repeat 与抬键那一下）不能当成界面内的输入，
+     * 见 {@code BoundContainerManageScreen.swallowOpeningInput()}。
+     */
+    public static boolean isManageKeyHeld() {
+        return isKeyHeld(MANAGE_KEY);
+    }
+
     /** 读取实时绑定后查询 GLFW 原始状态；改键立即生效，不依赖 Forge 的按键查找表。 */
     private static boolean isKeyHeld(KeyMapping mapping) {
         InputConstants.Key bound = mapping.getKey();

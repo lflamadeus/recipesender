@@ -5,11 +5,11 @@ import com.lai.recipesender.network.ModNetwork;
 import com.lai.recipesender.network.packet.UnbindContainerPacket;
 import com.lai.recipesender.network.packet.UpdateBindingPacket;
 import com.lai.recipesender.network.packet.UpdateBindingRoutesPacket;
+import net.minecraft.Util;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
-import net.minecraft.resources.ResourceLocation;
 import org.lwjgl.glfw.GLFW;
 
 import java.util.ArrayList;
@@ -58,6 +58,8 @@ class BoundContainerManageScreen extends Screen {
     private static final int SPACER_HEIGHT = 6;
     private static final int DELETE_CONFIRM_TICKS = 60;
     private static final int TOOLBAR_BUTTON_WIDTH = 56;
+    /** 打开界面后的键盘静默期，见 {@link #swallowOpeningInput()}。 */
+    private static final long OPEN_INPUT_GRACE_MS = 250L;
 
     private final Screen parent;
 
@@ -106,15 +108,8 @@ class BoundContainerManageScreen extends Screen {
     /** 本帧悬停中的行内按钮提示，最后统一画（画早了会被后画的控件盖住）。 */
     private Component pendingTooltip;
 
-    /**
-     * 类别选择器的草稿：在类别界面里右键去 EMI 看类别时，那一轮的勾选交回来存这里。
-     *
-     * <p>只在「同一个容器、上一次是被右键打断的」时生效，而且**用一次就清掉**：之后无论确定
-     * 还是取消，再打开都以服务端数据为准。否则一次右键留下的草稿会一直压着真实勾选，
-     * 玩家在界面里取消掉的东西下次打开又冒出来。</p>
-     */
-    private UUID categoryDraftId;
-    private Set<ResourceLocation> categoryDraft = Set.of();
+    /** 打开时刻，配合 {@link #OPEN_INPUT_GRACE_MS} 用。 */
+    private long openedAt;
 
     private int left;
     private int top;
@@ -139,6 +134,8 @@ class BoundContainerManageScreen extends Screen {
         // 重建控件前先把焦点交还：init() 之后输入栏都是新对象，焦点却还挂在上一个对象上，
         // 之后「点到框里没有」的判定就会错位。正在改名时这一下会让改名框失焦，按「失焦即确认」提交。
         setFocused(null);
+        // 记下打开时刻：开界面那一按的字符事件会落到下面刚建出来的搜索框上（见 swallowOpeningInput）。
+        openedAt = Util.getMillis();
         panelWidth = Math.min(PANEL_MAX_WIDTH, width - PANEL_MARGIN * 2);
         panelHeight = Math.min(height - PANEL_MARGIN, 320);
         left = (width - panelWidth) / 2;
@@ -744,18 +741,10 @@ class BoundContainerManageScreen extends Screen {
         if (minecraft == null) {
             return;
         }
-        // 上次是「右键去 EMI」打断的话，用存下来的草稿当初始值（见 categoryDraft 的说明）。
-        Set<ResourceLocation> initial = binding.id().equals(categoryDraftId)
-                ? categoryDraft : binding.routeKeys();
-        categoryDraftId = null;
-        categoryDraft = Set.of();
-        minecraft.setScreen(new CategoryPickerScreen(this, binding.name(), binding.iconItem(), initial,
+        minecraft.setScreen(new CategoryPickerScreen(this, binding.name(), binding.iconItem(),
+                binding.routeKeys(),
                 routes ->
-                        ModNetwork.CHANNEL.sendToServer(new UpdateBindingRoutesPacket(binding.id(), routes)),
-                routes -> {
-                    categoryDraftId = binding.id();
-                    categoryDraft = Set.copyOf(routes);
-                }));
+                        ModNetwork.CHANNEL.sendToServer(new UpdateBindingRoutesPacket(binding.id(), routes))));
     }
 
     private void beginRename(BoundContainer binding) {
@@ -906,7 +895,7 @@ class BoundContainerManageScreen extends Screen {
         }
         // 打字即聚焦搜索框：打开界面直接敲字就能搜，不必先用鼠标点一下输入框。
         // （不改成 setInitialFocus 是有意的：搜索框一开场就聚焦，E 关界面会被输入框吃掉。）
-        if (BoundUi.shouldTypeToSearch(this, keyCode)) {
+        if (!swallowOpeningInput() && BoundUi.shouldTypeToSearch(this, keyCode)) {
             BoundUi.focus(this, searchBox);
         }
         return super.keyPressed(keyCode, scanCode, modifiers);
@@ -917,10 +906,29 @@ class BoundContainerManageScreen extends Screen {
         return (searchBox != null && searchBox.isFocused()) || (renameBox != null && renameBox.isFocused());
     }
 
+    /**
+     * 打开界面的那一按（以及它的抬键、连发）不能当成搜索输入。
+     *
+     * <p>管理界面是用键盘快捷键开的（默认 Ctrl+B）：这一按的字符事件会落到 {@code init()} 刚建出来的
+     * 搜索框上，界面一打开搜索框里就自带一个字母。这里在「快捷键还按着」与「刚打开的头
+     * {@value #OPEN_INPUT_GRACE_MS} 毫秒」两个窗口里丢掉键盘输入；鼠标点击不受影响，玩家想搜索
+     * 仍然点一下输入框就能打字。
+     */
+    private boolean swallowOpeningInput() {
+        if (RecipeSenderClient.isManageKeyHeld()) {
+            return true;
+        }
+        return Util.getMillis() - openedAt < OPEN_INPUT_GRACE_MS;
+    }
+
     @Override
     public boolean charTyped(char codePoint, int modifiers) {
         if (renameBox != null) {
             return renameBox.charTyped(codePoint, modifiers);
+        }
+        // 静默期放在改名框之后：init() 在改窗口大小时也会跑，不能让静默期吃掉正在改名的输入。
+        if (swallowOpeningInput()) {
+            return true;
         }
         // 输入法常常只发 charTyped 不发可识别的 keyPressed，这里再补一次聚焦。
         if (searchBox != null && getFocused() != searchBox && !Character.isISOControl(codePoint)) {
