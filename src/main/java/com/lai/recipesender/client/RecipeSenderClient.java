@@ -236,14 +236,6 @@ public final class RecipeSenderClient {
         boolean awaitingAvailability;
         boolean releasePending;
         boolean selectAllRequested;
-        /**
-         * 本次选择是不是「按住模式键再按 1」拉起来的。
-         *
-         * <p>与 {@link #selectAllRequested} 的区别：那个是「这次要全部份数」的意图（1 或 Alt 按住过就算），
-         * 这个是「1 就是这次选择的起停键」——只有它才让 1 的松手去结束选择。1 单独按下不算：
-         * 容器界面里按 1 是原版的换快捷栏物品，鼠标恰好悬在配方上时不该顺手发出去。
-         */
-        boolean fillAllTriggered;
         boolean nearbyAvailabilityReceived;
         boolean bindingLogged;
         /**
@@ -375,16 +367,6 @@ public final class RecipeSenderClient {
         return isKeyHeld(INSERT_RECIPE_KEY) || isKeyHeld(DIRECT_KEY);
     }
 
-    /**
-     * 三个模式键（直达 / 反转 / 绑定发送）此刻有没有按住的。
-     *
-     * <p>用于「按住模式键再按 1」这条起停入口：有模式键按着说明玩家正在做一次发送，
-     * 这时 1 就不再是原版的换快捷栏物品，而是「按全部数量发出去」。
-     */
-    private static boolean isModeKeyHeld() {
-        return isKeyHeld(DIRECT_KEY) || isKeyHeld(REVERSE_KEY) || isKeyHeld(BOUND_SEND_KEY);
-    }
-
     /** 这个鼠标按钮号是不是绑到了给定的键位（不看冲突上下文）。 */
     private static boolean isBoundMouseButton(KeyMapping mapping, int button) {
         return mapping.getKey().getType() == InputConstants.Type.MOUSE
@@ -411,27 +393,10 @@ public final class RecipeSenderClient {
             selection.selectedBatches = maxSendableBatches();
             return;
         }
-        // 1.0.43：1 除了「按住它再按 Z」，也能反过来当起停键——按住模式键（发送 / 反转 / 直达）再按 1，
-        // 这一次选择直接按「全部数量」跑完，不必把 1 按在 Z 前面。
-        // 只认 1 本身（不是 Alt），而且要求至少有一个模式键按着：容器界面里按 1 是原版的换快捷栏物品，
-        // 鼠标恰好悬在 EMI 配方上时不该顺手把材料发出去，所以 1 单独按下不接管。
-        // 松手收尾沿用 Z 那条规则：Z / 直达键还有按着的就先不收（玩家可能先松其中一个）。
-        if (event.getKey() == FILL_ALL_KEY) {
-            if (event.getAction() == GLFW.GLFW_PRESS && !selection.selecting && isModeKeyHeld()) {
-                beginSelection();
-                if (selection.selecting) {
-                    // beginSelection() 里已经按 isFillAllDown() 把 selectAllRequested 置成了 true
-                    // （1 正按住）；这里补记「这次选择由 1 起停」，松手时才知道该收尾。
-                    selection.fillAllTriggered = true;
-                }
-                return;
-            }
-            if (event.getAction() == GLFW.GLFW_RELEASE && selection.selecting
-                    && selection.fillAllTriggered && !isSelectionKeyHeld()) {
-                finishSelection();
-                return;
-            }
-        }
+        // 1 与 Alt 只负责「把份数顶满」，永远不会起停一次发送：松手发送这件事只由功能键
+        // （Z / 直达键，鼠标绑定同理）负责。上面那条分支已经把「选择期间按下 1 / Alt = 顶满」
+        // 处理掉了，所以这里对 1 不需要再做任何事——没起选择时按 1 的语义属于原版
+        // （容器界面里换快捷栏物品），模组不该接管。
         // 1.0.34：直达键与 Z 等价——按住直达键就当成按住 Z，玩家不必再额外按 Z。
         // 两个键共用同一条起停分支，松手时要求「两个都没按住」才结束：玩家可能先松其中一个。
         if (INSERT_RECIPE_KEY.matches(event.getKey(), event.getScanCode())
@@ -650,16 +615,11 @@ public final class RecipeSenderClient {
             // 此刻是否还按着），而玩家完全可能是「先按 1 松手、再补按模式键」——标记就丢了。
             // 这里显式把它保住：意图只置位不撤销，和 ignoreFluids 是同一个道理。
             boolean keepAll = selection.selectAllRequested;
-            boolean keepFillAllTriggered = selection.fillAllTriggered;
             cancelSelection("发送模式已提升");
             beginSelection();
-            if (selection.selecting) {
-                if (keepAll) {
-                    selection.selectAllRequested = true;
-                    selection.selectedBatches = maxSendableBatches();
-                }
-                // 这次选择本来就是 1 拉起来的：换了个模式之后仍该由 1 的松手收尾。
-                selection.fillAllTriggered = keepFillAllTriggered;
+            if (keepAll && selection.selecting) {
+                selection.selectAllRequested = true;
+                selection.selectedBatches = maxSendableBatches();
             }
             return;
         }
@@ -2130,7 +2090,6 @@ public final class RecipeSenderClient {
         selection.awaitingAvailability = false;
         selection.releasePending = false;
         selection.selectAllRequested = false;
-        selection.fillAllTriggered = false;
         selection.nearbyAvailabilityReceived = false;
         selection.pendingScrollNotches = 0;
         selection.selectedBatches = 0;
