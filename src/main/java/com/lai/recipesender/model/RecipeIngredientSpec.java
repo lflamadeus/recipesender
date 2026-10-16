@@ -6,9 +6,13 @@ import net.minecraft.world.item.ItemStack;
 import java.util.ArrayList;
 import java.util.List;
 
-/** 与具体配方查看器解耦的物品输入描述。 */
+/**
+ * 与具体配方查看器解耦的物品输入描述。
+ *
+ * <p>份数上限不在这里：它是配置项 {@code maxBatches}
+ * （见 {@code com.lai.recipesender.config.RecipeSenderConfig#maxBatches()}，默认 8192）。
+ */
 public record RecipeIngredientSpec(int amountPerBatch, boolean wildcard, List<ItemStack> options) {
-    public static final int MAX_BATCHES = 512;
     public static final int MAX_INGREDIENTS = 64;
     public static final int MAX_OPTIONS = 32;
 

@@ -27,7 +27,7 @@ import java.util.function.Supplier;
  * 绑一个已经绑过的坐标时，没打开类别选择器不该把原有类别清空。
  */
 public record BindContainerPacket(ResourceLocation dimension, BlockPos pos, String name,
-                                  BoundContainer.Role role, UUID parentId,
+                                  BoundContainer.Role role, BoundContainer.Kind kind, UUID parentId,
                                   Set<ResourceLocation> routeKeys) {
     /** 名称长度上限，与 {@code BoundContainer.MAX_NAME_LENGTH} 保持一致。 */
     public static final int MAX_NAME_LENGTH = 32;
@@ -40,6 +40,7 @@ public record BindContainerPacket(ResourceLocation dimension, BlockPos pos, Stri
         buffer.writeBlockPos(packet.pos);
         buffer.writeUtf(packet.name == null ? "" : packet.name, MAX_NAME_LENGTH);
         buffer.writeEnum(packet.role == null ? BoundContainer.Role.MASTER : packet.role);
+        buffer.writeEnum(packet.kind == null ? BoundContainer.Kind.ITEM_TARGET : packet.kind);
         buffer.writeBoolean(packet.parentId != null);
         if (packet.parentId != null) {
             buffer.writeUUID(packet.parentId);
@@ -57,6 +58,7 @@ public record BindContainerPacket(ResourceLocation dimension, BlockPos pos, Stri
         BlockPos pos = buffer.readBlockPos();
         String name = buffer.readUtf(MAX_NAME_LENGTH);
         BoundContainer.Role role = buffer.readEnum(BoundContainer.Role.class);
+        BoundContainer.Kind kind = buffer.readEnum(BoundContainer.Kind.class);
         UUID parentId = buffer.readBoolean() ? buffer.readUUID() : null;
         int routeCount = buffer.readVarInt();
         if (routeCount < 0 || routeCount > MAX_ROUTES) {
@@ -66,7 +68,7 @@ public record BindContainerPacket(ResourceLocation dimension, BlockPos pos, Stri
         for (int index = 0; index < routeCount; index++) {
             routes.add(buffer.readResourceLocation());
         }
-        return new BindContainerPacket(dimension, pos, name, role, parentId, routes);
+        return new BindContainerPacket(dimension, pos, name, role, kind, parentId, routes);
     }
 
     /** 交给服务端主线程落盘并回推同步包。 */

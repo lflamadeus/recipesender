@@ -15,7 +15,29 @@ public enum BoundDetail {
     TARGET_FULL("text.recipe_sender.bound_detail.target_full"),
 
     /** 背包里的材料凑不齐这次发送。 */
-    MATERIALS("text.recipe_sender.bound_detail.materials");
+    MATERIALS("text.recipe_sender.bound_detail.materials"),
+
+    /** 配方带流体，但玩家没有绑定流体中枢（或中枢所在区块没加载）。 */
+    NO_FLUID_HUB("text.recipe_sender.bound_detail.no_fluid_hub"),
+
+    /** 配方带流体，但目标容器一个能装流体的都没有（比如只有物品输入总线）。 */
+    NO_FLUID_TARGET("text.recipe_sender.bound_detail.no_fluid_target"),
+
+    /** 配方带流体，中枢里的流体不够这次要发的份数。 */
+    FLUID_SHORT("text.recipe_sender.bound_detail.fluid_short"),
+
+    /** 主容器与全部并列成员都在跑配方，这一组一台空闲机器都没有：一份都没投，电路也没动。 */
+    ALL_BUSY("text.recipe_sender.bound_detail.all_busy"),
+
+    /** 有机器在跑、被跳过了（既不投料也不改电路），剩下的空闲机器装不下全部份数。 */
+    MACHINES_BUSY("text.recipe_sender.bound_detail.machines_busy"),
+
+    /**
+     * 整体模式的组里，正在跑的机器电路与本次发配的电路不一致：整单取消。
+     *
+     * <p>一台机器的电路都不动、一份材料都不投（也不抽），玩家要先把电路对齐再发。
+     */
+    GROUP_CIRCUIT_MISMATCH("text.recipe_sender.bound_detail.group_circuit_mismatch");
 
     private final String key;
 

@@ -1,8 +1,12 @@
 package com.lai.recipesender.integration.findme;
 
+import com.lai.recipesender.config.RecipeSenderConfig;
+import com.lai.recipesender.model.RecipeFluidSpec;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.InteractionHand;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.ChestBlock;
@@ -10,8 +14,15 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.ChestType;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.Vec3;
+import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.common.capabilities.Capability;
 import net.minecraftforge.common.capabilities.ForgeCapabilities;
+import net.minecraftforge.common.util.LazyOptional;
+import net.minecraftforge.event.entity.player.PlayerInteractEvent;
+import net.minecraftforge.fluids.FluidStack;
+import net.minecraftforge.fluids.capability.IFluidHandler;
 import net.minecraftforge.fml.ModList;
 import net.minecraftforge.items.IItemHandler;
 import net.minecraftforge.items.ItemHandlerHelper;
@@ -27,6 +38,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 
 /** 隔离 FindMeExtended 和 AE2 的可选兼容逻辑。 */
@@ -34,7 +46,8 @@ public final class FindMeExtendedAdapter {
     private static final Logger LOGGER = LoggerFactory.getLogger("recipe_sender");
     private static final String FIND_ME_ID = "findmeextended";
     private static final String AE2_ID = "ae2";
-    private static final int MAX_SAFE_RADIUS = 32;
+    /** 读不到 FindMeExtended 半径配置时使用的兜底半径。 */
+    private static final int FALLBACK_RADIUS = 8;
     /**
      * FindMeExtended 的包名候选，按新到旧排列。
      * <p>
@@ -145,9 +158,12 @@ public final class FindMeExtendedAdapter {
      * 快照周围容器和 AE2 存储中的物品，用于服务端配方数量计算。
      *
      * @param containerFilter 返回 {@code false} 的坐标会被跳过（例如黑名单里的容器），既不统计也不提取
+     * @param relevant        返回 {@code false} 的物品不进快照，也不会被模拟抽取（见
+     *                        {@link #copyHandlerContents(IItemHandler, List, Predicate)}）
      */
     public static List<ItemStack> snapshotNearby(ServerPlayer player,
-                                                 Predicate<BlockPos> containerFilter) {
+                                                 Predicate<BlockPos> containerFilter,
+                                                 Predicate<ItemStack> relevant) {
         ReflectionAccess reflection = getAccess();
         if (player == null || reflection == null) {
             return List.of();
@@ -167,7 +183,7 @@ public final class FindMeExtendedAdapter {
             if (!reflection.collectAe2Snapshots(blockEntity, physicalStorages, networkStorages,
                     visitedAe2Storages)) {
                 blockEntity.getCapability(ForgeCapabilities.ITEM_HANDLER, null)
-                        .ifPresent(handler -> copyHandlerContents(handler, result));
+                        .ifPresent(handler -> copyHandlerContents(handler, result, relevant));
             }
         }
         reflection.appendAe2Stacks(physicalStorages, networkStorages, result);
@@ -203,13 +219,258 @@ public final class FindMeExtendedAdapter {
         return pulled;
     }
 
-    /** 复制 Forge 物品处理器的内容，不修改容器状态。 */
-    private static void copyHandlerContents(IItemHandler handler, List<ItemStack> output) {
+    /**
+     * 与 FindMeExtended 完全一致的「这个方块玩家能不能交互」判定。
+     * <p>
+     * 反转模式的取回把物品交给 FindMeExtended 的提取器，而它的提取器在动手前会问一遍这件事——
+     * 领地、锁箱之类的保护模组正是靠取消 {@code RightClickBlock} 拦住玩家的。直达模式自己抽料、
+     * 自己插回，绕过了那道闸门，于是本该打不开的容器也能被搬空。这里照抄它的做法：按同样的参数
+     * 发一个事件，没人取消就当玩家能碰。
+     * <p>
+     * 事件参数刻意与 FindMeExtended 逐字对齐（主手、{@code Vec3.ZERO}、{@code Direction.UP}、
+     * 不命中内部），保护模组收到的请求与反转模式那次一模一样，不会出现「反转拿不到、直达却拿得到」。
+     */
+    public static boolean canInteract(ServerPlayer player, BlockEntity blockEntity) {
+        if (player == null || blockEntity == null) {
+            return false;
+        }
+        Level level = blockEntity.getLevel();
+        if (level == null) {
+            return false;
+        }
+        BlockPos pos = blockEntity.getBlockPos();
+        PlayerInteractEvent.RightClickBlock event = new PlayerInteractEvent.RightClickBlock(player,
+                InteractionHand.MAIN_HAND, pos,
+                new BlockHitResult(new Vec3(0, 0, 0), Direction.UP, pos, false));
+        return !MinecraftForge.EVENT_BUS.post(event);
+    }
+
+    /**
+     * 读一个方块实体的流体内容，供「流体中枢」规划用。
+     * <p>
+     * 与物品快照同一套优先级：AE2 存储视图优先（ME 驱动器里的流体元件、挂在网络上的储罐都算），
+     * 读不到再看 Forge 流体能力（格雷的流体仓、原版流体容器）。读操作不经过
+     * {@link #canInteract} 保护门——统计每 10 tick 跑一次，反复发交互事件会给保护类模组刷噪音，
+     * 真正抽不动时由直达的差额提示如实报出。
+     */
+    public static List<FluidStack> hubFluids(BlockEntity blockEntity) {
+        if (blockEntity == null) {
+            return List.of();
+        }
+        ReflectionAccess reflection = getAccess();
+        if (reflection != null) {
+            List<FluidStack> fluids = reflection.fluids(blockEntity);
+            if (!fluids.isEmpty()) {
+                return fluids;
+            }
+        }
+        return forgeFluidContents(blockEntity);
+    }
+
+    /**
+     * 这个方块实体能不能当流体中枢。
+     * <p>
+     * 判定刻意宽松：AE2 存储视图一律算数（驱动器里有没有流体元件只有抽的时候才知道），
+     * 有 Forge 流体能力的方块也算数。绑定时用这个判定替掉物品的「没有容器就拒绝」。
+     */
+    public static boolean hasFluidSource(BlockEntity blockEntity) {
+        if (blockEntity == null) {
+            return false;
+        }
+        // 纯 Forge 流体罐不经过任何反射，所以先单独判一次：FindMeExtended 缺失或兼容层
+        // 初始化失败时（反射对象为 null），普通储罐仍然应该能当流体中枢。
+        if (forgeFluidHandler(blockEntity) != null) {
+            return true;
+        }
+        ReflectionAccess reflection = getAccess();
+        return reflection != null && reflection.hasFluidSource(blockEntity);
+    }
+
+    /** 取一个方块实体的 Forge 流体能力（先试无面，再逐个面）；没有时返回 {@code null}。 */
+    public static IFluidHandler fluidHandlerOf(BlockEntity blockEntity) {
+        if (blockEntity == null) {
+            return null;
+        }
+        ReflectionAccess reflection = getAccess();
+        if (reflection != null) {
+            IFluidHandler handler = reflection.fluidHandler(blockEntity);
+            if (handler != null) {
+                return handler;
+            }
+        }
+        return forgeFluidHandler(blockEntity);
+    }
+
+    /**
+     * 纯 Forge 流体能力查找，不依赖 FindMeExtended 与 AE2 的反射对象。
+     *
+     * <p>与物品侧同一条规矩：先试无面再遍历六个面，格雷机器按面分发能力，先试无面能同时
+     * 覆盖「不看面的储罐」与「只认自己那几个面的机器」。
+     */
+    private static IFluidHandler forgeFluidHandler(BlockEntity blockEntity) {
+        IFluidHandler direct = unwrapFluid(blockEntity.getCapability(ForgeCapabilities.FLUID_HANDLER, null));
+        if (direct != null) {
+            return direct;
+        }
+        for (Direction side : Direction.values()) {
+            IFluidHandler sided = unwrapFluid(blockEntity.getCapability(ForgeCapabilities.FLUID_HANDLER, side));
+            if (sided != null) {
+                return sided;
+            }
+        }
+        return null;
+    }
+
+    private static IFluidHandler unwrapFluid(LazyOptional<IFluidHandler> optional) {
+        return optional != null && optional.isPresent() ? optional.orElse(null) : null;
+    }
+
+    /** 直接读 Forge 流体罐里的内容，用于反射对象不可用的兜底。 */
+    private static List<FluidStack> forgeFluidContents(BlockEntity blockEntity) {
+        IFluidHandler handler = forgeFluidHandler(blockEntity);
+        if (handler == null) {
+            return List.of();
+        }
+        List<FluidStack> fluids = new ArrayList<>();
+        try {
+            for (int tank = 0; tank < handler.getTanks(); tank++) {
+                FluidStack stack = handler.getFluidInTank(tank);
+                if (stack != null && !stack.isEmpty()) {
+                    fluids.add(stack.copy());
+                }
+            }
+        } catch (RuntimeException exception) {
+            LOGGER.debug("读取方块实体 {} 的流体罐失败", blockEntity.getBlockPos(), exception);
+        }
+        return List.copyOf(fluids);
+    }
+
+    /** 直接从 Forge 流体罐里抽流体，用于反射对象不可用的兜底。 */
+    private static int forgeDrain(BlockEntity blockEntity, FluidStack requirement, int amount,
+                                  List<FluidStack> output) {
+        IFluidHandler handler = forgeFluidHandler(blockEntity);
+        if (handler == null) {
+            return 0;
+        }
+        try {
+            FluidStack drained = handler.drain(
+                    new FluidStack(requirement.getFluid(), amount, requirement.getTag()),
+                    IFluidHandler.FluidAction.EXECUTE);
+            if (drained != null && !drained.isEmpty()) {
+                output.add(drained.copy());
+                return drained.getAmount();
+            }
+        } catch (RuntimeException exception) {
+            LOGGER.debug("从方块实体 {} 抽流体失败", blockEntity.getBlockPos(), exception);
+        }
+        return 0;
+    }
+
+    /**
+     * 从一个方块实体里抽出指定流体，抽到的追加到 {@code output}。
+     *
+     * @return 实际抽出的 mB 数
+     */
+    public static int drainFluid(ServerPlayer player, BlockEntity blockEntity, FluidStack requirement,
+                                 int amount, List<FluidStack> output) {
+        if (player == null || blockEntity == null || output == null
+                || requirement == null || requirement.isEmpty() || amount <= 0) {
+            return 0;
+        }
+        // 与物品同一条保护门：受保护模组拦下的容器不算可交互，不能从里面抽流体。
+        if (!canInteract(player, blockEntity)) {
+            return 0;
+        }
+        ReflectionAccess reflection = getAccess();
+        if (reflection != null) {
+            int taken = reflection.drainFluid(blockEntity, player, requirement, amount, output);
+            if (taken > 0) {
+                return taken;
+            }
+        }
+        return forgeDrain(blockEntity, requirement, amount, output);
+    }
+
+    /**
+     * 一次扫描周围容器后把材料直接抽进 {@code output}，<b>不经过玩家背包</b>。
+     * <p>
+     * 直达模式要的是「周围容器 → 绑定容器」：材料在服务端主线程上从一个容器搬进另一个容器，
+     * 中间不落背包，也就不该受背包空位、掉落物和背包合并的影响。FindMeExtended 的提取器做不到
+     * 这一点——它内部一律 {@code giveItemToPlayer}，所以这条路自己走 AE2 存储和 Forge 物品处理器。
+     * 代价是只认这两条通路：别的模组注册给 FindMeExtended 的专用提取器在直达模式里用不上，
+     * 那些容器里的材料会被算作「周围材料不足」而不是搬错地方。
+     *
+     * @param output 抽出来的材料按抽取顺序追加到这里；调用方负责把没投出去的部分还回去
+     * @return 每种材料实际抽出的数量，顺序与 {@code requirements} 一致
+     */
+    public static int[] pullAllTo(ServerPlayer player, List<ItemStack> requirements,
+                                  Predicate<BlockPos> containerFilter, List<ItemStack> output) {
+        ReflectionAccess reflection = getAccess();
+        int[] pulled = new int[requirements.size()];
+        if (player == null || reflection == null || output == null || requirements.isEmpty()) {
+            return pulled;
+        }
+        List<BlockEntity> containers = reflection.collectNearbyBlockEntities(player, containerFilter);
+        if (containers.isEmpty()) {
+            return pulled;
+        }
+        for (int index = 0; index < requirements.size(); index++) {
+            ItemStack requirement = requirements.get(index);
+            if (requirement.isEmpty() || requirement.getCount() <= 0) {
+                continue;
+            }
+            pulled[index] = reflection.extractTo(containers, player,
+                    requirement.copyWithCount(1), requirement.getCount(), output);
+        }
+        return pulled;
+    }
+
+    /**
+     * 复制 Forge 物品处理器的内容，不修改容器状态。
+     * <p>
+     * 只统计与本次配方相关、且抽得出来的槽位。这份快照既决定「周围现有 N 份」，又决定取回时挑哪些
+     * 物品堆当候选，把抽不出的槽位算进去就会显示虚高的份数，取回时那一项还只能静默失败。格雷机器的
+     * 输入槽和输入总线正是「看得见、取不出」：{@code getStackInSlot} 没有闸门，而 {@code extractItem}
+     * 在 {@code canCapOutput()} 为假时直接返回空（输入槽的能力 IO 是 {@code IO.IN}）。
+     * 模拟抽取能预言取回的结果，因为取回通路最终调用的也是 {@code extractItem}。
+     * <p>
+     * 判据是槽位行为而不是容器类型：GT 按面合并 trait，同一台机器的输入槽和输出槽可能来自
+     * 同一个处理器，而输出槽（{@code IO.OUT}）是抽得出来的，整块排除会误伤。
+     * <p>
+     * 模拟抽取只对 {@code relevant} 放行的物品做，因为别人的处理器可能在模拟抽取时改自己的状态：
+     * GTO 的无人机仓把无人机列表（{@code Drone[]}）挂在物品处理器上，它的 {@code extractItem}
+     * 不看 {@code simulate} 就先把缓存清空，于是「这份无人机取得出来吗」这一问会让无人机控制中心
+     * 再也看不到仓里的无人机（1.0.37 修）。只探与本次配方相关的物品，就不会再去碰那些和本次取回
+     * 毫无关系的槽位——无人机、机器里的电路之类永远不可能出现在配方材料里。
+     *
+     * @param relevant 返回 {@code false} 的物品既不计入快照，也不做模拟抽取
+     */
+    private static void copyHandlerContents(IItemHandler handler, List<ItemStack> output,
+                                            Predicate<ItemStack> relevant) {
         for (int slot = 0; slot < handler.getSlots(); slot++) {
             ItemStack stack = handler.getStackInSlot(slot);
-            if (!stack.isEmpty()) {
-                output.add(stack.copy());
+            if (stack.isEmpty() || !relevant.test(stack)) {
+                continue;
             }
+            if (!canExtract(handler, slot)) {
+                continue;
+            }
+            output.add(stack.copy());
+        }
+    }
+
+    /**
+     * 模拟抽取一个槽位，判断这份材料是否真的取不回来。
+     * <p>
+     * 调用方必须先确认这份物品与本次配方相关（见 {@link #copyHandlerContents}）：模拟抽取不是
+     * 纯查询，别人的 {@code extractItem} 可能顺手改自己的状态。
+     */
+    private static boolean canExtract(IItemHandler handler, int slot) {
+        try {
+            return !handler.extractItem(slot, 1, true).isEmpty();
+        } catch (RuntimeException exception) {
+            LOGGER.debug("模拟抽取槽位 {} 失败，本次不统计该槽位", slot, exception);
+            return false;
         }
     }
 
@@ -263,6 +524,8 @@ public final class FindMeExtendedAdapter {
             Method storageContentsMethod,
             Class<?> ae2ItemKeyClass,
             Method ae2ItemKeyToStackMethod,
+            Class<?> ae2FluidKeyClass,
+            Method ae2FluidKeyToStackMethod,
             Class<?> ae2ChestOrDriveClass,
             Method ae2IsPoweredMethod,
             Method ae2CellCountMethod,
@@ -289,7 +552,8 @@ public final class FindMeExtendedAdapter {
 
             if (!ModList.get().isLoaded(AE2_ID)) {
                 return new ReflectionAccess(common, radius, extractorList, pull,
-                        null, null, null, null, null, null, null, null, null, null, null, null, null);
+                        null, null, null, null, null, null, null, null, null, null, null, null, null,
+                        null, null);
             }
 
             try {
@@ -301,6 +565,16 @@ public final class FindMeExtendedAdapter {
                 Method storageContents = storageClass.getMethod("getAvailableStacks");
                 Class<?> itemKeyClass = Class.forName("appeng.api.stacks.AEItemKey");
                 Method toStack = itemKeyClass.getMethod("toStack", int.class);
+
+                // 流体键只在「流体中枢」用到，解析不了就只关掉流体这一条路，物品支持照常。
+                Class<?> fluidKeyClass = null;
+                Method fluidToStack = null;
+                try {
+                    fluidKeyClass = Class.forName("appeng.api.stacks.AEFluidKey");
+                    fluidToStack = fluidKeyClass.getMethod("toStack", int.class);
+                } catch (ReflectiveOperationException exception) {
+                    LOGGER.warn("未找到 appeng.api.stacks.AEFluidKey，流体中枢将只能读取 Forge 流体能力");
+                }
 
                 Class<?> chestOrDriveClass = Class.forName(
                         "appeng.api.implementations.blockentities.IChestOrDrive");
@@ -338,27 +612,37 @@ public final class FindMeExtendedAdapter {
 
                 return new ReflectionAccess(common, radius, extractorList, pull, getCapability,
                         storageCapability, storageContents, itemKeyClass, toStack,
+                        fluidKeyClass, fluidToStack,
                         chestOrDriveClass, isPowered, cellCount, cellInventory, networkStorageClass,
                         extractMethod, actionableModulate, actionSourceOfPlayer);
             } catch (ReflectiveOperationException exception) {
                 LOGGER.warn("AE2 API 不兼容，将仅使用 FindMeExtended 的普通容器支持", exception);
                 return new ReflectionAccess(common, radius, extractorList, pull,
-                        null, null, null, null, null, null, null, null, null, null, null, null, null);
+                        null, null, null, null, null, null, null, null, null, null, null, null, null,
+                        null, null);
             }
         }
 
-        /** 读取配置半径并限制扫描范围，防止过大范围造成服务端卡顿。 */
+        /**
+         * 读取 FindMeExtended 的半径配置，再夹到本模组的配方管理距离。
+         *
+         * <p>半径的主人是 FindMeExtended（它自己的搜索也用这个值），本模组只是借来扫同一片区域，
+         * 所以不去覆盖它，只做一个上限：以前这个上限是写死的 32 格，现在是配置项
+         * （{@code recipeManagementDistance}，默认 128，-1 表示不限）。
+         */
         private int getSafeRadius() {
             try {
                 int configuredRadius = radiusField.getInt(commonConfig);
-                if (configuredRadius > MAX_SAFE_RADIUS) {
-                    LOGGER.warn("FindMeExtended 搜索半径 {} 过大，已限制为 {}",
-                            configuredRadius, MAX_SAFE_RADIUS);
+                int limit = RecipeSenderConfig.recipeManagementDistance();
+                if (limit >= 0 && configuredRadius > limit) {
+                    LOGGER.warn("FindMeExtended 搜索半径 {} 超过配方管理距离 {}，已限制为 {}",
+                            configuredRadius, limit, limit);
+                    return Math.max(0, limit);
                 }
-                return Math.max(0, Math.min(configuredRadius, MAX_SAFE_RADIUS));
+                return Math.max(0, configuredRadius);
             } catch (IllegalAccessException exception) {
-                LOGGER.warn("读取 FindMeExtended 搜索半径失败，使用默认值 8", exception);
-                return 8;
+                LOGGER.warn("读取 FindMeExtended 搜索半径失败，使用默认值 {}", FALLBACK_RADIUS, exception);
+                return FALLBACK_RADIUS;
             }
         }
 
@@ -554,7 +838,8 @@ public final class FindMeExtendedAdapter {
                     break;
                 }
                 // 先试自己这条 AE2 通路，再交给 FindMeExtended 的提取器。
-                int fromAe2 = extractFromAe2Storage(blockEntity, player, stack, amount - extracted);
+                int fromAe2 = extractFromAe2Storage(blockEntity, player, stack, amount - extracted,
+                        taken -> ItemHandlerHelper.giveItemToPlayer(player, taken));
                 if (fromAe2 > 0) {
                     extracted = Math.min(amount, extracted + fromAe2);
                     if (extracted >= amount) {
@@ -595,7 +880,8 @@ public final class FindMeExtendedAdapter {
          * 为了这个差异把材料判定成取不回来并不合理。
          */
         private int extractFromAe2Storage(BlockEntity blockEntity, ServerPlayer player,
-                                          ItemStack requirement, int amount) {
+                                          ItemStack requirement, int amount,
+                                          Consumer<ItemStack> sink) {
             if (ae2ExtractMethod == null || ae2ActionableModulate == null
                     || ae2ActionSourceOfPlayer == null || getCapabilityMethod == null
                     || ae2StorageCapability == null || amount <= 0 || requirement.isEmpty()) {
@@ -619,6 +905,9 @@ public final class FindMeExtendedAdapter {
                 Object actionSource = ae2ActionSourceOfPlayer.invoke(null, player);
                 int pulled = 0;
                 Object looseKey = null;
+                // 保护门（1.0.38）懒问：null = 还没问过，只在确实找到匹配的材料、马上就要动手时
+                // 才发一次伪造右键。整个存储里没有我们要的东西时，别人一个假事件都收不到。
+                Boolean allowed = null;
                 for (Object entry : entries) {
                     if (pulled >= amount) {
                         break;
@@ -637,13 +926,25 @@ public final class FindMeExtendedAdapter {
                         continue;
                     }
                     if (ItemStack.isSameItemSameTags(keyStack, requirement)) {
-                        pulled += extractKey(storage, key, player, actionSource, amount - pulled);
+                        if (allowed == null) {
+                            allowed = canInteract(player, blockEntity);
+                        }
+                        if (!allowed) {
+                            // 保护模组拦下了这个容器（领地、锁箱之类）：一次都不抽，也不再试别的键。
+                            return 0;
+                        }
+                        pulled += extractKey(storage, key, actionSource, amount - pulled, sink);
                     } else if (looseKey == null && ItemStack.isSameItem(keyStack, requirement)) {
                         looseKey = key;
                     }
                 }
                 if (pulled < amount && looseKey != null) {
-                    pulled += extractKey(storage, looseKey, player, actionSource, amount - pulled);
+                    if (allowed == null) {
+                        allowed = canInteract(player, blockEntity);
+                    }
+                    if (allowed) {
+                        pulled += extractKey(storage, looseKey, actionSource, amount - pulled, sink);
+                    }
                 }
                 return pulled;
             } catch (ReflectiveOperationException | RuntimeException exception) {
@@ -652,9 +953,14 @@ public final class FindMeExtendedAdapter {
             }
         }
 
-        /** 用存储给出的那个键实例抽取指定数量，并把抽到的物品直接交给玩家。 */
-        private int extractKey(Object storage, Object key, ServerPlayer player,
-                               Object actionSource, int amount)
+        /**
+         * 用存储给出的那个键实例抽取指定数量，抽到的物品交给 {@code sink}。
+         * <p>
+         * 交付对象由调用方决定：反转取回传「塞进玩家背包」，直达投放传「收进待投料列表」。
+         * 这里是两条路唯一的分叉点，抽取本身完全共用。
+         */
+        private int extractKey(Object storage, Object key, Object actionSource, int amount,
+                               Consumer<ItemStack> sink)
                 throws ReflectiveOperationException {
             if (amount <= 0) {
                 return 0;
@@ -669,8 +975,93 @@ public final class FindMeExtendedAdapter {
             if (stack.isEmpty()) {
                 return 0;
             }
-            ItemHandlerHelper.giveItemToPlayer(player, stack);
+            sink.accept(stack);
             return stack.getCount();
+        }
+
+        /**
+         * 抽出材料并收进调用方给的列表，不经过玩家背包。
+         * <p>
+         * 与 {@link #pull} 的区别只在交付对象：那条路最后交给 FindMeExtended 的提取器，而提取器
+         * 内部一律把物品塞进玩家背包，没法换落点。这里自己抽：AE2 通路复用同一套「用存储给出的键
+         * 实例去抽」的匹配，Forge 通路按槽位 {@code extractItem}——正是 {@link #copyHandlerContents}
+         * 统计时模拟过的同一次调用，统计说抽得出来才抽得出来。
+         * <p>
+         * 保护门（{@link #canInteract}）不在这一层问，而是下移到「确实找到了要抽的那一堆」之后
+         * （{@link #extractFromAe2Storage} 命中匹配键、{@link #extractFromHandler} 命中匹配槽位）。
+         * 这一层是对搜索范围内<b>每一个</b>方块实体都试一遍的循环，在这里问等于为一次注定落空的
+         * 尝试也发一个伪造的右键事件——搜索范围是 32 格立方体，一次取回能给整合包里所有监听右键的
+         * 模组送出几百个假事件。下移之后，只有真正会动那个容器的时候才问。
+         */
+        private int extractTo(List<BlockEntity> containers, ServerPlayer player, ItemStack stack,
+                              int amount, List<ItemStack> output) {
+            int extracted = 0;
+            for (BlockEntity blockEntity : containers) {
+                if (extracted >= amount) {
+                    break;
+                }
+                int fromAe2 = extractFromAe2Storage(blockEntity, player, stack, amount - extracted,
+                        output::add);
+                if (fromAe2 > 0) {
+                    extracted = Math.min(amount, extracted + fromAe2);
+                    if (extracted >= amount) {
+                        break;
+                    }
+                }
+                extracted = Math.min(amount, extracted
+                        + extractFromHandler(blockEntity, player, stack, amount - extracted, output));
+            }
+            return extracted;
+        }
+
+        /** 只读地问一句：这个处理器里有没有我们要的东西（同物品同 NBT）。 */
+        private static boolean holds(IItemHandler handler, ItemStack requirement) {
+            for (int slot = 0; slot < handler.getSlots(); slot++) {
+                ItemStack inSlot = handler.getStackInSlot(slot);
+                if (!inSlot.isEmpty() && ItemStack.isSameItemSameTags(inSlot, requirement)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /** 按 Forge 物品处理器逐槽抽出材料，抽到的追加到 {@code output}。 */
+        private int extractFromHandler(BlockEntity blockEntity, ServerPlayer player,
+                                       ItemStack requirement, int amount, List<ItemStack> output) {
+            if (amount <= 0 || requirement.isEmpty()) {
+                return 0;
+            }
+            int[] extracted = new int[1];
+            try {
+                blockEntity.getCapability(ForgeCapabilities.ITEM_HANDLER, null)
+                        .ifPresent(handler -> {
+                            if (!holds(handler, requirement)) {
+                                // 里面根本没有我们要的东西：连保护门都不问。
+                                return;
+                            }
+                            if (!canInteract(player, blockEntity)) {
+                                return;
+                            }
+                            int remaining = amount;
+                            for (int slot = 0; slot < handler.getSlots() && remaining > 0; slot++) {
+                                ItemStack inSlot = handler.getStackInSlot(slot);
+                                if (inSlot.isEmpty()
+                                        || !ItemStack.isSameItemSameTags(inSlot, requirement)) {
+                                    continue;
+                                }
+                                ItemStack taken = handler.extractItem(slot, remaining, false);
+                                if (taken.isEmpty()) {
+                                    continue;
+                                }
+                                output.add(taken);
+                                remaining -= taken.getCount();
+                            }
+                            extracted[0] = amount - remaining;
+                        });
+            } catch (RuntimeException exception) {
+                LOGGER.debug("从 {} 的物品处理器抽出材料失败", blockEntity.getBlockPos(), exception);
+            }
+            return extracted[0];
         }
 
         /** 把 AE 物品键转成普通物品堆，失败时返回空。 */
@@ -681,6 +1072,237 @@ public final class FindMeExtendedAdapter {
             } catch (ReflectiveOperationException | RuntimeException exception) {
                 return ItemStack.EMPTY;
             }
+        }
+
+        /** 把 AE 流体键转成流体堆，失败时返回空。 */
+        private FluidStack toFluidStack(Object key, int amount) {
+            if (ae2FluidKeyToStackMethod == null || amount <= 0) {
+                return FluidStack.EMPTY;
+            }
+            try {
+                Object stack = ae2FluidKeyToStackMethod.invoke(key, amount);
+                return stack instanceof FluidStack fluidStack ? fluidStack : FluidStack.EMPTY;
+            } catch (ReflectiveOperationException | RuntimeException exception) {
+                return FluidStack.EMPTY;
+            }
+        }
+
+        /** 读一个方块实体的流体内容：AE2 存储视图优先，读不到再看 Forge 流体能力。 */
+        private List<FluidStack> fluids(BlockEntity blockEntity) {
+            List<FluidStack> fromAe2 = ae2Fluids(blockEntity);
+            return fromAe2.isEmpty() ? handlerFluids(blockEntity) : fromAe2;
+        }
+
+        /** 该方块实体是否有任何一条能取流体的通路。 */
+        private boolean hasFluidSource(BlockEntity blockEntity) {
+            return ae2Storage(blockEntity) != null || fluidHandler(blockEntity) != null;
+        }
+
+        /** 取方块实体的 AE2 存储对象，没有时返回 null。 */
+        private Object ae2Storage(BlockEntity blockEntity) {
+            if (getCapabilityMethod == null || ae2StorageCapability == null) {
+                return null;
+            }
+            try {
+                Object capability = getCapabilityMethod.invoke(blockEntity, ae2StorageCapability, null);
+                if (capability == null) {
+                    return null;
+                }
+                return capability.getClass().getMethod("orElse", Object.class)
+                        .invoke(capability, new Object[]{null});
+            } catch (ReflectiveOperationException | RuntimeException exception) {
+                LOGGER.debug("读取 {} 的 AE2 存储失败", blockEntity.getBlockPos(), exception);
+                return null;
+            }
+        }
+
+        /** 取方块实体的 Forge 流体能力：先试无面，再逐个面（格雷机器按面分发）。 */
+        private IFluidHandler fluidHandler(BlockEntity blockEntity) {
+            try {
+                IFluidHandler direct = blockEntity.getCapability(ForgeCapabilities.FLUID_HANDLER, null)
+                        .orElse(null);
+                if (direct != null) {
+                    return direct;
+                }
+                for (Direction side : Direction.values()) {
+                    IFluidHandler sided = blockEntity
+                            .getCapability(ForgeCapabilities.FLUID_HANDLER, side).orElse(null);
+                    if (sided != null) {
+                        return sided;
+                    }
+                }
+            } catch (RuntimeException exception) {
+                LOGGER.debug("读取 {} 的流体能力失败", blockEntity.getBlockPos(), exception);
+            }
+            return null;
+        }
+
+        /** 读 AE2 存储视图里的全部流体键。 */
+        private List<FluidStack> ae2Fluids(BlockEntity blockEntity) {
+            if (ae2FluidKeyClass == null || ae2FluidKeyToStackMethod == null
+                    || storageContentsMethod == null) {
+                return List.of();
+            }
+            Object storage = ae2Storage(blockEntity);
+            if (storage == null) {
+                return List.of();
+            }
+            List<FluidStack> result = new ArrayList<>();
+            try {
+                Object keyCounter = storageContentsMethod.invoke(storage);
+                if (!(keyCounter instanceof Iterable<?> entries)) {
+                    return List.of();
+                }
+                for (Object entry : entries) {
+                    if (!(entry instanceof Map.Entry<?, ?> mapEntry)) {
+                        continue;
+                    }
+                    Object key = mapEntry.getKey();
+                    Object value = mapEntry.getValue();
+                    long count = value instanceof Number number ? number.longValue() : 0L;
+                    if (count <= 0 || !ae2FluidKeyClass.isInstance(key)) {
+                        continue;
+                    }
+                    FluidStack stack = toFluidStack(key, (int) Math.min(count, Integer.MAX_VALUE));
+                    if (!stack.isEmpty()) {
+                        result.add(stack);
+                    }
+                }
+            } catch (ReflectiveOperationException | RuntimeException exception) {
+                LOGGER.debug("读取 {} 的 AE2 流体存储失败", blockEntity.getBlockPos(), exception);
+            }
+            return result;
+        }
+
+        /** 读 Forge 流体能力的各个罐。 */
+        private List<FluidStack> handlerFluids(BlockEntity blockEntity) {
+            IFluidHandler handler = fluidHandler(blockEntity);
+            if (handler == null) {
+                return List.of();
+            }
+            List<FluidStack> result = new ArrayList<>();
+            try {
+                for (int tank = 0; tank < handler.getTanks(); tank++) {
+                    FluidStack inTank = handler.getFluidInTank(tank);
+                    if (!inTank.isEmpty()) {
+                        result.add(inTank.copy());
+                    }
+                }
+            } catch (RuntimeException exception) {
+                LOGGER.debug("读取 {} 的流体罐失败", blockEntity.getBlockPos(), exception);
+            }
+            return result;
+        }
+
+        /** 从一个方块实体里抽出指定流体：AE2 通路优先，不足再看 Forge 流体能力。 */
+        private int drainFluid(BlockEntity blockEntity, ServerPlayer player, FluidStack requirement,
+                               int amount, List<FluidStack> output) {
+            int drained = extractFluidFromAe2(blockEntity, player, requirement, amount, output);
+            if (drained >= amount) {
+                return drained;
+            }
+            return drained + drainFromHandler(blockEntity, requirement, amount - drained, output);
+        }
+
+        /**
+         * 从 AE2 存储里抽流体。
+         * <p>
+         * 与物品完全同一套做法：遍历存储给出的可用键，用<b>存储自己给出的那个键实例</b>去抽，
+         * 匹配用 {@code FluidStack.isFluidEqual}（流体 + NBT）。
+         */
+        private int extractFluidFromAe2(BlockEntity blockEntity, ServerPlayer player,
+                                        FluidStack requirement, int amount, List<FluidStack> output) {
+            if (ae2ExtractMethod == null || ae2ActionableModulate == null
+                    || ae2ActionSourceOfPlayer == null || ae2FluidKeyClass == null
+                    || ae2FluidKeyToStackMethod == null || storageContentsMethod == null
+                    || amount <= 0) {
+                return 0;
+            }
+            Object storage = ae2Storage(blockEntity);
+            if (storage == null) {
+                return 0;
+            }
+            try {
+                Object keyCounter = storageContentsMethod.invoke(storage);
+                if (!(keyCounter instanceof Iterable<?> entries)) {
+                    return 0;
+                }
+                Object actionSource = ae2ActionSourceOfPlayer.invoke(null, player);
+                int drained = 0;
+                for (Object entry : entries) {
+                    if (drained >= amount) {
+                        break;
+                    }
+                    if (!(entry instanceof Map.Entry<?, ?> mapEntry)) {
+                        continue;
+                    }
+                    Object key = mapEntry.getKey();
+                    Object value = mapEntry.getValue();
+                    long available = value instanceof Number number ? number.longValue() : 0L;
+                    if (available <= 0 || !ae2FluidKeyClass.isInstance(key)) {
+                        continue;
+                    }
+                    FluidStack keyFluid = toFluidStack(key, 1);
+                    if (keyFluid.isEmpty() || !RecipeFluidSpec.sameFluid(keyFluid, requirement)) {
+                        continue;
+                    }
+                    drained += extractFluidKey(storage, key, actionSource, amount - drained, output);
+                }
+                return drained;
+            } catch (ReflectiveOperationException | RuntimeException exception) {
+                LOGGER.debug("从 AE2 存储 {} 抽流体失败", blockEntity.getBlockPos(), exception);
+                return 0;
+            }
+        }
+
+        /** 用存储给出的那个流体键实例抽取指定 mB，抽到的交给 {@code output}。 */
+        private int extractFluidKey(Object storage, Object key, Object actionSource, int amount,
+                                    List<FluidStack> output) throws ReflectiveOperationException {
+            if (amount <= 0) {
+                return 0;
+            }
+            Object result = ae2ExtractMethod.invoke(storage, key, (long) amount,
+                    ae2ActionableModulate, actionSource);
+            long count = result instanceof Number number ? number.longValue() : 0L;
+            if (count <= 0) {
+                return 0;
+            }
+            FluidStack stack = toFluidStack(key, (int) Math.min(count, Integer.MAX_VALUE));
+            if (stack.isEmpty()) {
+                return 0;
+            }
+            output.add(stack);
+            return stack.getAmount();
+        }
+
+        /** 按 Forge 流体能力逐罐抽出指定流体。 */
+        private int drainFromHandler(BlockEntity blockEntity, FluidStack requirement, int amount,
+                                     List<FluidStack> output) {
+            IFluidHandler handler = fluidHandler(blockEntity);
+            if (handler == null || amount <= 0) {
+                return 0;
+            }
+            int drained = 0;
+            try {
+                for (int tank = 0; tank < handler.getTanks() && drained < amount; tank++) {
+                    FluidStack inTank = handler.getFluidInTank(tank);
+                    if (inTank.isEmpty() || !RecipeFluidSpec.sameFluid(inTank, requirement)) {
+                        continue;
+                    }
+                    FluidStack taken = handler.drain(
+                            new FluidStack(requirement.getFluid(), amount - drained,
+                                    requirement.getTag()),
+                            IFluidHandler.FluidAction.EXECUTE);
+                    if (taken.isEmpty()) {
+                        continue;
+                    }
+                    output.add(taken);
+                    drained += taken.getAmount();
+                }
+            } catch (RuntimeException exception) {
+                LOGGER.debug("从 {} 的流体能力抽流体失败", blockEntity.getBlockPos(), exception);
+            }
+            return drained;
         }
     }
 

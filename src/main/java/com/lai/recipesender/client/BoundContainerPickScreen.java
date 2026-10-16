@@ -2,6 +2,8 @@ package com.lai.recipesender.client;
 
 import com.lai.recipesender.model.BoundContainer;
 import com.lai.recipesender.model.NoticeSeverity;
+import com.lai.recipesender.model.RecipeFluidSpec;
+import com.lai.recipesender.model.RecipeIngredientSpec;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
@@ -22,6 +24,8 @@ import java.util.UUID;
  *
  * <p>材料在这一步**还没有**从背包里扣：{@code requirements} 是客户端按当前份数算好的清单，
  * 真正扣除与插入都发生在服务端。所以玩家取消选择不会损失任何东西。
+ * 直达形态（{@link #directSpecs} 非空）连清单都没有——材料由服务端从周围现场抽取，
+ * 这一步只是挑落点。
  *
  * <p>「上次用过的发送单元」只是**预选中**它，并允许按 B 直达——弹窗本身照常弹出。
  */
@@ -45,6 +49,24 @@ class BoundContainerPickScreen extends Screen {
     private final List<BoundContainer> candidates;
     private final List<ItemStack> requirements;
     private final int batches;
+
+    /**
+     * 直达形态的配方输入描述；非 {@code null} 时本弹窗只负责挑目标。
+     *
+     * <p>直达的材料由服务端从玩家周围现场抽取，客户端手里没有（也不该有）物品堆清单，
+     * 所以 {@link #requirements} 在直达形态下是空的，确认时改发
+     * {@link RecipeSenderClient#sendDirectInsert}。为 {@code null} 时（绑定发送）行为与过去完全一致。
+     */
+    private final List<RecipeIngredientSpec> directSpecs;
+
+    /**
+     * 直达形态要带的流体需求；普通发送形态恒为空表。
+     *
+     * <p>与 {@link #directSpecs} 分开存：流体只有直达用得上（流体中枢是直达专用的绑定），
+     * 普通发送走的是 {@code sendBoundInsert}，那条路根本不看流体。为 {@code null} 时按空表处理，
+     * 这样普通发送那条调用点不必专门构造一个空列表。
+     */
+    private final List<RecipeFluidSpec> fluidSpecs;
 
     /**
      * 这次选择对应的配方路由键（S6）。「上次选择」按它分别记忆（方案 §4.3 D2）：
@@ -74,12 +96,15 @@ class BoundContainerPickScreen extends Screen {
     private boolean hasSearch;
 
     BoundContainerPickScreen(Screen parent, List<BoundContainer> candidates, List<ItemStack> requirements,
-                             int batches, ResourceLocation routeKey) {
+                             int batches, ResourceLocation routeKey, List<RecipeIngredientSpec> directSpecs,
+                             List<RecipeFluidSpec> fluidSpecs) {
         super(Component.translatable("text.recipe_sender.pick_title"));
         this.parent = parent;
         this.candidates = List.copyOf(candidates);
         this.requirements = List.copyOf(requirements);
         this.batches = batches;
+        this.directSpecs = directSpecs == null ? null : List.copyOf(directSpecs);
+        this.fluidSpecs = fluidSpecs == null ? List.of() : List.copyOf(fluidSpecs);
         this.awaitBoundRelease = true;
         this.routeKey = routeKey == null ? BoundContainerClient.manualRoute() : routeKey;
         BoundContainer last = BoundContainerClient.lastChoice(this.routeKey);
@@ -473,7 +498,13 @@ class BoundContainerPickScreen extends Screen {
 
     private void confirm(BoundContainer binding) {
         RecipeSenderClient.rememberBoundChoice(binding.id(), routeKey);
-        RecipeSenderClient.sendBoundInsert(binding.id(), requirements, batches);
+        if (directSpecs != null) {
+            // 直达形态：材料由服务端从周围现场抽取，客户端只交配方输入描述（物品 + 流体）与份数，
+            // 因此不能走 sendBoundInsert（那条要求客户端先备好物品清单）。
+            RecipeSenderClient.sendDirectInsert(binding.id(), directSpecs, fluidSpecs, batches);
+        } else {
+            RecipeSenderClient.sendBoundInsert(binding.id(), requirements, batches);
+        }
         onClose();
     }
 

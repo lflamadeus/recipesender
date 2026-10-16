@@ -2,7 +2,9 @@ package com.lai.recipesender.client;
 
 import com.lai.recipesender.model.BoundContainer;
 import com.lai.recipesender.model.BoundStatus;
+import com.lai.recipesender.model.MachineState;
 import com.lai.recipesender.network.ModNetwork;
+import com.lai.recipesender.network.packet.AlignGroupCircuitPacket;
 import com.lai.recipesender.network.packet.UnbindContainerPacket;
 import com.lai.recipesender.network.packet.UpdateBindingPacket;
 import com.lai.recipesender.network.packet.UpdateBindingRoutesPacket;
@@ -11,6 +13,7 @@ import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
 import org.lwjgl.glfw.GLFW;
 
 import java.util.ArrayList;
@@ -27,14 +30,15 @@ import java.util.UUID;
 /**
  * ⑦ 已绑定容器 · 管理界面。
  *
- * <p>按主容器分组的嵌套列表：主容器是一级行，并列成员与从容器缩进挂在它下面；
+ * <p>按主容器分组的嵌套列表：主容器是一级行，并列成员与组级从容器缩进挂在它下面；
+ * 并列成员名下的从容器（独立模式下给单台机器扩容的箱子）再缩进一级挂在那一台下面。
  * 找不到父容器的项收在最外层的「未归组」小节里（父容器被删掉时会这样），
  * **不连带删除**，玩家可以自己决定删掉还是重新绑定。
  *
  * <p>非模态：{@code isPauseScreen()} 返回 false，世界继续跑。
  * 全部操作都只是发一个网络包，界面显示的是服务端回推的最新状态，客户端不做乐观更新。
  *
- * <p>并列成员与从容器**默认收起**，点主容器行展开这一组（行首有 ▼ / ▶ 记号），
+ * <p>并列成员与从容器**默认收起**，点有子行的行展开（行首有 ▼ / ▶ 记号），
  * 工具栏的「展开 / 收起」按钮则一次全开或全关；一旦搜索就自动展开，此时点行不再收起。
  * 搜索支持中文首字母与全拼（靠 {@link PinyinSupport}，没装 JEC 时静默降级为字面匹配），
  * 搜索框上点右键清空。
@@ -44,6 +48,17 @@ import java.util.UUID;
  * <p>行内操作：「改名 / 关系 / 类别 / 高亮 / 删除」。其中「类别」只出现在主容器行上，
  * 打开 {@link CategoryPickerScreen} 勾选这个容器负责的配方类别（S6 自动路由）；并列成员与从容器
  * 跟随父容器，不单独勾。
+ *
+ * <p>分两页签（1.0.33 新增）：
+ * <ul>
+ *   <li><b>容器绑定</b>（{@link Tab#ITEMS}）：全部**物品目标**，就是上面这套按主容器分组的列表；
+ *       流体中枢不在这页里。</li>
+ *   <li><b>流体中枢</b>（{@link Tab#FLUIDS}）：**只列流体中枢**（正常最多一条）。中枢是直达功能的
+ *       流体来源，固定是主容器角色、没有父容器、没有配方类别，所以它不参与按主容器分组，
+ *       每行也只留「改名 / 高亮 / 删除」（没有「关系」与「类别」）。</li>
+ * </ul>
+ * 两页共用同一份列表渲染、滚动与命中区，只是数据源不同：切页签会作废行缓存并清空命中区
+ * （见 {@link #setTab(Tab)}），上一页的按钮不会再被点到。
  */
 class BoundContainerManageScreen extends Screen {
 
@@ -51,12 +66,36 @@ class BoundContainerManageScreen extends Screen {
     private static final int PANEL_MAX_WIDTH = 420;
     private static final int HEADER_HEIGHT = 30;
     private static final int TOOLBAR_HEIGHT = 24;
+    /** 页签行的高度（「容器绑定」/「流体中枢」），夹在标题与工具栏之间。 */
+    private static final int TAB_HEIGHT = 22;
+    /** 两个页签之间的间隙。 */
+    private static final int TAB_GAP = 4;
     private static final int FOOTER_HEIGHT = 18;
     private static final int PADDING = 8;
     private static final int ROW_MASTER_HEIGHT = 30;
     private static final int ROW_CHILD_HEIGHT = 26;
     private static final int GROUP_HEAD_HEIGHT = 16;
     private static final int SPACER_HEIGHT = 6;
+
+    /**
+     * 行内属性标签的绘制缩放。
+     *
+     * <p>标签是次要信息，却和名字抢同一条行宽：主容器行上「主容器 / 并列组 / 从 ×N / 类别 ×N」
+     * 再加上忙闲标签，量出来能有一百六十多像素，把名字压到只剩两个字加「…」（用户实测反馈）。
+     * 整块缩到 0.75 倍画，占位按同一比例折算，名字大约拿回四分之一的标签宽度；
+     * 标签本身仍然清楚——原版 9px 的字缩到 6.75px，30px 高的行里放得下。
+     */
+    private static final float TAG_SCALE = 0.75F;
+
+    /**
+     * 名字至少留出的宽度（原字号像素）。
+     *
+     * <p>原来这里写的是 30：标签一多，名字就只剩两个字加「…」，连是哪个容器都认不出来。
+     * 54 ≈ 6 个汉字，够认出名字。真到了这一行也放不下的时候，让位的是**标签**而不是名字：
+     * 标签整块不画还有悬停提示兜底，名字被裁成两个字却没有任何补救。
+     */
+    private static final int NAME_MIN_WIDTH = 54;
+
     private static final int DELETE_CONFIRM_TICKS = 60;
     private static final int TOOLBAR_BUTTON_WIDTH = 56;
     /** 打开界面后的键盘静默期，见 {@link #swallowOpeningInput()}。 */
@@ -74,6 +113,14 @@ class BoundContainerManageScreen extends Screen {
     private int pendingDeleteTicks;
     private String query = "";
     private int scrollOffset;
+
+    /**
+     * 当前页签，默认「容器绑定」（物品目标）。
+     *
+     * <p>换窗口大小 / 重开界面都会重建 Screen 对象，页签回到默认页——管理界面本来就没有跨次打开
+     * 记忆状态的先例（搜索词、展开状态也一样）。
+     */
+    private Tab tab = Tab.ITEMS;
 
     /**
      * 已经展开的主容器。
@@ -105,8 +152,14 @@ class BoundContainerManageScreen extends Screen {
     private int builtRevision = -1;
     private boolean entriesDirty = true;
 
-    /** 每个主容器的 {并列成员数, 从容器数}，在 {@link #buildEntries()} 里一次算好。 */
-    private final Map<UUID, int[]> groupCounts = new HashMap<>();
+    /**
+     * 每个容器（主容器或并列成员）名下的 {并列成员数, 从容器数}，在 {@link #buildEntries()} 里一次算好。
+     *
+     * <p>两个数都是**直接挂在它下面的原始个数**，不含容器自己：并列成员的父必然是主容器，
+     * 所以「并列成员数」只有主容器会非 0；从容器可以挂在主容器上（组级从容器），也可以挂在某个
+     * 并列成员上（那一台机器私有的库存扩展），两种父都要能查到，所以这里按**实际父容器**归组。
+     */
+    private final Map<UUID, int[]> childCounts = new HashMap<>();
 
     /** 本帧悬停中的行内按钮提示，最后统一画（画早了会被后画的控件盖住）。 */
     private Component pendingTooltip;
@@ -159,13 +212,18 @@ class BoundContainerManageScreen extends Screen {
         panelHeight = Math.min(height - PANEL_MARGIN, 320);
         left = (width - panelWidth) / 2;
         top = (height - panelHeight) / 2;
-        listTop = top + HEADER_HEIGHT + TOOLBAR_HEIGHT;
-        listHeight = panelHeight - HEADER_HEIGHT - TOOLBAR_HEIGHT - FOOTER_HEIGHT;
+        listTop = top + HEADER_HEIGHT + TAB_HEIGHT + TOOLBAR_HEIGHT;
+        listHeight = panelHeight - HEADER_HEIGHT - TAB_HEIGHT - TOOLBAR_HEIGHT - FOOTER_HEIGHT;
 
-        int toolbarY = top + HEADER_HEIGHT + 2;
+        int toolbarY = top + HEADER_HEIGHT + TAB_HEIGHT + 2;
+        // 工具栏从右往左排：关闭 → 展开/收起 → 搜索框吃剩下的宽度。
         int closeX = left + panelWidth - PADDING - TOOLBAR_BUTTON_WIDTH;
         int expandX = closeX - 4 - TOOLBAR_BUTTON_WIDTH;
-        int searchWidth = Math.max(60, expandX - 8 - (left + PADDING));
+        // 搜索框吃剩下的宽度。原来这里写着 Math.max(60, ...)，现在把下限换成 20 并让搜索框优先让位：
+        // 面板正常宽度（≥ 280）时剩下的宽度本来就有 61 以上，与原来的下限等价；只有玩家把 GUI 缩放
+        // 调到 4、窗口又不大时才会真的不够——那时硬撑到 60 会把搜索框顶到展开按钮上，而重叠的控件
+        // 点起来是错的（点在重叠处会先被搜索框接走，按钮就永远点不到）。窄一点的输入框总比重叠强。
+        int searchWidth = Math.max(20, expandX - 8 - (left + PADDING));
         searchBox = new BoundEditBox(font, left + PADDING, toolbarY, searchWidth, 18,
                 Component.translatable("text.recipe_sender.manage_search"));
         searchBox.setHint(Component.translatable("text.recipe_sender.manage_search"));
@@ -181,6 +239,7 @@ class BoundContainerManageScreen extends Screen {
         expandButton = Button.builder(expandLabel(), button -> setAllExpanded(!allExpanded()))
                 .bounds(expandX, toolbarY, TOOLBAR_BUTTON_WIDTH, 18).build();
         addRenderableWidget(expandButton);
+        syncToolbar();
         addRenderableWidget(Button.builder(Component.translatable("text.recipe_sender.manage_close"),
                         button -> onClose())
                 .bounds(closeX, toolbarY, TOOLBAR_BUTTON_WIDTH, 18).build());
@@ -190,12 +249,34 @@ class BoundContainerManageScreen extends Screen {
         }
     }
 
-    /** 工具栏的全局开关：一次全开或全关。 */
+    /**
+     * 让工具栏跟上当前页签。
+     *
+     * <p>中枢页没有分组可展开，「展开 / 收起」在这一页没有意义：整个按钮藏掉（{@code visible=false}
+     * 的控件既画不出来也点不到）。搜索框两页都留着——按名字过滤中枢同样是合理的用法。
+     */
+    private void syncToolbar() {
+        if (expandButton == null) {
+            return;
+        }
+        boolean itemsTab = tab == Tab.ITEMS;
+        expandButton.visible = itemsTab;
+        expandButton.active = itemsTab;
+    }
+
+    /**
+     * 工具栏的全局开关：一次全开或全关。
+     *
+     * <p>展开状态按容器 id 记，而并列成员行自己也能展开（它私有的从容器挂在它下面），
+     * 所以「全开」要把有子行的并列成员一并收进来，否则它们的子行仍然看不见。
+     */
     private void setAllExpanded(boolean value) {
         expandedMasters.clear();
         if (value) {
-            for (BoundContainer master : BoundContainerClient.masters()) {
-                expandedMasters.add(master.id());
+            for (BoundContainer binding : BoundContainerClient.itemTargets()) {
+                if (hasChildren(binding)) {
+                    expandedMasters.add(binding.id());
+                }
             }
         }
         if (expandButton != null) {
@@ -224,18 +305,24 @@ class BoundContainerManageScreen extends Screen {
         return searching || expandedMasters.contains(masterId);
     }
 
-    /** 全部主容器都展开时按钮显示「收起」，否则显示「展开」。 */
+    /**
+     * 所有**有子行**的容器都展开时按钮显示「收起」，否则显示「展开」。
+     *
+     * <p>判据必须与 {@link #setAllExpanded(boolean)} 完全一致（并列成员也可能有子行），
+     * 否则点一次「全开」之后按钮还写着「展开」。
+     */
     private boolean allExpanded() {
-        List<BoundContainer> masters = BoundContainerClient.masters();
-        if (masters.isEmpty()) {
-            return false;
-        }
-        for (BoundContainer master : masters) {
-            if (!expandedMasters.contains(master.id())) {
+        boolean any = false;
+        for (BoundContainer binding : BoundContainerClient.itemTargets()) {
+            if (!hasChildren(binding)) {
+                continue;
+            }
+            any = true;
+            if (!expandedMasters.contains(binding.id())) {
                 return false;
             }
         }
-        return true;
+        return any;
     }
 
     private Component expandLabel() {
@@ -262,6 +349,9 @@ class BoundContainerManageScreen extends Screen {
         if (++livenessTicks >= LIVENESS_REFRESH_TICKS) {
             livenessTicks = 0;
             refreshLiveness();
+            // 机器忙/闲只有服务端算得出来（客户端可能没有能力表、也不该去加载区块），
+            // 所以蹭同一个 1 秒节流顺手要一次，界面侧只管画服务端回推的快照。
+            RecipeSenderClient.requestMachineStatus();
         }
     }
 
@@ -278,15 +368,26 @@ class BoundContainerManageScreen extends Screen {
         return liveness.getOrDefault(binding.id(), BoundStatus.OK);
     }
 
-    /** 页脚用：当前有几个绑定指向的方块已经不存在。 */
+    /**
+     * 页脚用：**当前页签**里有几个绑定现在不工作。
+     *
+     * <p>判据只有一条：指向的方块已经不存在（{@link BoundStatus#MISSING}）。
+     *
+     * <p>按页签过滤：页脚说的是「这一页共 N 项、其中 M 项失效」，另一页的失效项不该算进来。
+     */
     private int deadCount() {
         int count = 0;
-        for (BoundStatus status : liveness.values()) {
-            if (status == BoundStatus.MISSING) {
+        for (BoundContainer binding : tabSource()) {
+            if (livenessOf(binding) == BoundStatus.MISSING) {
                 count++;
             }
         }
         return count;
+    }
+
+    /** 当前页签的数据源：物品目标页列全部物品目标，中枢页只列中枢。 */
+    private List<BoundContainer> tabSource() {
+        return tab == Tab.FLUIDS ? BoundContainerClient.fluidHubs() : BoundContainerClient.itemTargets();
     }
 
     // ------------------------------------------------------------------ 数据组织
@@ -304,7 +405,13 @@ class BoundContainerManageScreen extends Screen {
 
     /** 分组：主容器 → 它名下的并列成员与从容器；找不到父容器的单独成组。 */
     private List<Entry> buildEntries() {
-        List<BoundContainer> all = BoundContainerClient.all();
+        // 页签决定数据源：中枢页是平铺的几条（正常只有一条），走 buildHubEntries()。
+        if (tab == Tab.FLUIDS) {
+            return buildHubEntries();
+        }
+        // 物品目标页：中枢绝不能进来。它也是 MASTER 角色，混进来会被当成一个「可展开的主容器」，
+        // 而它既没有并列成员也没有从容器，只会让分组里多出一个空壳。
+        List<BoundContainer> all = BoundContainerClient.itemTargets();
         Map<UUID, List<BoundContainer>> children = new LinkedHashMap<>();
         List<BoundContainer> masters = new ArrayList<>();
         List<BoundContainer> orphans = new ArrayList<>();
@@ -314,12 +421,16 @@ class BoundContainerManageScreen extends Screen {
                 masters.add(binding);
             }
         }
+        // 按**实际父容器**归组，不要求父一定是主容器：并列成员的父必然是主容器，而从容器的父既可能
+        // 是主容器（组级从容器），也可能是某个并列成员（那一台机器私有的库存扩展）。
+        // 父是别的角色（比如从容器挂从容器）时这条绑定在服务端就是孤立项，行列表里也一样：
+        // 它既不会出现在任何父行下面，也不该被静默丢掉——归到孤儿组里玩家才能看到并删掉它。
         for (BoundContainer binding : all) {
             if (binding.isMaster()) {
                 continue;
             }
             BoundContainer parent = BoundContainerClient.find(binding.parentId());
-            if (parent == null) {
+            if (parent == null || (!parent.isMaster() && parent.role() != BoundContainer.Role.PARALLEL)) {
                 orphans.add(binding);
             } else {
                 children.computeIfAbsent(parent.id(), key -> new ArrayList<>()).add(binding);
@@ -332,11 +443,12 @@ class BoundContainerManageScreen extends Screen {
             group.sort(Comparator.comparingInt(BoundContainerManageScreen::roleOrder));
         }
 
-        // 每个主容器的规模一次算好：行内标签与「有没有子项」都读这份结果，
-        // 不必再为每个可见行遍历整张绑定表（原来每帧 O(n²)）。
-        groupCounts.clear();
+        // 每个容器名下有几个子行一次算好：行内标签、展开记号与「有没有子项」都读这份结果，
+        // 不必再为每个可见行遍历整张绑定表（原来每帧 O(n²)）。存的是**原始个数**、不含容器自己，
+        // 所以主容器要的「含自己在内的台数」由调用方自己 +1（见 parallelCountOf）。
+        childCounts.clear();
         for (Map.Entry<UUID, List<BoundContainer>> group : children.entrySet()) {
-            int parallel = 1;
+            int parallel = 0;
             int slave = 0;
             for (BoundContainer child : group.getValue()) {
                 if (child.role() == BoundContainer.Role.PARALLEL) {
@@ -345,7 +457,7 @@ class BoundContainerManageScreen extends Screen {
                     slave++;
                 }
             }
-            groupCounts.put(group.getKey(), new int[]{parallel, slave});
+            childCounts.put(group.getKey(), new int[]{parallel, slave});
         }
 
         List<Entry> entries = new ArrayList<>();
@@ -356,26 +468,51 @@ class BoundContainerManageScreen extends Screen {
         for (BoundContainer master : masters) {
             // 收起时只列主容器；一搜索就自动展开，否则搜到的并列成员/从容器会因为折叠而「看不见」。
             boolean showChildren = isExpanded(master.id());
+            boolean masterHit = !searching || matches(master, needle);
             List<BoundContainer> group = children.getOrDefault(master.id(), List.of());
-            List<BoundContainer> visibleChildren = new ArrayList<>();
+            // 先把这一组里**可见**的两级子行挑出来。可见性只看搜索词、与展开状态无关：收起的行也要
+            // 计入页脚（见下面的计数），所以「哪几行算数」与「画不画」必须分开算。
+            List<BoundContainer> visibleChildren = new ArrayList<>(group.size());
+            List<List<BoundContainer>> visibleGrand = new ArrayList<>(group.size());
             for (BoundContainer child : group) {
-                if (!searching || matches(child, needle) || matches(master, needle)) {
+                boolean childHit = !searching || matches(child, needle);
+                // depth 2 只可能挂在并列成员下（从容器不能再有子容器），别的角色一律没有下一级。
+                List<BoundContainer> grandGroup = child.role() == BoundContainer.Role.PARALLEL
+                        ? children.getOrDefault(child.id(), List.of()) : List.of();
+                List<BoundContainer> grandRows = new ArrayList<>(grandGroup.size());
+                for (BoundContainer grand : grandGroup) {
+                    // 主容器命中时整组都可见；否则看它挂的那台（depth 1）或它自己有没有命中。
+                    if (masterHit || childHit || matches(grand, needle)) {
+                        grandRows.add(grand);
+                    }
+                }
+                if (masterHit || childHit || !grandRows.isEmpty()) {
                     visibleChildren.add(child);
+                    visibleGrand.add(grandRows);
                 }
             }
-            boolean masterVisible = !searching || matches(master, needle);
-            if (!masterVisible && visibleChildren.isEmpty()) {
+            if (!masterHit && visibleChildren.isEmpty()) {
                 continue;
             }
             // 这里原来还有一条组头（「名字 ×N」+ 规模说明），紧接着的主容器行又把名字写了一遍。
             // 组头已经删掉：名字与 ×N 归主容器行，规模由行上的「并列组 / 从 ×N」标签表达。
-            entries.add(new RowEntry(master, false, false, null));
+            entries.add(new RowEntry(master, 0, false, null));
             shown++;
-            for (BoundContainer child : visibleChildren) {
+            for (int i = 0; i < visibleChildren.size(); i++) {
+                BoundContainer child = visibleChildren.get(i);
                 // 收起时也要计数：页脚的「共 N 项」不该随展开状态跳来跳去。
                 shown++;
                 if (showChildren) {
-                    entries.add(new RowEntry(child, true, false, null));
+                    entries.add(new RowEntry(child, 1, false, null));
+                }
+                List<BoundContainer> grandRows = visibleGrand.get(i);
+                // depth 2 与 depth 1 同一口径：收起也计、不画。
+                shown += grandRows.size();
+                // 某一台并列成员展开才画它私有的从容器；搜索时 isExpanded 恒为 true，直接复用。
+                if (showChildren && isExpanded(child.id())) {
+                    for (BoundContainer grand : grandRows) {
+                        entries.add(new RowEntry(grand, 2, false, null));
+                    }
                 }
             }
         }
@@ -390,9 +527,35 @@ class BoundContainerManageScreen extends Screen {
             entries.add(new GroupEntry(Component.translatable("text.recipe_sender.manage_orphan"),
                     Component.translatable("text.recipe_sender.manage_orphan_count", visibleOrphans.size())));
             for (BoundContainer orphan : visibleOrphans) {
-                entries.add(new RowEntry(orphan, false, true, orphanReason(orphan)));
+                entries.add(new RowEntry(orphan, 0, true, orphanReason(orphan)));
                 shown++;
             }
+        }
+        entryCount = shown;
+        return entries;
+    }
+
+    /**
+     * 流体中枢页的行列表：平铺，不分组、不缩进、没有子项。
+     *
+     * <p>中枢固定是主容器角色、无父容器、无类别，所以这里不建 {@code childCounts}：
+     * 行上的「×N」与展开记号都会自然落空（{@link #parallelCountOf} 查不到就是 1、
+     * {@link #hasChildren} 查不到就是 false），不必为中枢另写一套行渲染。
+     *
+     * <p>搜索照常生效：这一页通常只有一行，但按名字过滤的行为两页保持一致。
+     */
+    private List<Entry> buildHubEntries() {
+        childCounts.clear();
+        List<Entry> entries = new ArrayList<>();
+        String needle = query.trim().toLowerCase(Locale.ROOT);
+        searching = !needle.isEmpty();
+        int shown = 0;
+        for (BoundContainer hub : BoundContainerClient.fluidHubs()) {
+            if (searching && !matches(hub, needle)) {
+                continue;
+            }
+            entries.add(new RowEntry(hub, 0, false, null));
+            shown++;
         }
         entryCount = shown;
         return entries;
@@ -438,6 +601,8 @@ class BoundContainerManageScreen extends Screen {
                 BoundContainerClient.all().size()), left + panelWidth / 2, top + 6, BoundUi.TEXT);
         BoundUi.centered(graphics, Component.translatable("text.recipe_sender.manage_subtitle"),
                 left + panelWidth / 2, top + 18, BoundUi.TEXT_DIM);
+        // 页签在标题下、工具栏上。和行内按钮一样是自绘的，命中区随绘制一起登记（render 开头已清空）。
+        drawTabs(graphics, mouseX, mouseY);
 
         List<Entry> entries = entries();
         lastEntries = entries;
@@ -492,6 +657,12 @@ class BoundContainerManageScreen extends Screen {
 
     private void drawEmptyState(GuiGraphics graphics) {
         int centerX = left + panelWidth / 2;
+        if (tab == Tab.FLUIDS) {
+            // 中枢页的空状态只要一句话：这一页是干什么的、怎么加（键由语言文件提供）。
+            BoundUi.centered(graphics, Component.translatable("text.recipe_sender.fluid_hub_empty"),
+                    centerX, listTop + listHeight / 2 - 4, BoundUi.TEXT_DIM);
+            return;
+        }
         int y = listTop + listHeight / 2 - 16;
         BoundUi.centered(graphics, Component.translatable("text.recipe_sender.manage_empty"),
                 centerX, y, BoundUi.TEXT);
@@ -499,6 +670,39 @@ class BoundContainerManageScreen extends Screen {
                 centerX, y + 14, BoundUi.TEXT_DIM);
         BoundUi.centered(graphics, Component.translatable("text.recipe_sender.manage_empty_note"),
                 centerX, y + 28, BoundUi.TEXT_DIM);
+    }
+
+    /**
+     * 画两个页签并登记命中区。
+     *
+     * <p>两页等宽平分面板内侧宽度，样式沿用本模组的面板配色：选中用 {@code ROW_SELECTED} 底 +
+     * 正常字色，未选中是面板底色 + 暗字色，悬停提亮一档。不另画选中记号（下划线之类），
+     * 底色本身就够区分，也和行内的选中样式一致。
+     */
+    private void drawTabs(GuiGraphics graphics, int mouseX, int mouseY) {
+        int innerWidth = panelWidth - PADDING * 2;
+        int tabWidth = (innerWidth - TAB_GAP) / 2;
+        int y = top + HEADER_HEIGHT + 2;
+        int height = TAB_HEIGHT - 4;
+        drawTab(graphics, mouseX, mouseY, left + PADDING, y, tabWidth, height, Tab.ITEMS);
+        drawTab(graphics, mouseX, mouseY, left + PADDING + tabWidth + TAB_GAP, y, tabWidth, height,
+                Tab.FLUIDS);
+    }
+
+    private void drawTab(GuiGraphics graphics, int mouseX, int mouseY, int x, int y, int width, int height,
+                         Tab candidate) {
+        boolean selected = tab == candidate;
+        boolean hovered = BoundUi.inside(mouseX, mouseY, x, y, width, height);
+        int background = selected ? BoundUi.ROW_SELECTED
+                : (hovered ? BoundUi.ROW_HOVER : BoundUi.PANEL);
+        graphics.fill(x, y, x + width, y + height, background);
+        graphics.renderOutline(x, y, width, height, BoundUi.BORDER_DARK);
+        Component label = candidate.label();
+        graphics.drawString(font, label, x + (width - font.width(label)) / 2, y + (height - 8) / 2,
+                selected ? BoundUi.TEXT : BoundUi.TEXT_DIM, false);
+        // 命中区在绘制里登记（render 开头已清空）：切页签时 {@link #setTab} 会再整体清一次，
+        // 保证本帧剩下的时间里点不到上一页的按钮。
+        hitTargets.add(new HitTarget(x, y, width, height, null, "tab:" + candidate.name()));
     }
 
     private void drawGroupHead(GuiGraphics graphics, GroupEntry group, int y) {
@@ -514,14 +718,18 @@ class BoundContainerManageScreen extends Screen {
     private void drawRow(GuiGraphics graphics, RowEntry row, int y, int mouseX, int mouseY) {
         BoundContainer binding = row.binding();
         int height = row.height();
-        // 从容器比并列成员再缩进一档：两类角色在发送时的地位不同（并列成员参与均分、
+        // 缩进按层级走：depth 1 的并列成员缩 16、组级从容器再深一档（28），depth 2 的成员私有
+        // 从容器在 depth 1 的基础上每级再让 16。两类角色在发送时的地位不同（并列成员参与均分、
         // 从容器只收溢出），缩进量拉开才能一眼扫出层级。
-        int indent = row.indent()
-                ? (binding.role() == BoundContainer.Role.SLAVE ? 28 : 16) : 0;
+        int indent = row.depth() == 0 ? 0
+                : (binding.role() == BoundContainer.Role.SLAVE ? 28 : 16) + (row.depth() - 1) * 16;
         int x = left + PADDING + indent;
         int width = panelWidth - PADDING * 2 - indent;
         boolean orphan = row.orphan();
         BoundStatus status = livenessOf(binding);
+        // 忙/闲只有服务端算得出来，每秒推一次快照，允许过期。像 livenessOf 一样在这里实时查，
+        // 不并进 entries() 的行缓存：那个缓存按 revision() 失效，每秒重建整表是 1.0.26 的主要开销。
+        MachineState state = BoundContainerClient.machineStateOf(binding.id());
 
         // 目标已经不在了的行整行铺一层红底：标签行可能因为名字太长而整体不画，
         // 底色是「这一行有问题」最不容易被漏看的表达。
@@ -538,14 +746,15 @@ class BoundContainerManageScreen extends Screen {
         if (row.indent()) {
             graphics.drawString(font, "└", cursor, y + 4, BoundUi.TEXT_DIM, false);
             cursor += 8;
-        } else if (!orphan) {
-            // 主容器行前面的三角：▼ 展开、▶ 收起。点整行都能翻，这个记号只是让人知道「能点」。
-            // 没有子容器的（光杆主容器）不画记号也不给点——画了却点不动，比不画更让人困惑。
-            // 位置照留，让各行图标与名字对齐。
-            if (hasChildren(binding)) {
-                graphics.drawString(font, isExpanded(binding.id()) ? "▼" : "▶", cursor, y + 4,
-                        BoundUi.TEXT_DIM, false);
-            }
+        }
+        // 三角记号：▼ 展开、▶ 收起。并列成员行自己也可能带子行（它私有的从容器），所以缩进行
+        // 同样要画。没有子容器的（光杆主容器、没有私有从容器的并列成员）不画记号也不给点——
+        // 画了却点不动，比不画更让人困惑。图标位照留，让各行图标与名字对齐。
+        if (!orphan && hasChildren(binding)) {
+            graphics.drawString(font, isExpanded(binding.id()) ? "▼" : "▶", cursor, y + 4,
+                    BoundUi.TEXT_DIM, false);
+        }
+        if (!orphan) {
             cursor += 9;
         }
         if (!binding.iconItem().isEmpty()) {
@@ -564,36 +773,71 @@ class BoundContainerManageScreen extends Screen {
         int rightEdge = x + width - 4;
         int reserved = actionsWidth(binding) + 6;
         int aliveWidth = BoundUi.aliveTagWidth(status);
-        int tagsWidth = aliveWidth + BoundUi.tagsWidth(binding, parallel, slave, false)
-                + routeTagWidth(binding);
-        int nameWidth;
-        if (renaming) {
-            nameWidth = font.width(displayName(binding));
-        } else {
-            int nameMax = Math.max(30, rightEdge - reserved - tagsWidth - 4 - cursor);
-            nameWidth = BoundUi.clipText(graphics, Component.literal(displayName(binding)), cursor, y + 4,
+        int machineWidth = BoundUi.machineTagWidth(state);
+        // 标签块先按原字号量（BoundUi 那几个 Width 方法只测量、不绘制），再整体折到 TAG_SCALE：
+        // 原字号的 tagsRawWidth 给块内绘制用，折算后的 tagsWidth 给名字让位用，两边对得上才不重叠。
+        int tagsRawWidth = aliveWidth + BoundUi.tagsWidth(binding, parallel, slave, false)
+                + machineWidth + routeTagWidth(binding);
+        int tagsWidth = scaleTagWidth(tagsRawWidth);
+        // 这一帧名字有没有被裁、标签有没有整块没画出来：两种情况都要靠悬停提示兜底（见 rowTip）。
+        boolean nameClipped = false;
+        boolean tagsDropped = false;
+        // 改名时整行让给输入框：不画名字也不画标签，宽度自然不必算。
+        if (!renaming) {
+            String name = displayName(binding);
+            // 名字列 = 行宽 − 标签列 − 间距 − 图标 / 按钮等固定占位。下限原来是 30（两个字加「…」），
+            // 现在是 NAME_MIN_WIDTH；真放不下时让位的是标签——它整块不画还有 tooltip 兜底。
+            int nameMax = Math.max(NAME_MIN_WIDTH, rightEdge - reserved - tagsWidth - 4 - cursor);
+            nameClipped = font.width(name) > nameMax;
+            int nameWidth = BoundUi.clipText(graphics, Component.literal(name), cursor, y + 4,
                     nameMax, BoundUi.TEXT);
             int tagsX = cursor + nameWidth + 4;
-            // 存活性标签优先：一行太窄时先放弃角色标签，也不能放弃它——
-            // 「这个绑定还能不能用」比「它是什么角色」重要得多。
+            // 标签块整体平移 + 缩放后再画：块内坐标就是「缩小后的像素」，BoundUi 那套
+            // 「画一个、返回一个宽度」的累加逻辑原样能用，不必为缩放另写一份绘制。
+            // 可用的块内宽度得先把绝对像素折回去（tagBudget），否则缩放后右边界会算错。
+            int tagBudget = (int) Math.floor((rightEdge - reserved - tagsX) / TAG_SCALE);
+            graphics.pose().pushPose();
+            graphics.pose().translate(tagsX, y + 4, 0.0F);
+            graphics.pose().scale(TAG_SCALE, TAG_SCALE, 1.0F);
             int drawn = 0;
-            if (aliveWidth > 0 && tagsX + aliveWidth <= rightEdge - reserved) {
-                drawn += BoundUi.aliveTag(graphics, tagsX, y + 3, status);
-            }
-            if (tagsX + drawn + (tagsWidth - aliveWidth) <= rightEdge - reserved) {
-                drawn += BoundUi.tags(graphics, tagsX + drawn, y + 3, binding, parallel, slave, false);
-                // 类别标签只给主容器画：并列成员与从容器跟随父容器，它们身上永远没有类别。
-                if (binding.isMaster() && !binding.routeKeys().isEmpty()) {
-                    BoundUi.tag(graphics, tagsX + drawn, y + 3, routeTag(binding), BoundUi.TAG_ROUTE);
+            if (tagsRawWidth > 0) {
+                // 存活性标签优先：一行太窄时先放弃角色标签，也不能放弃它——
+                // 「这个绑定还能不能用」比「它是什么角色」重要得多。
+                if (aliveWidth > 0 && aliveWidth <= tagBudget) {
+                    drawn += BoundUi.aliveTag(graphics, 0, 0, status);
+                }
+                if (drawn + (tagsRawWidth - aliveWidth) <= tagBudget) {
+                    drawn += BoundUi.tags(graphics, drawn, 0, binding, parallel, slave, false);
+                    // 机器忙/闲排在角色标签之后、类别之前：它是「现在能不能投料」，
+                    // 比「它是什么角色」更贴近玩家这一刻的决定。
+                    drawn += BoundUi.machineTag(graphics, drawn, 0, state);
+                    // 类别标签只给主容器画：并列成员与从容器跟随父容器，它们身上永远没有类别。
+                    if (binding.isMaster() && !binding.routeKeys().isEmpty()) {
+                        drawn += BoundUi.tag(graphics, drawn, 0, routeTag(binding), BoundUi.TAG_ROUTE);
+                    }
+                } else {
+                    // 连角色标签都放不下：这一行的属性得在悬停提示里补全。
+                    tagsDropped = true;
                 }
             }
+            graphics.pose().popPose();
         }
 
         // 悬停整行都给说明，而不是只有那个十来像素高的标签条：红底一定会画出来，标签却可能因为
         // 一行太窄而整块没画，光有红底不给解释最让人摸不着头脑（用户实测反馈）。
         // 鼠标停在行内按钮上时按钮的提示会覆盖它——drawRowButtons 在本方法末尾才调用。
-        if (aliveWidth > 0 && BoundUi.inside(mouseX, mouseY, x, y, width, height)) {
-            pendingTooltip = BoundUi.aliveTip(status);
+        if (BoundUi.inside(mouseX, mouseY, x, y, width, height)) {
+            Component reason = null;
+            if (aliveWidth > 0) {
+                // 方块都不在了就先解释那个：它是「这条绑定还能不能用」里更硬的一档。
+                reason = BoundUi.aliveTip(status);
+            }
+            // 名字被裁掉、或者标签整块没画出来时，把完整内容补进提示：行内那点宽度只够
+            // 「两个字 + …」，悬停是唯一能把这一行看全的地方。两者都没发生时就保持原来的
+            // 单一原因提示，不给每一行都加一个多余的气泡。
+            pendingTooltip = nameClipped || tagsDropped
+                    ? rowTip(binding, nameClipped, tagsDropped, parallel, slave, status, state, reason)
+                    : reason;
         }
 
         int subY = row.indent() ? y + 14 : y + 17;
@@ -617,17 +861,22 @@ class BoundContainerManageScreen extends Screen {
             return;
         }
         drawRowButtons(graphics, binding, x + width, y, mouseX, mouseY);
-        // 整行可点：展开 / 收起这一组。**必须加在按钮之后**——命中判定按列表顺序取第一个，
+        // 整行可点：展开 / 收起这一行名下的子行。**必须加在按钮之后**——命中判定按列表顺序取第一个，
         // 按钮先入列才能在点击时优先于整行，否则点「改名」会变成展开。
-        if (!row.indent() && !orphan && hasChildren(binding)) {
+        if (!orphan && hasChildren(binding)) {
             hitTargets.add(new HitTarget(x, y, width, height, binding.id(), "toggle"));
         }
     }
 
-    /** 这一组名下有没有子项（并列成员 / 从容器）；没有就没什么可展开的。 */
-    private boolean hasChildren(BoundContainer master) {
-        int[] counts = groupCounts.get(master.id());
-        return counts != null && (counts[0] > 1 || counts[1] > 0);
+    /**
+     * 这一行名下有没有子行（并列成员 / 从容器）；没有就没什么可展开的。
+     *
+     * <p>比的是**原始个数**：从容器可以挂在并列成员下，所以子行数只有 1 也是真的能展开，
+     * 不能像主容器那样拿「含自己在内的台数 &gt; 1」当判据。
+     */
+    private boolean hasChildren(BoundContainer binding) {
+        int[] counts = childCounts.get(binding.id());
+        return counts != null && (counts[0] > 0 || counts[1] > 0);
     }
 
     /** 名字带 {@code ×N}（N = 主容器 + 并列成员，不含从容器）。组头删掉后，这个后缀归行名。 */
@@ -649,6 +898,111 @@ class BoundContainerManageScreen extends Screen {
         return font.width(routeTag(binding)) + 5 + 2;
     }
 
+    /**
+     * 标签块的占位宽度：把 {@link BoundUi} 量出来的原字号宽度折到 {@link #TAG_SCALE}。
+     *
+     * <p>取上整而不是四舍五入：缩放后的实际占位是小数，少算半像素就会让标签压到名字上。
+     */
+    private static int scaleTagWidth(int rawWidth) {
+        return (int) Math.ceil(rawWidth * TAG_SCALE);
+    }
+
+    /**
+     * 一行的悬停提示：完整名字 + 失效原因 + 全部属性标签，各占一行。
+     *
+     * <p>名字被行宽裁掉之后，界面上看不到完整名字，也没有别的地方能查；属性标签同理——
+     * 一行太窄时整块不画。悬停提示是唯一能把「这一行到底是什么、现在还能不能用」说全的地方。
+     * 行内画得下、名字也没被裁的行不调用它（见 {@link #drawRow}），免得每行都弹一个多余的气泡。
+     *
+     * @param nameClipped 名字是否被裁过；没裁过就不重复写一遍名字
+     * @param tagsDropped 属性标签是否没能整块画出来
+     * @param reason      已经算好的失效原因，没有就传 {@code null}
+     * @return 拼好的多行提示；一行内容都没有时返回 {@code null}
+     */
+    private Component rowTip(BoundContainer binding, boolean nameClipped, boolean tagsDropped,
+                             int parallel, int slave, BoundStatus status, MachineState state,
+                             Component reason) {
+        List<Component> lines = new ArrayList<>(3);
+        if (nameClipped) {
+            lines.add(Component.literal(displayName(binding)));
+        }
+        if (reason != null) {
+            lines.add(reason);
+        }
+        if (nameClipped || tagsDropped) {
+            Component summary = tagSummary(binding, parallel, slave, status, state);
+            if (summary != null) {
+                lines.add(summary);
+            }
+        }
+        if (lines.isEmpty()) {
+            return null;
+        }
+        // 原版 tooltip 自己按 \n 断行：拼成一个多行组件就行，不必自己算行高、画多行。
+        MutableComponent tip = Component.empty();
+        for (int i = 0; i < lines.size(); i++) {
+            if (i > 0) {
+                tip.append("\n");
+            }
+            tip.append(lines.get(i));
+        }
+        return tip;
+    }
+
+    /**
+     * 一行的属性标签文案，用「 · 」串成一行。
+     *
+     * <p>与行内画的标签是同一批、同一顺序（{@link BoundUi#tags}，再加上 {@link #drawRow} 里
+     * 后补的忙闲 / 类别）：行内标签会因为一行太窄而整块不画，悬停提示里必须能看全。
+     * 文案全部取自既有语言键，界面里不出现硬编码中文。
+     *
+     * @return 没有属性时返回 {@code null}
+     */
+    private Component tagSummary(BoundContainer binding, int parallel, int slave, BoundStatus status,
+                                 MachineState state) {
+        List<Component> tags = new ArrayList<>();
+        Component alive = BoundUi.aliveLabel(status);
+        if (alive != null) {
+            tags.add(alive);
+        }
+        if (binding.isMaster()) {
+            tags.add(Component.translatable("text.recipe_sender.tag_master"));
+            // 顺序与 BoundUi.tags 保持一致（主容器 → 整体 → 独立）：这一行只有在标签整块被
+            // 挤出、玩家只能靠悬停看属性时才会读到，两处的顺序必须一样，否则同一组容器的
+            // 属性在「画出来的」和「悬停看的」两种呈现里对不上。
+            if (binding.isUnified()) {
+                tags.add(Component.translatable("text.recipe_sender.tag_unified"));
+            }
+            if (parallel <= 1) {
+                tags.add(Component.translatable("text.recipe_sender.tag_independent"));
+            }
+        }
+        if (parallel > 1) {
+            tags.add(Component.translatable("text.recipe_sender.tag_parallel"));
+        }
+        if (slave > 0) {
+            tags.add(Component.translatable("text.recipe_sender.tag_slave", slave));
+        }
+        Component machine = BoundUi.machineLabel(state);
+        if (machine != null) {
+            tags.add(machine);
+        }
+        if (binding.isMaster() && !binding.routeKeys().isEmpty()) {
+            tags.add(routeTag(binding));
+        }
+        if (tags.isEmpty()) {
+            return null;
+        }
+        MutableComponent text = Component.empty();
+        for (int i = 0; i < tags.size(); i++) {
+            if (i > 0) {
+                text.append(" · ");
+            }
+            text.append(tags.get(i));
+        }
+        return text;
+    }
+
     private static String roleText(BoundContainer binding) {
         return binding.role() == BoundContainer.Role.SLAVE
                 ? Component.translatable("text.recipe_sender.tag_slave_role").getString()
@@ -660,13 +1014,24 @@ class BoundContainerManageScreen extends Screen {
         return parent == null ? "?" : parent.name();
     }
 
-    private int parallelCountOf(BoundContainer master) {
-        int[] counts = groupCounts.get(master.id());
-        return counts == null ? 1 : counts[0];
+    /**
+     * 含自己在内的机器台数，喂给 {@link BoundUi#tags} 的 {@code parallelCount}。
+     *
+     * <p>那个参数的口径是「这一组一共几台机器」（{@code <= 1} 画「独立」、{@code > 1} 画「并列组」），
+     * 所以主容器要拿「并列成员数 + 1」；非主容器自己就是一台、恒为 1——挂在它名下的从容器是它
+     * 私有的库存，不改变它是「这一组里的一员」这件事。
+     */
+    private int parallelCountOf(BoundContainer binding) {
+        if (!binding.isMaster()) {
+            return 1;
+        }
+        int[] counts = childCounts.get(binding.id());
+        return counts == null ? 1 : counts[0] + 1;
     }
 
-    private int slaveCountOf(BoundContainer master) {
-        int[] counts = groupCounts.get(master.id());
+    /** 直接挂在这个容器下面的从容器数（只算一层，不含并列成员名下的）。 */
+    private int slaveCountOf(BoundContainer binding) {
+        int[] counts = childCounts.get(binding.id());
         return counts == null ? 0 : counts[1];
     }
 
@@ -716,6 +1081,16 @@ class BoundContainerManageScreen extends Screen {
         }
     }
 
+    /**
+     * 一行上要有哪几个按钮。
+     *
+     * <p>流体中枢只留「改名 / 高亮 / 删除」：它是另一种**用途**而不是一种角色，没有父子关系，
+     * 也没有配方类别（服务端绑定中枢时就强制主容器 + 无父容器 + 无类别），所以「关系」与「类别」
+     * 对它一律不出现——摆了也点不出结果，只会让人以为有东西没生效。
+     *
+     * <p>1.0.38：「一键对齐电路」只加在整体模式的主容器行上，位置排在「类别」之后、「高亮」之前
+     * （见 {@link #alignCircuitAvailable}）。
+     */
     private List<Action> actionsFor(BoundContainer binding) {
         if (binding.id().equals(pendingDeleteId)) {
             return List.of(new Action(Component.translatable("text.recipe_sender.button_delete_confirm"),
@@ -724,12 +1099,20 @@ class BoundContainerManageScreen extends Screen {
         List<Action> actions = new ArrayList<>();
         actions.add(new Action(Component.translatable("text.recipe_sender.button_rename"), false, "rename",
                 Component.translatable("text.recipe_sender.tooltip_rename")));
-        actions.add(new Action(Component.translatable("text.recipe_sender.button_relation"), false, "relation",
-                Component.translatable("text.recipe_sender.tooltip_relation")));
-        // 「类别」只给主容器：并列成员与从容器跟随父容器，勾类别没有意义（方案 §6⑩ 明确不加）。
-        if (binding.isMaster()) {
-            actions.add(new Action(Component.translatable("text.recipe_sender.button_category"), false,
-                    "category", Component.translatable("text.recipe_sender.tooltip_category")));
+        if (!binding.isFluidHub()) {
+            actions.add(new Action(Component.translatable("text.recipe_sender.button_relation"), false,
+                    "relation", Component.translatable("text.recipe_sender.tooltip_relation")));
+            // 「类别」只给主容器：并列成员与从容器跟随父容器，勾类别没有意义（方案 §6⑩ 明确不加）。
+            if (binding.isMaster()) {
+                actions.add(new Action(Component.translatable("text.recipe_sender.button_category"), false,
+                        "category", Component.translatable("text.recipe_sender.tooltip_category")));
+                if (alignCircuitAvailable(binding)) {
+                    actions.add(new Action(
+                            Component.translatable("text.recipe_sender.button_align_circuit"), false,
+                            "align_circuit",
+                            Component.translatable("text.recipe_sender.tooltip_align_circuit")));
+                }
+            }
         }
         actions.add(new Action(Component.translatable("text.recipe_sender.button_highlight"), false, "highlight",
                 Component.translatable("text.recipe_sender.tooltip_highlight")));
@@ -738,7 +1121,56 @@ class BoundContainerManageScreen extends Screen {
         return actions;
     }
 
+    /**
+     * 「一键对齐电路」该不该出现在这一行上（1.0.38）。
+     *
+     * <p>两个条件缺一不可：
+     * <ul>
+     *   <li>整体模式（{@link BoundContainer#isUnified()}）：独立模式的语义就是「各机器电路可以不同」，
+     *       把整组强行写成同一个值等于替玩家改了玩法；</li>
+     *   <li>这一组至少两台机器（{@code memberCount() >= 2}）：组里只有主容器自己时「对齐整组」
+     *       没有任何可对齐的对象，点了也只是空转。</li>
+     * </ul>
+     *
+     * <p>刻意**不看**主容器此刻有没有电路：那是每秒刷新的快照，拿它决定按钮出不出现会让按钮
+     * 忽隐忽现（玩家正好在它消失的那一帧点下去反而什么都发生不了）。按钮稳定地在那儿，
+     * 点下去再按情况提示，见 {@link #alignGroupCircuit}。
+     */
+    private boolean alignCircuitAvailable(BoundContainer binding) {
+        return binding.isUnified() && BoundContainerClient.memberCount(binding.id()) >= 2;
+    }
+
     // ------------------------------------------------------------------ 交互
+
+    /**
+     * 切页签。
+     *
+     * <p>两页共用同一份行渲染、滚动偏移与命中区，所以切页签要当成「换了一整份列表」来处理：
+     * <ul>
+     *   <li>{@code entriesDirty}：行缓存作废，下一帧按新页签重建（见 {@link #entries()}）。</li>
+     *   <li>滚动归零、行位置表 {@code rowBounds} 清空、{@code lastEntries} 清空（滚轮按行边界翻，
+     *       拿上一页的行高会翻错）。</li>
+     *   <li><b>命中区 {@code hitTargets} 清空</b>：它是每帧在 {@code render()} 里重建的，但重建发生在
+     *       下一帧；切页签这一下就在 {@code mouseClicked} 里，同一帧内还可能有后续点击（连点、拖动）
+     *       与滚动，残留的矩形会让上一页的「删除 / 类别」等按钮仍然可点。清掉之后本帧只剩页签可点。</li>
+     *   <li>改名与「确认删除」取消：它们都挂在具体某一行上，而那一行已经不在当前页。</li>
+     * </ul>
+     */
+    private void setTab(Tab newTab) {
+        if (tab == newTab) {
+            return;
+        }
+        tab = newTab;
+        entriesDirty = true;
+        scrollOffset = 0;
+        hitTargets.clear();
+        rowBounds.clear();
+        lastEntries = List.of();
+        contentHeight = 0;
+        cancelRename();
+        pendingDeleteId = null;
+        syncToolbar();
+    }
 
     @Override
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
@@ -771,6 +1203,11 @@ class BoundContainerManageScreen extends Screen {
     }
 
     private void handleAction(HitTarget target) {
+        // 页签不是「某一行上的按钮」：先认它，再去查绑定。绑定 id 为 null 的命中项只可能是页签。
+        if (target.action().startsWith("tab:")) {
+            setTab(Tab.valueOf(target.action().substring("tab:".length())));
+            return;
+        }
         BoundContainer binding = BoundContainerClient.find(target.bindingId());
         if (binding == null) {
             return;
@@ -779,12 +1216,53 @@ class BoundContainerManageScreen extends Screen {
             case "rename" -> beginRename(binding);
             case "relation" -> openRelation(binding);
             case "category" -> openCategories(binding);
+            case "align_circuit" -> alignGroupCircuit(binding);
             case "toggle" -> toggleExpanded(binding.id());
             case "highlight" -> highlight(binding);
             case "delete" -> requestDelete(binding);
             default -> {
             }
         }
+    }
+
+    /**
+     * 一键对齐电路：把整组的电路写成主容器此刻的电路（1.0.38）。
+     *
+     * <p>参照值取 {@link BoundContainerClient#machineCircuitOf}，也就是每秒刷新的那份机器状态快照
+     * ——本界面开着时 {@code tick()} 一直在请求刷新（见 {@link #tick()}），所以这里读到的是最近
+     * 一秒内的状态。慢一拍最坏的结果是「对齐到一秒前主容器的电路」，而玩家刚改完主容器电路就又点
+     * 对齐，可接受；不刷新状态才是问题，那会让参照值变成「不知道」。
+     *
+     * <p><b>这个方法的重点全在 {@code machineCircuitOf} 的返回值形态上</b>（它给的是原始编号，
+     * 不是「能直接发出去的基准」）：
+     * <ul>
+     *   <li>{@code null} —— 主容器没有可调整的电路槽（普通箱子、非格雷机器），或者状态还没收到。
+     *       {@code NO_CIRCUIT_SLOT} 这个哨兵已经在 {@code machineCircuitOf} 里折成了 {@code null}。
+     *       **不发包**，只提示：服务端要的是一个可信的参照，客户端猜一个数字发过去会把整组写错。</li>
+     *   <li>{@code -1} —— 槽里放着<b>玩家自己的物品</b>（不是编程电路，见
+     *       {@code GtCircuitSupport#NO_CIRCUIT}），也就是「读不出来」。同样**不发包**：把它当基准
+     *       发出去，服务端会理解成「把整组电路清空」，等于替玩家删掉一整组机器的电路。</li>
+     *   <li>{@code 0} —— 槽是<b>空的</b>（GT 把空槽当电路 0）。这时基准应该是「整组都没有电路」，
+     *       所以发 {@code -1}（清空整组，与主容器当前状态一致），**不是**发 0：发 0 会给每台机器的
+     *       槽里塞一个 0 号编程电路物品。</li>
+     *   <li>{@code 1..32} —— 主容器装着该编号的电路，照发。</li>
+     * </ul>
+     *
+     * <p>「{@code -1} 是清空、{@code 0} 是空槽」是 {@link AlignGroupCircuitPacket} 与
+     * {@link com.lai.recipesender.integration.gt.GtCircuitSupport} 之间既有的坑，服务端也是这么
+     * 理解的（{@code BoundBindingService} 里 {@code circuit < 0} 走「已清空」的提示）。
+     */
+    private void alignGroupCircuit(BoundContainer master) {
+        Integer reference = BoundContainerClient.machineCircuitOf(master.id());
+        if (reference == null || reference < 0) {
+            // 本地提示：这不是服务端拒绝，而是客户端压根没发包（见上），所以不经由服务端回话。
+            RecipeSenderClient.notifyPlayer(
+                    Component.translatable("text.recipe_sender.align_circuit_no_reference"));
+            return;
+        }
+        // 空槽折算成「清空整组」：0 是 GT 给空槽的编号，直接发 0 会往每台机器里塞一个电路 0 物品。
+        int circuit = reference == 0 ? -1 : reference;
+        ModNetwork.CHANNEL.sendToServer(new AlignGroupCircuitPacket(master.id(), circuit));
     }
 
     /** 高亮：关掉界面回到世界，否则红框画在界面后面根本看不见。 */
@@ -1033,11 +1511,40 @@ class BoundContainerManageScreen extends Screen {
         }
     }
 
-    private record RowEntry(BoundContainer binding, boolean indent, boolean orphan, Component reason)
+    private record RowEntry(BoundContainer binding, int depth, boolean orphan, Component reason)
             implements Entry {
+        /** 是不是缩进过的子行。保留这个名字，行渲染与滚动里已有大量 {@code row.indent()} 调用。 */
+        boolean indent() {
+            return depth > 0;
+        }
+
         @Override
         public int height() {
-            return indent ? ROW_CHILD_HEIGHT : ROW_MASTER_HEIGHT;
+            return depth == 0 ? ROW_MASTER_HEIGHT : ROW_CHILD_HEIGHT;
+        }
+    }
+
+    /**
+     * 管理界面的两个页签。
+     *
+     * <p>页签直接对应绑定的**用途**（{@code BoundContainer.Kind}），所以没有另建数据结构：
+     * 分叉只在「数据源」与「每行有哪几个按钮」两处，行的渲染、滚动、搜索、改名两页共用。
+     */
+    private enum Tab {
+        /** 容器绑定：全部物品目标。 */
+        ITEMS("text.recipe_sender.manage_tab_items"),
+        /** 流体中枢：只列流体中枢。 */
+        FLUIDS("text.recipe_sender.manage_tab_fluids");
+
+        private final String labelKey;
+
+        Tab(String labelKey) {
+            this.labelKey = labelKey;
+        }
+
+        /** 页签文案。走语言键，界面里不出现硬编码中文。 */
+        Component label() {
+            return Component.translatable(labelKey);
         }
     }
 

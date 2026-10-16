@@ -104,7 +104,8 @@ public final class BoundContainerService {
      */
     public static BoundContainer bind(ServerPlayer player, ResourceKey<Level> dimension, BlockPos pos,
                                       String name, ItemStack icon, BoundContainer.Role role, UUID parentId) {
-        return bind(player, dimension, pos, name, icon, role, parentId, Set.of());
+        return bind(player, dimension, pos, name, icon, role, BoundContainer.Kind.ITEM_TARGET,
+                parentId, Set.of());
     }
 
     /**
@@ -116,6 +117,21 @@ public final class BoundContainerService {
     public static BoundContainer bind(ServerPlayer player, ResourceKey<Level> dimension, BlockPos pos,
                                       String name, ItemStack icon, BoundContainer.Role role, UUID parentId,
                                       Set<ResourceLocation> routes) {
+        return bind(player, dimension, pos, name, icon, role, BoundContainer.Kind.ITEM_TARGET,
+                parentId, routes);
+    }
+
+    /**
+     * 绑定一个坐标，并同时决定它的用途（物品目标 / 流体中枢）。
+     *
+     * <p>用途是落盘字段，创建之后不再由这里改：绑定弹窗只在新建时给出用途开关，
+     * 改用途要删掉重绑。
+     */
+    public static BoundContainer bind(ServerPlayer player, ResourceKey<Level> dimension, BlockPos pos,
+                                      String name, ItemStack icon, BoundContainer.Role role,
+                                      BoundContainer.Kind kind, UUID parentId,
+                                      Set<ResourceLocation> routes) {
+        BoundContainer.Kind effectiveKind = kind == null ? BoundContainer.Kind.ITEM_TARGET : kind;
         BoundContainer.Role effectiveRole = role == null ? BoundContainer.Role.MASTER : role;
         UUID effectiveParent = effectiveRole == BoundContainer.Role.MASTER ? null : parentId;
         List<BoundContainer> bindings = new ArrayList<>(list(player));
@@ -136,14 +152,17 @@ public final class BoundContainerService {
                 // 放在 withRole 之后：withRole 会把非主容器的类别清空，顺序反过来会被它抹掉。
                 updated = updated.withRoutes(routes);
             }
+            // 放在最后：转成流体中枢时要把角色与类别一并清掉。
+            updated = updated.withKind(effectiveKind);
             bindings.set(index, updated);
             save(player, bindings);
             return updated;
         }
         BoundContainer created = new BoundContainer(UUID.randomUUID(), name, dimension, pos,
-                icon, effectiveRole, effectiveParent,
+                icon, effectiveRole, effectiveKind, effectiveParent,
                 routes == null ? Set.of() : Set.copyOf(routes),
-                System.currentTimeMillis());
+                System.currentTimeMillis(),
+                BoundContainer.GroupMode.INDEPENDENT);
         bindings.add(created);
         save(player, bindings);
         return created;
@@ -317,6 +336,8 @@ public final class BoundContainerService {
             case CHUNK_UNLOADED -> "text.recipe_sender.bound_status.chunk_unloaded";
             case MISSING -> "text.recipe_sender.bound_status.missing";
             case NO_ITEM_HANDLER -> "text.recipe_sender.bound_status.no_item_handler";
+            case NO_FLUID_HANDLER -> "text.recipe_sender.bound_status.no_fluid_handler";
+            case TOO_FAR -> "text.recipe_sender.bound_status.too_far";
             case FORBIDDEN -> "text.recipe_sender.bound_status.forbidden";
         };
     }

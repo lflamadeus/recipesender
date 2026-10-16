@@ -4,6 +4,7 @@ import com.lai.recipesender.model.BoundContainer;
 import com.lai.recipesender.model.BoundDetail;
 import com.lai.recipesender.model.BoundStatus;
 import com.lai.recipesender.model.NoticeSeverity;
+import com.lai.recipesender.network.packet.MachineStatusPacket;
 import net.minecraft.network.chat.Component;
 
 import java.util.List;
@@ -32,6 +33,23 @@ public final class ClientPacketHandler {
                                                int overflowBatches, BoundDetail detail) {
         RecipeSenderClient.acceptBoundInsertResult(requestId, bindingId, status, insertedBatches,
                 requestedBatches, overflowBatches, detail);
+    }
+
+    /** 转交一次「直达」的结果。 */
+    public static void acceptDirectInsertResult(long requestId, UUID bindingId, BoundStatus status,
+                                                int insertedBatches, int requestedBatches,
+                                                BoundDetail detail) {
+        RecipeSenderClient.acceptDirectInsertResult(requestId, bindingId, status, insertedBatches,
+                requestedBatches, detail);
+    }
+
+    /**
+     * 转交一次「每台绑定机器现在忙不忙」的全量状态。
+     *
+     * <p>只丢进缓存，界面自己去取：状态每秒刷新，界面每帧都从缓存读，两边不必知道对方。
+     */
+    public static void acceptMachineStatus(List<MachineStatusPacket.Entry> entries) {
+        BoundContainerClient.acceptMachineStates(entries);
     }
 
     /**

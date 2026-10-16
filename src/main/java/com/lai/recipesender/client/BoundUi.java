@@ -2,6 +2,7 @@ package com.lai.recipesender.client;
 
 import com.lai.recipesender.model.BoundContainer;
 import com.lai.recipesender.model.BoundStatus;
+import com.lai.recipesender.model.MachineState;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.screens.Screen;
@@ -36,6 +37,8 @@ final class BoundUi {
     static final int TAG_MASTER = 0xFF4F8A3F;
     /** 独立（没有并列成员的主容器）。 */
     static final int TAG_INDEPENDENT = 0xFF7D7D7D;
+    /** 整体模式（整组电路必须一致，在运行的机器也接料）。 */
+    static final int TAG_UNIFIED = 0xFF2F8F8F;
     /** 并列组。 */
     static final int TAG_PARALLEL = 0xFF2F6FA8;
     /** 从容器。 */
@@ -50,6 +53,10 @@ final class BoundUi {
     static final int TAG_UNKNOWN = 0xFF8A8A8A;
     /** 绑定记在别的维度。 */
     static final int TAG_OTHER_DIMENSION = 0xFF6B6B6B;
+    /** 机器空闲。 */
+    static final int TAG_MACHINE_IDLE = 0xFF4F8A3F;
+    /** 机器正在运行。 */
+    static final int TAG_MACHINE_BUSY = 0xFFB8860B;
 
     private BoundUi() {
     }
@@ -87,7 +94,8 @@ final class BoundUi {
     /**
      * 按原型 {@code tags()} 的顺序依次画角色标签，返回总宽度。
      *
-     * <p>顺序与含义：主容器 → 独立（主容器且没有并列成员）→ 并列组 → 从 ×N → 上次。
+     * <p>顺序与含义：主容器 → 整体（组模式为整体，1.0.38）→ 独立（主容器且没有并列成员）→ 并列组
+     * → 从 ×N → 上次。
      * 并列组标签**不带数字**（组的规模已经体现在名字的 {@code ×N} 后缀里）。
      */
     static int tags(GuiGraphics graphics, int x, int y, BoundContainer binding, int parallelCount,
@@ -96,6 +104,12 @@ final class BoundUi {
         if (binding.isMaster()) {
             cursor += tag(graphics, cursor, y, Component.translatable("text.recipe_sender.tag_master"),
                     TAG_MASTER) + 2;
+            // 1.0.38：组模式与「有没有并列成员」是两件事，所以整体模式单独占一个标签，
+            // 独立模式不画（默认就是独立，画出来只是噪音）。
+            if (binding.isUnified()) {
+                cursor += tag(graphics, cursor, y,
+                        Component.translatable("text.recipe_sender.tag_unified"), TAG_UNIFIED) + 2;
+            }
             if (parallelCount <= 1) {
                 cursor += tag(graphics, cursor, y,
                         Component.translatable("text.recipe_sender.tag_independent"), TAG_INDEPENDENT) + 2;
@@ -126,6 +140,9 @@ final class BoundUi {
         int width = 0;
         if (binding.isMaster()) {
             width += font.width(Component.translatable("text.recipe_sender.tag_master")) + 5 + 2;
+            if (binding.isUnified()) {
+                width += font.width(Component.translatable("text.recipe_sender.tag_unified")) + 5 + 2;
+            }
             if (parallelCount <= 1) {
                 width += font.width(Component.translatable("text.recipe_sender.tag_independent")) + 5 + 2;
             }
@@ -186,6 +203,39 @@ final class BoundUi {
     static int aliveTagWidth(BoundStatus status) {
         Component label = aliveLabel(status);
         return label == null ? 0 : Minecraft.getInstance().font.width(label) + 5 + 2;
+    }
+
+    /**
+     * 机器忙/闲短标签的文案；{@code null}（含「未知」）时返回 {@code null}，表示什么都不画。
+     *
+     * <p>忙/闲只有服务端算得出来（客户端可能没有能力表、也不该去加载区块），所以状态是每秒
+     * 推一次的快照，未知时宁可什么都不画，也不能把「没收到」显示成「空闲」——那会让玩家以为
+     * 可以投料。
+     */
+    static Component machineLabel(MachineState state) {
+        if (state == null) {
+            return null;
+        }
+        return switch (state) {
+            case IDLE -> Lang.message("text.recipe_sender.machine_idle", "空闲");
+            case BUSY -> Lang.message("text.recipe_sender.machine_busy", "运行中");
+            case NOT_A_MACHINE -> null;
+        };
+    }
+
+    /** 与 {@link #machineTag} 对应的宽度，只测量不绘制；不画时返回 0。 */
+    static int machineTagWidth(MachineState state) {
+        Component label = machineLabel(state);
+        return label == null ? 0 : Minecraft.getInstance().font.width(label) + 5;
+    }
+
+    /** 画机器忙/闲短标签，返回它占用的宽度；未知或不是机器时返回 0，什么都不画。 */
+    static int machineTag(GuiGraphics graphics, int x, int y, MachineState state) {
+        Component label = machineLabel(state);
+        if (label == null) {
+            return 0;
+        }
+        return tag(graphics, x, y, label, state == MachineState.BUSY ? TAG_MACHINE_BUSY : TAG_MACHINE_IDLE);
     }
 
     /**

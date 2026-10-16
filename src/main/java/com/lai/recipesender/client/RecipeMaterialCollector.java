@@ -1,15 +1,21 @@
 package com.lai.recipesender.client;
 
+import com.lai.recipesender.config.RecipeSenderConfig;
+import com.lai.recipesender.model.RecipeFluidSpec;
 import com.lai.recipesender.model.RecipeIngredientSpec;
 import com.lai.recipesender.network.packet.InsertRecipeItemsPacket;
 import com.lai.recipesender.service.TransferPlanner;
 import dev.emi.emi.api.recipe.EmiRecipe;
 import dev.emi.emi.api.stack.EmiIngredient;
 import dev.emi.emi.api.stack.EmiStack;
+import dev.emi.emi.api.stack.FluidEmiStack;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.material.Fluid;
+import net.minecraftforge.fluids.FluidStack;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -27,7 +33,7 @@ final class RecipeMaterialCollector {
             return 0;
         }
         int lower = 0;
-        int upper = RecipeIngredientSpec.MAX_BATCHES + 1;
+        int upper = RecipeSenderConfig.maxBatches() + 1;
         while (lower + 1 < upper) {
             int candidate = lower + (upper - lower) / 2;
             if (canCollect(recipe, player, candidate)) {
@@ -46,7 +52,7 @@ final class RecipeMaterialCollector {
      */
     static int countInsertableBatches(EmiRecipe recipe, Player player, AbstractContainerMenu menu,
                                       int availableBatches) {
-        int upperBound = Math.min(availableBatches, RecipeIngredientSpec.MAX_BATCHES);
+        int upperBound = Math.min(availableBatches, RecipeSenderConfig.maxBatches());
         if (recipe == null || player == null || menu == null || upperBound < 1) {
             return 0;
         }
@@ -123,10 +129,59 @@ final class RecipeMaterialCollector {
         return List.copyOf(result);
     }
 
+    /**
+     * 将 EMI 输入里的流体部分转换为服务端可验证的流体需求。
+     *
+     * <p>只认 {@link FluidEmiStack}：物品输入项里的物品候选在这里被自然跳过，配方里没有流体时
+     * 整张表就是空的。用量与「这是什么流体」分开表达：候选一律按 1 mB 建堆，每一份要多少由
+     * {@link RecipeFluidSpec#amountPerBatch()} 单独带（见该类的说明）。
+     *
+     * <p>只在配置打开流体支持、且这次是「直达」时才会被调用（见 {@code RecipeSenderClient}）：
+     * 反转与绑定发送的材料一律从玩家背包走，与流体中枢无关。
+     */
+    static List<RecipeFluidSpec> createFluidSpecs(EmiRecipe recipe) {
+        if (recipe == null) {
+            return List.of();
+        }
+        List<RecipeFluidSpec> result = new ArrayList<>();
+        for (EmiIngredient ingredient : recipe.getInputs()) {
+            long amount = ingredient.getAmount();
+            if (amount <= 0 || amount > RecipeFluidSpec.MAX_AMOUNT_PER_BATCH) {
+                continue;
+            }
+            List<FluidStack> options = new ArrayList<>();
+            for (EmiStack stack : ingredient.getEmiStacks()) {
+                if (options.size() >= RecipeFluidSpec.MAX_OPTIONS) {
+                    break;
+                }
+                if (!(stack instanceof FluidEmiStack fluidStack)) {
+                    continue;
+                }
+                // getKey() 在 EmiStack 上的声明类型是 Object，流体这一侧实际放的是 Fluid。
+                if (!(fluidStack.getKey() instanceof Fluid fluid)) {
+                    continue;
+                }
+                CompoundTag nbt = fluidStack.getNbt();
+                options.add(new FluidStack(fluid, 1, nbt));
+            }
+            if (options.isEmpty()) {
+                continue;
+            }
+            RecipeFluidSpec spec = new RecipeFluidSpec((int) amount, options);
+            if (spec.isValid()) {
+                result.add(spec);
+            }
+            if (result.size() >= RecipeFluidSpec.MAX_FLUIDS) {
+                break;
+            }
+        }
+        return List.copyOf(result);
+    }
+
     /** 按指定份数从背包快照中规划正向投放材料。 */
     static CollectionResult collect(EmiRecipe recipe, Player player, int batches) {
         if (recipe == null || player == null || batches < 1
-                || batches > RecipeIngredientSpec.MAX_BATCHES) {
+                || batches > RecipeSenderConfig.maxBatches()) {
             return CollectionResult.failure("配方份数超出允许范围");
         }
         List<ItemStack> remaining = copyInventory(player);

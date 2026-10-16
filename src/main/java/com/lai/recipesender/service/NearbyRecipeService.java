@@ -1,5 +1,6 @@
 package com.lai.recipesender.service;
 
+import com.lai.recipesender.config.RecipeSenderConfig;
 import com.lai.recipesender.integration.findme.FindMeExtendedAdapter;
 import com.lai.recipesender.model.RecipeIngredientSpec;
 import com.lai.recipesender.network.ModNetwork;
@@ -58,16 +59,20 @@ public final class NearbyRecipeService {
         int available = 0;
         try {
             if (FindMeExtendedAdapter.isAvailable()) {
+                Predicate<BlockPos> searchable = containerFilter(player, Set.of());
+                // 两种模式都统计玩家背包与快捷栏：反转模式的材料取回背包，背包里的现成材料当然算数；
+                // 直达模式也一样（1.0.32 起直达会把背包与快捷栏里的材料直接送进目标容器），
+                // 所以「周围能做几份」对两边是同一个数字。
                 available = countAvailable(packet.ingredients(),
-                        captureStocks(player, searchableContainers(player)));
+                        captureStocks(player, searchable, packet.ingredients()));
             }
         } catch (RuntimeException exception) {
             LOGGER.warn("统计玩家 {} 周围的配方材料失败",
                     player.getGameProfile().getName(), exception);
         }
 
-        QUERY_STATES.put(player.getUUID(),
-                new QueryState(currentTick, List.copyOf(packet.ingredients()), available));
+        QUERY_STATES.put(player.getUUID(), new QueryState(currentTick,
+                List.copyOf(packet.ingredients()), available));
         sendAvailability(player, packet.requestId(), available);
     }
 
@@ -113,7 +118,7 @@ public final class NearbyRecipeService {
     /** 校验请求后，从周围容器取回背包缺少的材料。 */
     public static synchronized void pull(ServerPlayer player, NearbyRecipePullPacket packet) {
         if (player == null || packet == null || packet.batches() < 1
-                || packet.batches() > RecipeIngredientSpec.MAX_BATCHES
+                || packet.batches() > RecipeSenderConfig.maxBatches()
                 || !validIngredients(packet.ingredients())
                 || !FindMeExtendedAdapter.isAvailable()) {
             return;
@@ -121,7 +126,8 @@ public final class NearbyRecipeService {
 
         try {
             Predicate<BlockPos> searchable = searchableContainers(player);
-            PullPlan plan = createPlan(packet.ingredients(), captureStocks(player, searchable),
+            PullPlan plan = createPlan(packet.ingredients(),
+                    captureStocks(player, searchable, packet.ingredients()),
                     packet.batches());
             if (!plan.success() || plan.items().isEmpty()) {
                 return;
@@ -192,7 +198,7 @@ public final class NearbyRecipeService {
     /** 使用二分查找快速计算最大可制作份数。 */
     private static int countAvailable(List<RecipeIngredientSpec> ingredients, StockSnapshot snapshot) {
         int lower = 0;
-        int upper = RecipeIngredientSpec.MAX_BATCHES + 1;
+        int upper = RecipeSenderConfig.maxBatches() + 1;
         while (lower + 1 < upper) {
             int candidate = lower + (upper - lower) / 2;
             if (createPlan(ingredients, snapshot, candidate).success()) {
@@ -264,15 +270,62 @@ public final class NearbyRecipeService {
      * 扫描范围内的每个方块实体共用同一份判定；黑名单为空时用常量过滤器，连哈希查表都省掉。
      */
     private static Predicate<BlockPos> searchableContainers(ServerPlayer player) {
+        return containerFilter(player, Set.of());
+    }
+
+    /**
+     * 通用容器过滤器：FindMeExtended 黑名单里的坐标，加上本次调用额外要排除的坐标。
+     *
+     * <p>直达模式用它把<b>目标容器自己</b>排除在外。目标容器也在搜索范围内，不排除的话
+     * 就会「从输入总线里掏出材料再塞回同一个输入总线」：统计出的份数是假的（材料本来就在
+     * 目标里），而真正搬进目标的数量是零，玩家按一下什么也没发生。
+     *
+     * <p>黑名单与排除集都为空时返回常量过滤器，连哈希查表都省掉。
+     */
+    public static Predicate<BlockPos> containerFilter(ServerPlayer player, Set<BlockPos> excluded) {
         Set<BlockPos> blacklisted = FindMeExtendedAdapter.blacklistedPositions(player.serverLevel());
-        return blacklisted.isEmpty() ? container -> true : container -> !blacklisted.contains(container);
+        Set<BlockPos> skip = excluded == null ? Set.of() : excluded;
+        if (blacklisted.isEmpty() && skip.isEmpty()) {
+            return container -> true;
+        }
+        return container -> !blacklisted.contains(container) && !skip.contains(container);
+    }
+
+    /**
+     * 判断一份物品是不是本次配方要用的材料。
+     * <p>
+     * 统计周围容器时用它筛掉无关物品：快照里无关的物品永远匹配不上配方，留着只会让模拟抽取去碰
+     * 别人的槽位，而别人的 {@code extractItem} 可能有副作用（GTO 无人机仓的无人机缓存就是这么被
+     * 清掉的，见 FindMeExtendedAdapter.snapshotNearby）。配方为空时放行全部，退回改动前的行为。
+     */
+    public static Predicate<ItemStack> relevance(List<RecipeIngredientSpec> ingredients) {
+        if (ingredients == null || ingredients.isEmpty()) {
+            return stack -> true;
+        }
+        List<RecipeIngredientSpec> specs = List.copyOf(ingredients);
+        return stack -> {
+            for (RecipeIngredientSpec spec : specs) {
+                if (spec.matches(stack)) {
+                    return true;
+                }
+            }
+            return false;
+        };
     }
 
     /** 创建包含玩家背包和周围容器的材料快照。 */
     private static StockSnapshot captureStocks(ServerPlayer player,
-                                               Predicate<BlockPos> searchable) {
-        List<ItemStack> inventoryItems = player.getInventory().items;
-        List<ItemStack> nearbyItems = FindMeExtendedAdapter.snapshotNearby(player, searchable);
+                                               Predicate<BlockPos> searchable,
+                                               List<RecipeIngredientSpec> ingredients) {
+        return buildSnapshot(player.getInventory().items,
+                FindMeExtendedAdapter.snapshotNearby(player, searchable, relevance(ingredients)));
+    }
+
+    /**
+     * 把背包堆与周围堆合成一份快照；背包堆标 {@code nearby = false}，只用于算份数。
+     */
+    private static StockSnapshot buildSnapshot(List<ItemStack> inventoryItems,
+                                               List<ItemStack> nearbyItems) {
         List<Stock> stocks = new ArrayList<>(inventoryItems.size() + nearbyItems.size());
         for (ItemStack stack : inventoryItems) {
             if (!stack.isEmpty()) {
@@ -289,6 +342,83 @@ public final class NearbyRecipeService {
             counts[index] = stocks.get(index).stack().getCount();
         }
         return new StockSnapshot(List.copyOf(stocks), counts);
+    }
+
+    /**
+     * 直达模式的快照：背包（含快捷栏）与周围的材料<b>都</b>算来源。
+     *
+     * <p>与 {@link #buildSnapshot} 的唯一区别是背包堆也标 {@code nearby = true}：反转模式只把背包
+     * 用来抵需求、抽取一律去周围容器（材料最终要进背包），而直达是把材料从来源直接搬进目标容器，
+     * 背包里的现成材料同样可以直接搬过去，所以它必须是合法的抽取来源。
+     */
+    private static StockSnapshot buildDirectSnapshot(List<ItemStack> inventoryItems,
+                                                     List<ItemStack> nearbyItems) {
+        List<Stock> stocks = new ArrayList<>(inventoryItems.size() + nearbyItems.size());
+        for (ItemStack stack : inventoryItems) {
+            if (!stack.isEmpty()) {
+                stocks.add(new Stock(stack.copy(), true));
+            }
+        }
+        for (ItemStack stack : nearbyItems) {
+            if (!stack.isEmpty()) {
+                stocks.add(new Stock(stack.copy(), true));
+            }
+        }
+        int[] counts = new int[stocks.size()];
+        for (int index = 0; index < stocks.size(); index++) {
+            counts[index] = stocks.get(index).stack().getCount();
+        }
+        return new StockSnapshot(List.copyOf(stocks), counts);
+    }
+
+    /**
+     * 直达模式一次投放的规划结果。
+     *
+     * @param batches      按背包与周围容器的并集算出来的、这一次真正搬得动的份数
+     * @param requirements 每项材料的具体物品堆，数量 = 每份用量 × {@code batches}
+     */
+    public record DirectPlan(int batches, List<ItemStack> requirements) {
+    }
+
+    /**
+     * 规划一次直达投放：能搬几份、每份要什么。
+     *
+     * <p>来源是玩家背包（含快捷栏）与周围容器的<b>并集</b>，份数用 {@link #countAvailable} 算，
+     * 与反转模式共用同一套「匹配的容器按存量从多到少消耗」语义，保证显示给玩家的数字和真搬得动的
+     * 数字一致。材料清单取每项里存量最多的候选（{@code candidates} 已按存量降序排列），并把同种
+     * 物品合并——配方把一种材料拆成两格很常见，合并后抽料只扫一遍搜索范围。
+     *
+     * @param inventoryItems 玩家背包与快捷栏的物品
+     * @param nearbyStacks   周围容器里的物品堆
+     */
+    public static DirectPlan planDirect(List<RecipeIngredientSpec> ingredients,
+                                        List<ItemStack> inventoryItems, List<ItemStack> nearbyStacks,
+                                        int requestedBatches) {
+        if (!validIngredients(ingredients) || requestedBatches < 1) {
+            return new DirectPlan(0, List.of());
+        }
+        StockSnapshot snapshot = buildDirectSnapshot(
+                inventoryItems == null ? List.of() : inventoryItems,
+                nearbyStacks == null ? List.of() : nearbyStacks);
+        int batches = Math.min(requestedBatches, countAvailable(ingredients, snapshot));
+        if (batches < 1) {
+            return new DirectPlan(0, List.of());
+        }
+        PullPlan plan = createPlan(ingredients, snapshot, batches);
+        if (!plan.success()) {
+            return new DirectPlan(0, List.of());
+        }
+        List<ItemStack> requirements = new ArrayList<>();
+        for (ItemPlan item : plan.items()) {
+            ItemStack candidate = item.candidates().get(0);
+            int existing = indexOfSameItem(requirements, candidate);
+            if (existing < 0) {
+                requirements.add(candidate.copyWithCount(item.amount));
+            } else {
+                requirements.get(existing).grow(item.amount);
+            }
+        }
+        return new DirectPlan(batches, List.copyOf(requirements));
     }
 
     /** 校验配方输入数量和每项材料描述。 */

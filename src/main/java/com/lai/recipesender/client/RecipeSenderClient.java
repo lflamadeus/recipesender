@@ -1,23 +1,28 @@
 package com.lai.recipesender.client;
 
 import com.lai.recipesender.RecipeSenderMod;
+import com.lai.recipesender.config.RecipeSenderConfig;
 import com.lai.recipesender.integration.findme.FindMeExtendedAdapter;
 import com.lai.recipesender.integration.gt.GtCircuitSupport;
 import com.lai.recipesender.model.BoundContainer;
 import com.lai.recipesender.model.BoundDetail;
 import com.lai.recipesender.model.BoundStatus;
 import com.lai.recipesender.model.NoticeSeverity;
+import com.lai.recipesender.model.RecipeFluidSpec;
 import com.lai.recipesender.model.RecipeIngredientSpec;
 import com.lai.recipesender.network.ModNetwork;
 import com.lai.recipesender.network.packet.BindContainerPacket;
 import com.lai.recipesender.network.packet.ClearContainerCircuitPacket;
+import com.lai.recipesender.network.packet.DirectInsertToBoundPacket;
 import com.lai.recipesender.network.packet.InsertRecipeItemsPacket;
 import com.lai.recipesender.network.packet.InsertRecipeItemsToBoundPacket;
+import com.lai.recipesender.network.packet.MachineStatusRequestPacket;
 import com.lai.recipesender.network.packet.NearbyRecipePullPacket;
 import com.lai.recipesender.network.packet.NearbyRecipeQueryPacket;
 import com.lai.recipesender.network.packet.SelectBoundTargetPacket;
 import com.lai.recipesender.network.packet.SetContainerCircuitPacket;
 import com.lai.recipesender.service.BoundContainerService;
+import com.lai.recipesender.service.BoundGroupResolver;
 import com.lai.recipesender.service.BoundTargetResolver;
 import com.mojang.blaze3d.platform.InputConstants;
 import dev.emi.emi.api.EmiApi;
@@ -38,6 +43,7 @@ import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraftforge.api.distmarker.Dist;
@@ -52,6 +58,7 @@ import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.eventbus.api.EventPriority;
 import net.minecraftforge.eventbus.api.IEventBus;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fluids.FluidStack;
 import net.minecraftforge.fml.common.Mod;
 import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
@@ -71,17 +78,40 @@ public final class RecipeSenderClient {
 
     private static final int CONTROL_STEP = 64;
     private static final int SHIFT_STEP = 8;
+    /**
+     * 「全部数量」的第二个键：英文键盘主键区的 1。
+     *
+     * <p>与 Alt 完全等价——选份数期间按住它滚动直接给满，单独按它当场锁满（见 {@link #isFillAllDown()}）。
+     * 用 keysym 而不是扫描码：玩家认的是键帽上那个 1。
+     */
+    private static final int FILL_ALL_KEY = GLFW.GLFW_KEY_1;
     private static final long AVAILABILITY_REFRESH_INTERVAL_TICKS = 10L;
+    /**
+     * 选择期间补问机器状态的间隔。
+     *
+     * <p>整体模式的 HUD 预检要读每台成员机器此刻的电路，而客户端只有收到服务端快照才知道；
+     * 服务端每秒才推一次，问得比这更勤没有意义。见 {@link #onClientTick}。
+     */
+    private static final long MACHINE_STATUS_REFRESH_INTERVAL_TICKS = 20L;
     /** 服务端统计请求的等待上限；超时后解除等待，避免界面永久卡在“统计中”。 */
     private static final long AVAILABILITY_TIMEOUT_TICKS = 40L;
     private static final AtomicLong REQUEST_SEQUENCE = new AtomicLong();
     /** 「发送到已绑定容器」的请求号；与反转统计分开，两边的回执互不干扰。 */
     private static final AtomicLong BOUND_REQUEST_SEQUENCE = new AtomicLong();
+    /** 「直达」的请求号；同样与另外两条通路分开，回执只认自己的号。 */
+    private static final AtomicLong DIRECT_REQUEST_SEQUENCE = new AtomicLong();
 
     /** 发送模式的优先级编号；数字越大优先级越高，见 {@link #onClientTick}。 */
     private static final int MODE_FORWARD = 0;
     private static final int MODE_BOUND = 1;
     private static final int MODE_REVERSE = 2;
+    /**
+     * 反转键与绑定键同时按住 = 直达：材料从周围容器直接进已绑定容器，不进玩家背包。
+     *
+     * <p>优先级最高：它是「反转」与「绑定发送」两个既有模式叠加出来的第三种语义，
+     * 组合键必须先于单键被判定，否则同时按住时会被当成其中某一个。
+     */
+    private static final int MODE_DIRECT = 3;
 
     private static final KeyMapping INSERT_RECIPE_KEY = new KeyMapping(
             "key.recipe_sender.insert", KeyConflictContext.GUI, KeyModifier.NONE,
@@ -113,10 +143,41 @@ public final class RecipeSenderClient {
     private static final KeyMapping MANAGE_KEY = new KeyMapping(
             "key.recipe_sender.manage", KeyConflictContext.UNIVERSAL, KeyModifier.CONTROL,
             InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_B, "key.categories.recipe_sender");
+    /**
+     * 直达模式键：按住它 = 直达，等价于同时按住反转键与绑定键。
+     *
+     * <p><b>默认不绑任何键</b>（{@code GLFW_KEY_UNKNOWN} 即 {@code InputConstants.UNKNOWN}）：
+     * 组合键在部分键盘/鼠标上不好按（反转键默认是鼠标侧键），所以给一个「一键直达」的入口，
+     * 但要不要用、绑哪个键由玩家在控制设置里自己决定——默认占用一个键位反而会与玩家的键位规划冲突。
+     * 未绑定时 {@link #isKeyHeld} 恒为 false，等价于这个键不存在，组合键照常可用。
+     *
+     * <p>上下文是 {@code GUI}：直达的起点必须是 EMI 侧栏里悬停的那条配方，只有界面里才谈得上。
+     */
+    private static final KeyMapping DIRECT_KEY = new KeyMapping(
+            "key.recipe_sender.direct", KeyConflictContext.GUI, KeyModifier.NONE,
+            InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_UNKNOWN, "key.categories.recipe_sender");
+    /**
+     * 忽略配方液体键：按住它发送时，这次直达只投物品与电路，不取也不灌流体。
+     *
+     * <p>与反转键、绑定键、直达键同一套用法：<b>按住生效</b>，不是切换键。判定与发送模式一样
+     * 「只置位、不撤销」：本次选择期间按住过就算数，松键顺序不影响结果——先松它、再松直达键
+     * 也一样忽略（见 {@code Selection#ignoreFluids} 与 {@code onClientTick}）。
+     *
+     * <p>实现上等价于把配置里的「流体支持」临时关掉这一次：服务端收到空流体表就只搬物品。
+     * 不新增网络字段，也不动协议版本。
+     *
+     * <p>默认 {@code ~}。反转键的默认值同样是 {@code ~}，所以没改过键的玩家会在控制设置里
+     * 看到一处冲突提示（两处会同时生效：反转 + 忽略液体）；把其中一个改掉即可。
+     */
+    private static final KeyMapping IGNORE_FLUIDS_KEY = new KeyMapping(
+            "key.recipe_sender.ignore_fluids", KeyConflictContext.GUI, KeyModifier.NONE,
+            InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_GRAVE_ACCENT, "key.categories.recipe_sender");
 
     private static long clientTicks;
     private static long nextAvailabilityRefreshTick;
     private static long availabilityRequestTick;
+    /** 下一次「选择期间补问机器状态」的 tick；见 {@link #onClientTick}。 */
+    private static long nextMachineStatusRefreshTick;
     /**
      * 上一次统计（背包可制作份数 / 目标容器可容纳份数）算的是哪一份内容。
      *
@@ -152,6 +213,13 @@ public final class RecipeSenderClient {
         boolean reverseMode;
         /** 当前选择是不是「发送到已绑定容器」；与 {@link #reverseMode} 互斥。 */
         boolean boundMode;
+        /**
+         * 当前选择是不是「直达」：材料从周围容器直接进已绑定容器，不进玩家背包。
+         *
+         * <p>与 {@link #reverseMode} 共用「材料来自周围」的那套统计，但落点与提交方式完全不同：
+         * 反转把材料取回背包，直达把它放进远程的绑定容器。
+         */
+        boolean directMode;
         /** 本次发送的目标；只在 {@link #boundMode} 为 true 时有值。 */
         BoundContainer activeBinding;
         /**
@@ -163,6 +231,8 @@ public final class RecipeSenderClient {
         List<BoundContainer> boundCandidates = List.of();
         /** 最近一次绑定发送的请求号；只接受与它相等的回执。 */
         long boundRequestId;
+        /** 最近一次直达的请求号；只接受与它相等的回执，与绑定发送的号互不干扰。 */
+        long directRequestId;
         boolean awaitingAvailability;
         boolean releasePending;
         boolean selectAllRequested;
@@ -203,6 +273,22 @@ public final class RecipeSenderClient {
         EmiIngredient activeIngredient;
         EmiRecipe activeRecipe;
         List<RecipeIngredientSpec> activeSpecs = List.of();
+        /**
+         * 本次直达要带的流体需求；流体支持关闭、配方不含流体、或这次不是直达时都是空表。
+         *
+         * <p>只有直达用得到：反转与绑定发送的材料一律从玩家背包走，碰不到流体中枢。
+         * 必须在这里留一份而不能等到发包时再算——多候选时发包发生在 {@code cancelSelection()}
+         * 之后，那时 {@link #activeRecipe} 已经被清空（与 {@link #resolvedCircuit} 同理）。
+         */
+        List<RecipeFluidSpec> fluidSpecs = List.of();
+        /**
+         * 本次发送是否要完全忽略配方里的流体（按住忽略液体键）。
+         *
+         * <p>和发送模式一样「只置位、不撤销」：松键必然有先后，玩家先松 {@code ~} 再松直达键的话，
+         * 若按发包那一刻的实时状态判定，这次就会照样带着流体发出去——表现为「明明按住了 ~，
+         * 还是提示流体不足」。所以按住过就锁住，直到本次选择结束（{@code cancelSelection()}）。
+         */
+        boolean ignoreFluids;
     }
 
     private RecipeSenderClient() {
@@ -219,12 +305,16 @@ public final class RecipeSenderClient {
      * （控制界面的列表同样是 options.keyMappings），一旦按条件注册，玩家在控制设置里改好的键
      * 在下次启动时就会被丢弃、退回默认的“~”。是否启用反转功能改由运行期的模组检测决定。
      * 新增的绑定键同样无条件注册，理由一致：它必须在控制设置里可改、且改了要能存下来。
+     * 直达键默认是「未绑定」，更要注册：玩家在控制设置里给它绑上键之后，options.txt 里存的就是
+     * 「key.recipe_sender.direct:key.keyboard.xxx」，不注册的话这一行下次启动会被丢弃、退回未绑定。
      */
     private static void registerKeyMappings(RegisterKeyMappingsEvent event) {
         event.register(INSERT_RECIPE_KEY);
         event.register(REVERSE_KEY);
         event.register(BOUND_SEND_KEY);
         event.register(MANAGE_KEY);
+        event.register(DIRECT_KEY);
+        event.register(IGNORE_FLUIDS_KEY);
     }
 
     /**
@@ -252,6 +342,37 @@ public final class RecipeSenderClient {
         return isKeyHeld(MANAGE_KEY);
     }
 
+    /**
+     * 判断「直达」模式键当前是否按下。
+     *
+     * <p>这个键默认未绑定（{@code GLFW_KEY_UNKNOWN}），此时 {@link #isKeyHeld} 恒为 false，
+     * 于是「反转键 + 绑定键」的组合判定照常生效——两条入口互不干扰。
+     */
+    public static boolean isDirectKeyHeld() {
+        return isKeyHeld(DIRECT_KEY);
+    }
+
+    /**
+     * 判断「忽略配方液体」键当前是否按下。
+     *
+     * <p>每次调用都读实时键位：HUD 每帧调一次，玩家按住或松开时提示立刻跟着变。
+     * 与其它模式键一样，未绑定时恒为 false（等价于这个功能不存在）。
+     */
+    public static boolean isIgnoreFluidsKeyHeld() {
+        return isKeyHeld(IGNORE_FLUIDS_KEY);
+    }
+
+    /** 起停一次选择的两个键（Z 与直达键）此刻还有没有按住的。 */
+    private static boolean isSelectionKeyHeld() {
+        return isKeyHeld(INSERT_RECIPE_KEY) || isKeyHeld(DIRECT_KEY);
+    }
+
+    /** 这个鼠标按钮号是不是绑到了给定的键位（不看冲突上下文）。 */
+    private static boolean isBoundMouseButton(KeyMapping mapping, int button) {
+        return mapping.getKey().getType() == InputConstants.Type.MOUSE
+                && mapping.getKey().getValue() == button;
+    }
+
     /** 读取实时绑定后查询 GLFW 原始状态；改键立即生效，不依赖 Forge 的按键查找表。 */
     private static boolean isKeyHeld(KeyMapping mapping) {
         InputConstants.Key bound = mapping.getKey();
@@ -264,20 +385,36 @@ public final class RecipeSenderClient {
         };
     }
 
-    /** 处理 Alt、Z、配方反转键和绑定键的按下与松开事件。 */
+    /** 处理 Alt / 1、Z、配方反转键和绑定键的按下与松开事件。 */
     @SubscribeEvent
     public static void onKeyInput(InputEvent.Key event) {
-        if (event.getAction() == GLFW.GLFW_PRESS && selection.selecting && isAltKey(event)) {
+        if (event.getAction() == GLFW.GLFW_PRESS && selection.selecting && isFillAllKey(event)) {
             selection.selectAllRequested = true;
             selection.selectedBatches = maxSendableBatches();
             return;
         }
-        if (INSERT_RECIPE_KEY.matches(event.getKey(), event.getScanCode())) {
+        // 1.0.34：直达键与 Z 等价——按住直达键就当成按住 Z，玩家不必再额外按 Z。
+        // 两个键共用同一条起停分支，松手时要求「两个都没按住」才结束：玩家可能先松其中一个。
+        if (INSERT_RECIPE_KEY.matches(event.getKey(), event.getScanCode())
+                || DIRECT_KEY.matches(event.getKey(), event.getScanCode())) {
             if (event.getAction() == GLFW.GLFW_PRESS && !selection.selecting) {
                 beginSelection();
-            } else if (event.getAction() == GLFW.GLFW_RELEASE && selection.selecting) {
+            } else if (event.getAction() == GLFW.GLFW_RELEASE && selection.selecting
+                    && !isSelectionKeyHeld()) {
                 finishSelection();
             }
+            return;
+        }
+        // 1.0.35：绑定界面已经开着时再按一次绑定键 = 「接受默认」（连续挂同类并列成员时的快捷路径：
+        // 第一下开界面、第二下确定）。必须放在下面的 isOwnScreenOpen() 之前——那个守卫会把界面开着时
+        // 的所有按键都吞掉。真正「能不能接受默认」由界面自己判定：输入框聚焦时它什么都不做，
+        // 那一次按键就是打字（名字里完全可能有个 b）。
+        if (event.getAction() == GLFW.GLFW_PRESS && !selection.selecting
+                && Minecraft.getInstance().screen instanceof BoundContainerBindScreen bindScreen
+                && BOUND_SEND_KEY.matches(event.getKey(), event.getScanCode())
+                && !MANAGE_KEY.isActiveAndMatches(
+                        InputConstants.getKey(event.getKey(), event.getScanCode()))) {
+            bindScreen.acceptDefault();
             return;
         }
         // 本模组自己的界面（选择弹窗、管理界面）打开时，B 与 Ctrl+B 由界面自己处理：
@@ -317,6 +454,27 @@ public final class RecipeSenderClient {
      */
     @SubscribeEvent
     public static void onMouseInput(InputEvent.MouseButton.Post event) {
+        // 1.0.34：Z 与直达键可能被绑到鼠标键位，按住/松开都要能起停一次选择。
+        // 这里按鼠标按钮号直接比，不看 KeyConflictContext——与 isKeyHeld 的轮询口径保持一致。
+        if (isBoundMouseButton(INSERT_RECIPE_KEY, event.getButton())
+                || isBoundMouseButton(DIRECT_KEY, event.getButton())) {
+            if (event.getAction() == GLFW.GLFW_PRESS && !selection.selecting) {
+                beginSelection();
+            } else if (event.getAction() == GLFW.GLFW_RELEASE && selection.selecting
+                    && !isSelectionKeyHeld()) {
+                finishSelection();
+            }
+            return;
+        }
+        // 1.0.35：绑定界面已经开着时再按一次绑定键（也可能是鼠标键）= 「接受默认」，见 onKeyInput()。
+        if (event.getAction() == GLFW.GLFW_PRESS && !selection.selecting
+                && Minecraft.getInstance().screen instanceof BoundContainerBindScreen bindScreen) {
+            InputConstants.Key button = InputConstants.Type.MOUSE.getOrCreate(event.getButton());
+            if (BOUND_SEND_KEY.isActiveAndMatches(button) && !MANAGE_KEY.isActiveAndMatches(button)) {
+                bindScreen.acceptDefault();
+                return;
+            }
+        }
         if (event.getAction() != GLFW.GLFW_PRESS || selection.selecting || isOwnScreenOpen()) {
             return;
         }
@@ -383,7 +541,11 @@ public final class RecipeSenderClient {
         // 石头、混凝土这类没有方块实体的方块永远不可能提供物品容器，绑了也永远发不进去，
         // 所以连弹窗都不打开。服务端 BoundBindingService 还会用同一个判定再拦一次：
         // 客户端的能力表可能不全（某些模组只注册服务端），不能把它当成唯一依据。
-        if (!BoundTargetResolver.hasItemHandler(minecraft.level.getBlockEntity(pos))) {
+        //
+        // 1.0.32 起放行流体容器：储罐这类方块只有流体能力，它照样可以绑成「流体中枢」，
+        // 所以这里两种能力任一具备就打开弹窗，具体用途在弹窗里选。
+        BlockEntity lookedAt = minecraft.level.getBlockEntity(pos);
+        if (!BoundTargetResolver.hasItemHandler(lookedAt) && !BoundTargetResolver.hasFluidHandler(lookedAt)) {
             sendMessage(minecraft, getMessage("text.recipe_sender.bind_no_container",
                     "这个方块不是物品容器"), NoticeSeverity.ERROR);
             return;
@@ -421,7 +583,15 @@ public final class RecipeSenderClient {
         if (!selection.selecting) {
             return;
         }
-        // 发送模式由「此刻按住哪些修饰键」实时决定，优先级固定为：反转 > 发送到已绑定容器 > 正向发送。
+        // 整体模式的 HUD 预检要比对每台成员机器此刻的电路，而这份快照只有主动问服务端才有：
+        // 普通游玩时管理界面没开，没人会问，缓存一直是空的（machineCircuitOf 全返回 null）。
+        // 服务端每秒才推一次，所以选择期间每秒补问一次；选择一结束就停，不空跑流量。
+        if (clientTicks >= nextMachineStatusRefreshTick) {
+            nextMachineStatusRefreshTick = clientTicks + MACHINE_STATUS_REFRESH_INTERVAL_TICKS;
+            requestMachineStatus();
+        }
+        // 发送模式由「此刻按住哪些修饰键」实时决定，优先级固定为：直达 > 反转 > 发送到已绑定容器 > 正向发送。
+        // 其中「直达」有两条等价入口：按住直达键，或同时按住反转键与绑定键。
         // 玩家习惯先按 Z 再补按修饰键，如果只在按下 Z 的那一瞬间判定，后补的修饰键就完全无效，
         // 所以每 tick 复核一次。
         //
@@ -430,13 +600,21 @@ public final class RecipeSenderClient {
         // 若在 Z 松开前的某一 tick 看到修饰键已抬起就把模式降回去，最终就会按降级后的模式发送，
         // 表现为「HUD 明明显示发送到已绑定容器，结果发到了当前界面」。
         // 锁定之后松键顺序不再影响结果，也就不需要给「同时松开」猜一个容差毫秒数。
-        int wantedMode = isReverseKeyHeld() ? MODE_REVERSE
-                : (isBoundSendKeyHeld() ? MODE_BOUND : MODE_FORWARD);
-        int currentMode = selection.reverseMode ? MODE_REVERSE : (selection.boundMode ? MODE_BOUND : MODE_FORWARD);
+        // 两个键同时按住是「直达」；各自单独按住时的语义保持不变，所以组合判定必须放在最前。
+        // 直达键（默认未绑定）是同一个模式的一键入口，与组合键等价，判定时并进同一分支。
+        int wantedMode = isDirectKeyHeld() || (isReverseKeyHeld() && isBoundSendKeyHeld()) ? MODE_DIRECT
+                : (isReverseKeyHeld() ? MODE_REVERSE : (isBoundSendKeyHeld() ? MODE_BOUND : MODE_FORWARD));
+        int currentMode = selection.directMode ? MODE_DIRECT
+                : (selection.reverseMode ? MODE_REVERSE : (selection.boundMode ? MODE_BOUND : MODE_FORWARD));
         if (wantedMode > currentMode && canEnterMode(wantedMode)) {
             cancelSelection("发送模式已提升");
             beginSelection();
             return;
+        }
+        if (isIgnoreFluidsKeyHeld()) {
+            // 「忽略配方液体」与发送模式同一个道理：只置位、不撤销。
+            // 先按直达再补按 ~ 也要算数，而且先松 ~ 再松直达键时结果不能变回去。
+            selection.ignoreFluids = true;
         }
         if (minecraft.screen != selection.activeScreen) {
             cancelSelection("当前界面已改变");
@@ -450,13 +628,13 @@ public final class RecipeSenderClient {
             onAvailabilityTimeout();
             return;
         }
-        if (!selection.reverseMode && clientTicks >= nextAvailabilityRefreshTick) {
+        if (!materialFromNearby() && clientTicks >= nextAvailabilityRefreshTick) {
             nextAvailabilityRefreshTick = clientTicks + AVAILABILITY_REFRESH_INTERVAL_TICKS;
             int fingerprint = availabilityFingerprint(minecraft);
             if (fingerprint != lastAvailabilityFingerprint) {
                 refreshInventoryAvailability(minecraft);
             }
-        } else if (selection.reverseMode && !selection.awaitingAvailability
+        } else if (materialFromNearby() && !selection.awaitingAvailability
                 && clientTicks >= nextAvailabilityRefreshTick) {
             requestNearbyAvailability();
         }
@@ -473,6 +651,8 @@ public final class RecipeSenderClient {
         return switch (mode) {
             case MODE_REVERSE -> FindMeExtendedAdapter.isAvailable();
             case MODE_BOUND -> !BoundContainerClient.masters().isEmpty();
+            // 直达两头都要：周围材料靠 FindMeExtended 扫描，落点靠已绑定的主容器。
+            case MODE_DIRECT -> FindMeExtendedAdapter.isAvailable() && !BoundContainerClient.masters().isEmpty();
             default -> true;
         };
     }
@@ -573,6 +753,31 @@ public final class RecipeSenderClient {
         return Lang.message("text.recipe_sender.bound_target", "发送到「" + name + "」", name);
     }
 
+    /** 生成 HUD 上的「放入「X」」直达目标行；材料来自周围，用词与绑定发送区分开。 */
+    private static Component getDirectTargetText(String name) {
+        return Lang.message("text.recipe_sender.direct_target", "放入「" + name + "」", name);
+    }
+
+    /**
+     * 把本次直达要取的流体拼成一行清单文本：「水 × 1000 mB、硫酸 × 250 mB」。
+     *
+     * <p>每项只报第一个候选的名字：候选之间通常只是 NBT 不同、显示名一样，逐项展开会把这一行
+     * 撑成好几行，反而看不出「要什么、要多少」。用量报的是每一份的用量，不是总数。
+     */
+    private static String describeFluidSpecs() {
+        List<String> parts = new ArrayList<>(selection.fluidSpecs.size());
+        for (RecipeFluidSpec spec : selection.fluidSpecs) {
+            if (spec.options().isEmpty()) {
+                // isValid() 保证候选非空；真出现空表时跳过，不能为了显示把整个 HUD 拖崩。
+                continue;
+            }
+            FluidStack first = spec.options().get(0);
+            String name = new FluidStack(first.getFluid(), 1).getDisplayName().getString();
+            parts.add("「" + name + " × " + spec.amountPerBatch() + " mB」");
+        }
+        return String.join("、", parts);
+    }
+
     /**
      * 每次启动只记录一次反转键的真实绑定和反转搜索是否可用，用于排查“按住反转键没反应”这类问题：
      * 日志会给出模组读到的键名、这个 KeyMapping 是否真的进了控制设置的列表
@@ -586,10 +791,12 @@ public final class RecipeSenderClient {
         LOGGER.info("反转键绑定 = {}，已进入控制设置列表 = {}，反转搜索可用 = {}",
                 REVERSE_KEY.getKey().getName(), isRegistered(minecraft, REVERSE_KEY),
                 FindMeExtendedAdapter.isAvailable());
-        LOGGER.info("按键绑定：Z = {}（已注册 = {}），绑定键 = {}（已注册 = {}），管理键 = {}（已注册 = {}）",
+        LOGGER.info("按键绑定：Z = {}（已注册 = {}），绑定键 = {}（已注册 = {}），管理键 = {}（已注册 = {}），直达键 = {}（已注册 = {}），忽略液体键 = {}（已注册 = {}）",
                 INSERT_RECIPE_KEY.getKey().getName(), isRegistered(minecraft, INSERT_RECIPE_KEY),
                 BOUND_SEND_KEY.getKey().getName(), isRegistered(minecraft, BOUND_SEND_KEY),
-                MANAGE_KEY.getKey().getName(), isRegistered(minecraft, MANAGE_KEY));
+                MANAGE_KEY.getKey().getName(), isRegistered(minecraft, MANAGE_KEY),
+                DIRECT_KEY.getKey().getName(), isRegistered(minecraft, DIRECT_KEY),
+                IGNORE_FLUIDS_KEY.getKey().getName(), isRegistered(minecraft, IGNORE_FLUIDS_KEY));
     }
 
     /** 判断某个按键是否真的进了「控制设置」列表：只有进列表的键，options.txt 里的改键才会被写回。 */
@@ -643,7 +850,9 @@ public final class RecipeSenderClient {
     /**
      * 选择期间屏蔽其他按键，避免误触打断选择。
      *
-     * <p>放行 Esc（保留关闭界面的能力）、修饰键（Shift/Ctrl/Alt 决定步长）和本模组自己的两个按键。
+     * <p>放行 Esc（保留关闭界面的能力）、修饰键（Shift/Ctrl/Alt 决定步长）和本模组自己的两个按键；
+     * 「全部数量」的另一个键 1 刻意不放行——按住它滚动时界面不该同时收到这个数字键，
+     * 而我们自己的 {@code InputEvent.Key} 处理器不受这里影响。
      *
      * <p>已核对字节码的边界：这里只能拦住交给界面的按键（原版容器界面的数字键换物品、Q 丢弃、
      * E 关闭，以及 EMI 配方界面自身的按键处理）。<b>容器界面下拦不住 EMI 的全局按键</b>——
@@ -685,10 +894,11 @@ public final class RecipeSenderClient {
                 || keyCode == GLFW.GLFW_KEY_LEFT_ALT || keyCode == GLFW.GLFW_KEY_RIGHT_ALT;
     }
 
-    /** 判断按键是否为“插入配方”“反转方向”“绑定容器”或管理键（按玩家当前实际绑定判断，改键后立即生效）。 */
+    /** 判断按键是否为“插入配方”“反转方向”“绑定容器”“直达”或管理键（按玩家当前实际绑定判断，改键后立即生效）。 */
     private static boolean isModKeyMapping(int keyCode) {
         return isBoundKeySym(INSERT_RECIPE_KEY, keyCode) || isBoundKeySym(REVERSE_KEY, keyCode)
-                || isBoundKeySym(BOUND_SEND_KEY, keyCode) || isBoundKeySym(MANAGE_KEY, keyCode);
+                || isBoundKeySym(BOUND_SEND_KEY, keyCode) || isBoundKeySym(DIRECT_KEY, keyCode)
+                || isBoundKeySym(MANAGE_KEY, keyCode);
     }
 
     /** 绑定的键是键盘按键且等于 keyCode 时返回 true；鼠标绑定不参与判断。 */
@@ -737,29 +947,38 @@ public final class RecipeSenderClient {
         GuiGraphics graphics = event.getGuiGraphics();
         renderInventoryHighlights(graphics, event.getScreen());
 
-        String availableKey = selection.reverseMode
-                ? "text.recipe_sender.nearby_available_count"
-                : "text.recipe_sender.available_count";
+        // 直达与反转的份数都由服务端扫周围得出，但可用份数的文案必须分开：
+        // 反转会把材料取回背包，背包里现成的也算数；直达不动背包，只能报周围那一部分。
+        String availableKey = selection.directMode
+                ? "text.recipe_sender.direct_available_count"
+                : (selection.reverseMode
+                        ? "text.recipe_sender.nearby_available_count"
+                        : "text.recipe_sender.available_count");
         List<Component> lines = HUD_LINES;
         List<Integer> colors = HUD_COLORS;
         lines.clear();
         colors.clear();
-        if (selection.boundMode) {
+        if (selection.boundMode || selection.directMode) {
             // 落点在玩家看不到的远程方块上，所以第一行必须先说清楚发到哪儿。
             // 有多个候选时这里说不了具体是哪一个（等松开 Z 才由玩家挑），只说候选数量——
             // 数量取的是按配方类别筛过的候选（S6），不是全部主容器。
             lines.add(selection.activeBinding != null
-                    ? getBoundTargetText(selection.activeBinding.name())
+                    ? (selection.directMode
+                            ? getDirectTargetText(selection.activeBinding.name())
+                            : getBoundTargetText(selection.activeBinding.name()))
                     : getBoundText("text.recipe_sender.bound_target_pick",
                             new Object[]{selection.boundCandidates.size()}, "候选容器"));
             colors.add(0x8FE08F);
         }
         lines.add(getCountText(availableKey, selection.availableBatches,
-                selection.reverseMode ? "周围现有" : "背包现有"));
+                materialFromNearby() ? "周围现有" : "背包现有"));
         colors.add(0xB8B8B8);
-        lines.add(getCountText(selection.reverseMode
-                        ? "text.recipe_sender.pull_count" : "text.recipe_sender.send_count",
-                selection.selectedBatches, selection.reverseMode ? "取回" : "发送"));
+        lines.add(getCountText(selection.directMode ? "text.recipe_sender.direct_count"
+                        : (selection.reverseMode
+                                ? "text.recipe_sender.pull_count"
+                                : "text.recipe_sender.send_count"),
+                selection.selectedBatches,
+                selection.directMode ? "直达" : (selection.reverseMode ? "取回" : "发送")));
         colors.add(0xFFFFFF);
         Component circuitLine = selection.reverseMode ? null : describeCircuitChange();
         if (circuitLine != null) {
@@ -767,11 +986,29 @@ public final class RecipeSenderClient {
             lines.add(circuitLine);
             colors.add(0xFFD479);
         }
-        if (!selection.reverseMode && selection.insertableBatches < selection.availableBatches) {
+        if (selection.directMode && selection.ignoreFluids) {
+            // 按住过忽略液体键：这次只投物品与电路。把流体清单换成这条提醒，
+            // 否则玩家会以为列出来的流体照样会被取走。
+            // 用的是锁定后的标记，所以先松 ~ 时这行也不会消失——它描述的正是这次发送的结果。
+            lines.add(Component.translatable("text.recipe_sender.hud_fluids_ignored"));
+            colors.add(0xFF9AD9);
+        } else if (selection.directMode && !selection.fluidSpecs.isEmpty()) {
+            // 流体只有直达用得上，而流体中枢的存量玩家在 HUD 上看不到：
+            // 把这次要取的流体逐项列出来，玩家才知道服务端会去哪儿取什么、取多少。
+            lines.add(Component.translatable("text.recipe_sender.hud_fluid", describeFluidSpecs()));
+            colors.add(0xC8A0FF);
+        }
+        if (!materialFromNearby() && selection.insertableBatches < selection.availableBatches) {
             // 目标容器成为瓶颈时明确提示上限，避免玩家以为滚轮失效。
             lines.add(getCountText("text.recipe_sender.target_limit", selection.insertableBatches,
                     "目标最多接收"));
             colors.add(0x9AD9FF);
+        }
+        if (groupCircuitMismatchAhead()) {
+            // 整体模式下服务端有一道电路一致性闸门：正在运行的成员里只要有一台电路对不上，
+            // 整单会被取消（一份都不投、一台机器的电路都不改）。提前说出来，别等按完才知道。
+            lines.add(Component.translatable("text.recipe_sender.hud_group_circuit_mismatch"));
+            colors.add(0xFF5555);
         }
 
         int width = lines.stream().mapToInt(line -> minecraft.font.width(line)).max().orElse(0);
@@ -849,27 +1086,31 @@ public final class RecipeSenderClient {
             return;
         }
 
-        // 绑定键与反转键同时按住时以反转为准：反转是既有行为，不能因为新增按键而改变含义。
-        boolean boundRequested = isBoundSendKeyHeld() && !isReverseKeyHeld();
-        boolean reverseRequested = !boundRequested && isReverseKeyHeld();
+        // 两个键同时按住是新增的「直达」，它占掉的是组合语义；单个键按住的含义必须与过去逐字一致，
+        // 所以先判组合，再判单键。直达键（默认未绑定）是同一模式的一键入口，与组合键等价。
+        boolean directRequested = isDirectKeyHeld() || (isBoundSendKeyHeld() && isReverseKeyHeld());
+        boolean boundRequested = !directRequested && isBoundSendKeyHeld() && !isReverseKeyHeld();
+        boolean reverseRequested = !directRequested && isReverseKeyHeld();
         // 每次开始选择都记一行：按住 Z 却没进绑定模式时，这一行能直接说明模组读到的绑定是什么。
-        LOGGER.info("开始选择：绑定键 = {}（按住 = {}），反转键 = {}（按住 = {}），判定 = {}",
+        LOGGER.info("开始选择：绑定键 = {}（按住 = {}），反转键 = {}（按住 = {}），直达键 = {}（按住 = {}），判定 = {}",
                 BOUND_SEND_KEY.getKey().getName(), isBoundSendKeyHeld(),
                 REVERSE_KEY.getKey().getName(), isReverseKeyHeld(),
-                boundRequested ? "绑定发送" : reverseRequested ? "反转" : "正向发送");
-        if (!boundRequested && container == null) {
-            // 正向发送的落点就是当前打开的容器，没有容器界面就无从谈起。
+                DIRECT_KEY.getKey().getName(), isDirectKeyHeld(),
+                directRequested ? "直达" : boundRequested ? "绑定发送" : reverseRequested ? "反转" : "正向发送");
+        if (!boundRequested && !directRequested && container == null) {
+            // 正向发送的落点就是当前打开的容器，没有容器界面就无从谈起；
+            // 绑定与直达的落点是远程方块，与当前开着哪个界面无关。
             return;
         }
-        if (reverseRequested && !FindMeExtendedAdapter.isAvailable()) {
-            // 反转搜索完全依赖 FindMeExtended 的容器扫描与提取器。不可用时必须中止并明说：
+        if ((reverseRequested || directRequested) && !FindMeExtendedAdapter.isAvailable()) {
+            // 反转搜索与直达都依赖 FindMeExtended 的容器扫描与提取器。不可用时必须中止并明说：
             // 悄悄退化成正向发送会把玩家背包里的材料送进机器，和按住反转键的意图正好相反。
             warnReverseUnavailable(minecraft);
             return;
         }
         BoundContainer boundTarget = null;
         List<BoundContainer> candidates = List.of();
-        if (boundRequested) {
+        if (boundRequested || directRequested) {
             List<BoundContainer> masters = BoundContainerClient.masters();
             if (masters.isEmpty()) {
                 sendMessage(minecraft, getMessage("text.recipe_sender.bound_none",
@@ -895,10 +1136,12 @@ public final class RecipeSenderClient {
         selection.selecting = true;
         selection.reverseMode = reverseRequested;
         selection.boundMode = boundRequested;
+        selection.directMode = directRequested;
         selection.activeBinding = boundTarget;
         selection.boundCandidates = candidates;
-        selection.selectAllRequested = isAltDown();
-        selection.selectedBatches = selection.reverseMode ? 0 : 1;
+        selection.selectAllRequested = isFillAllDown();
+        // 直达与反转一样，份数要等服务端扫完周围才能定，先置 0 表示「还没算出来」。
+        selection.selectedBatches = materialFromNearby() ? 0 : 1;
         selection.pendingScrollNotches = 0;
         selection.activeScreen = minecraft.screen;
         selection.activeContainer = container;
@@ -909,18 +1152,26 @@ public final class RecipeSenderClient {
         // 由服务端按真实实例决定写不写（没有电路槽就静默跳过）。
         selection.activeCircuit = GtCircuitSupport.findCircuit(recipe);
         selection.resolvedCircuit = selection.activeCircuit;
+        // 先按 ~ 再按直达：开始选择时就按住的话直接锁上；之后 onClientTick 每 tick 还会复核补按的情况。
+        selection.ignoreFluids = isIgnoreFluidsKeyHeld();
         selection.activeTargetHasCircuit = container != null
                 && GtCircuitSupport.canAdjustCircuit(
                         GtCircuitSupport.findCircuitHolder(container.getMenu()));
         selection.highlightedInventorySlots = RecipeMaterialCollector.findMatchingInventorySlots(recipe,
                 minecraft.player);
 
-        if (selection.reverseMode) {
+        if (materialFromNearby()) {
+            // 直达与反转的材料描述同源：都是配方输入描述，由服务端按现场情况规划要拿哪些。
             selection.activeSpecs = RecipeMaterialCollector.createIngredientSpecs(recipe);
             if (selection.activeSpecs.isEmpty()) {
                 cancelSelection();
                 return;
             }
+            // 流体只有直达用得上：反转与绑定发送的材料一律从背包走，与流体中枢无关。
+            // 配置关掉流体支持时也保持空表，服务端据此完全忽略配方里的流体（一切照旧）。
+            selection.fluidSpecs = selection.directMode && RecipeSenderConfig.fluidSupport()
+                    ? RecipeMaterialCollector.createFluidSpecs(recipe)
+                    : List.of();
             selection.awaitingAvailability = false;
             selection.nearbyAvailabilityReceived = false;
             requestNearbyAvailability();
@@ -935,12 +1186,14 @@ public final class RecipeSenderClient {
 
     /** 请求服务端统计周围材料，并通过节流避免高频扫描容器。 */
     private static void requestNearbyAvailability() {
-        if (!selection.reverseMode || selection.activeSpecs.isEmpty() || selection.awaitingAvailability) {
+        if (!materialFromNearby() || selection.activeSpecs.isEmpty() || selection.awaitingAvailability) {
             return;
         }
         selection.awaitingAvailability = true;
         activeRequestId = REQUEST_SEQUENCE.incrementAndGet();
         availabilityRequestTick = clientTicks;
+        // 反转与直达统计的是同一批来源：背包（含快捷栏）里的现成材料算数，FindMeExtended
+        // 搜索范围内的周围容器也算数。原先用来区分两者的「只统计周围」标志已删除。
         ModNetwork.CHANNEL.sendToServer(new NearbyRecipeQueryPacket(activeRequestId, selection.activeSpecs));
     }
 
@@ -963,6 +1216,16 @@ public final class RecipeSenderClient {
         Minecraft minecraft = Minecraft.getInstance();
         if (selection.boundMode) {
             finishBoundSelection(minecraft);
+            return;
+        }
+        if (selection.directMode) {
+            // 直达与反转一样要等周围统计：此刻的份数还没算出来，先记下「松手了」，
+            // 由回包那一侧收尾（见 acceptNearbyAvailability）。
+            if (selection.awaitingAvailability) {
+                selection.releasePending = true;
+                return;
+            }
+            finishDirectSelection(minecraft);
             return;
         }
         // 选择的份数超过目标容器能容纳的数量时，按目标容器可容纳的份数发送；
@@ -1023,7 +1286,58 @@ public final class RecipeSenderClient {
         // 路由键要在 cancelSelection() 之前取：它清掉的是这次选择的状态。
         ResourceLocation routeKey = RecipeRouteKeys.primary(selection.activeRecipe);
         cancelSelection();
-        minecraft.setScreen(new BoundContainerPickScreen(parent, candidates, requirements, batches, routeKey));
+        minecraft.setScreen(new BoundContainerPickScreen(parent, candidates, requirements, batches, routeKey,
+                null, null));
+    }
+
+    /**
+     * 提交一次「直达」。
+     *
+     * <p>与绑定发送最大的差别在材料那一侧：客户端不数背包、也不凑物品堆，只把配方输入描述
+     * 与份数交给服务端，由它扫描周围容器现场规划并抽取——所以这里连材料凑不凑得齐都不知道，
+     * 失败原因只能等回执（见 {@link #acceptDirectInsertResult}）。
+     */
+    private static void finishDirectSelection(Minecraft minecraft) {
+        // 用开始选择时算好的候选（已按配方类别与维度筛过）：与绑定发送同理，
+        // 中途重新筛会得到一份与 HUD 上显示的不一样的候选。
+        List<BoundContainer> candidates = selection.boundCandidates;
+        if (candidates.isEmpty()) {
+            sendMessage(minecraft, getMessage("text.recipe_sender.bound_none",
+                    "还没有绑定容器：对着方块按绑定键绑定"), NoticeSeverity.WARN);
+            cancelSelection();
+            return;
+        }
+        // 按住过忽略液体键 = 这次只投物品与电路：给服务端一个空流体表，等价于把「流体支持」临时关掉，
+        // 服务端那边连流体中枢和目标的流体仓都不会碰（也不会有「流体不足」这类拦阻）。
+        // 这里读的是锁定后的标记而不是键位实时状态（见 Selection#ignoreFluids）：松键有先后，
+        // 玩家先松 ~ 再松直达键时，实时状态已经是「没按」，会把这次误判成要带流体。
+        // 必须在 cancelSelection() 之前取，它清掉的正是这次选择的状态。
+        List<RecipeFluidSpec> fluids = selection.ignoreFluids ? List.of() : selection.fluidSpecs;
+        if (selection.ignoreFluids) {
+            // 只记一条，方便日后排查「按了 ~ 却还是取了流体」这类问题（丢弃了几项一看就知道）。
+            LOGGER.info("忽略配方液体：本次直达只投物品与电路，丢弃流体需求 {} 项", selection.fluidSpecs.size());
+        }
+        int batches = Math.min(selection.selectedBatches, selection.availableBatches);
+        if (batches < 1) {
+            // 周围一份都凑不出来：必须明说，否则玩家只看到「按了没反应」。
+            sendMessage(minecraft, getMessage("text.recipe_sender.direct_none",
+                    "周围没有可用的材料"), NoticeSeverity.WARN);
+            cancelSelection();
+            return;
+        }
+        if (candidates.size() == 1) {
+            sendDirectInsert(candidates.get(0).id(), selection.activeSpecs, fluids, batches);
+            return;
+        }
+        Screen parent = minecraft.screen;
+        // 路由键、配方描述与流体清单都要在 cancelSelection() 之前取：它清掉的正是这次选择的状态。
+        ResourceLocation routeKey = RecipeRouteKeys.primary(selection.activeRecipe);
+        List<RecipeIngredientSpec> specs = selection.activeSpecs;
+        cancelSelection();
+        // 直达形态不需要物品堆清单（材料由服务端现场规划），这里交空列表，
+        // 弹窗按 directSpecs 走另一条确认路径；流体清单随包带上（没有流体时是空表）。
+        minecraft.setScreen(new BoundContainerPickScreen(parent, candidates, List.of(), batches, routeKey,
+                specs, fluids));
     }
 
     /**
@@ -1045,6 +1359,93 @@ public final class RecipeSenderClient {
         selection.boundRequestId = BOUND_REQUEST_SEQUENCE.incrementAndGet();
         ModNetwork.CHANNEL.sendToServer(new InsertRecipeItemsToBoundPacket(selection.boundRequestId, bindingId,
                 requirements, batches, circuitNumber, gregRecipe));
+    }
+
+    /**
+     * 把一次「直达」交给服务端：只带配方输入描述（物品 + 流体）与份数，材料由服务端现场抽取。
+     *
+     * <p>电路要求的取法与 {@link #sendBoundInsert} 完全一致（读 {@code resolvedCircuit}，
+     * 认不出格雷配方时带 {@link GtCircuitSupport#NO_CIRCUIT}）：落点同样是远程方块，
+     * 服务端手里没有配方信息，不带上就只能不调电路。
+     *
+     * <p>流体需求（{@code fluids}）与物品描述同源：流体支持关闭、或配方不含流体时是空表，
+     * 服务端据此完全忽略流体；带流体时「一份」的定义是物品与流体都齐，不齐就一份都不发。
+     *
+     * <p>发送后取消选择，与绑定发送的调用点顺序一致（先发包再清状态）；多候选时本方法由
+     * 选择弹窗调用，那时选择其实已经被清过了，重复清一次是幂等的。
+     */
+    public static void sendDirectInsert(UUID bindingId, List<RecipeIngredientSpec> specs,
+                                        List<RecipeFluidSpec> fluids, int batches) {
+        if (bindingId == null || specs.isEmpty() || batches <= 0) {
+            return;
+        }
+        GtCircuitSupport.CircuitRequirement circuit = selection.resolvedCircuit;
+        int circuitNumber = circuit == null ? GtCircuitSupport.NO_CIRCUIT : circuit.circuit();
+        boolean gregRecipe = circuit != null && circuit.gregRecipe();
+        selection.directRequestId = DIRECT_REQUEST_SEQUENCE.incrementAndGet();
+        ModNetwork.CHANNEL.sendToServer(new DirectInsertToBoundPacket(selection.directRequestId, bindingId,
+                specs, fluids == null ? List.of() : fluids, batches, circuitNumber, gregRecipe));
+        cancelSelection();
+    }
+
+    /** 向服务端要一次「每台绑定机器现在忙不忙」；管理界面每秒调一次。 */
+    public static void requestMachineStatus() {
+        if (Minecraft.getInstance().getConnection() == null) {
+            return;
+        }
+        ModNetwork.CHANNEL.sendToServer(new MachineStatusRequestPacket());
+    }
+
+    /**
+     * 这次发送会不会被服务端的「整组电路一致性闸门」整单取消。
+     *
+     * <p>只在能确定唯一目标、且这次要发配的电路已经确定时才判定：候选有多个时要等玩家在弹窗里
+     * 挑一个，此刻还不知道发往哪一组；电路没解析出来时服务端也不会动电路，谈不上不一致。
+     *
+     * <p>判据严格镜像服务端的 {@code GroupCircuitGate.matches}：只比对<b>正在运行</b>的成员，
+     * 探不到电路槽的机器（普通箱子、非格雷机器）在服务端一律放行，这里也放行。
+     */
+    private static boolean groupCircuitMismatchAhead() {
+        BoundContainer target = selection.activeBinding;
+        if (target == null) {
+            return false;
+        }
+        BoundGroupResolver.BoundGroup group = BoundContainerClient.groupOf(target.id());
+        if (group == null || !group.unified()) {
+            return false;
+        }
+        GtCircuitSupport.CircuitRequirement circuit = selection.resolvedCircuit;
+        if (circuit == null) {
+            return false;
+        }
+        for (UUID memberId : BoundContainerClient.busyMembersOf(target)) {
+            if (!circuitMatches(BoundContainerClient.machineCircuitOf(memberId),
+                    circuit.circuit(), circuit.gregRecipe())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 一台机器此刻的电路是否已经符合本次要求；镜像服务端的 {@code GroupCircuitGate.matches}。
+     *
+     * <p>{@code current} 的取值有三种互不相同的形态：{@code null} = 没有可调整的电路槽（放行）、
+     * {@code 0} = 空槽（GT 把空槽当电路 0，与「不要电路」等价，也放行）、
+     * {@code -1} = 槽里放着玩家自己的物品（要求具体电路时冲突，要求不要电路时不动它、放行）。
+     *
+     * @param current    这台机器此刻的电路；{@code null} = 没有可调整的电路槽，服务端放行
+     * @param circuit    本次要发配的电路；{@code < 0} 表示「本次不要电路」
+     * @param gregRecipe 本次是不是格雷配方；为假且 {@code circuit < 0} 时服务端根本不动电路
+     */
+    private static boolean circuitMatches(Integer current, int circuit, boolean gregRecipe) {
+        if (circuit < 0 && !gregRecipe) {
+            return true;
+        }
+        if (current == null) {
+            return true;
+        }
+        return circuit >= 0 ? current == circuit : current <= 0;
     }
 
     /**
@@ -1107,9 +1508,11 @@ public final class RecipeSenderClient {
      * 拿机器实例判断（写不进去时服务端直接返回，不会误删别的东西）。
      */
     private static void sendCircuitRequest() {
-        // 绑定模式不走这条：它的电路要求随投放包一起交给服务端（见 sendBoundInsert）。绑定模式下
-        // 玩家可能正开着某台机器的界面，走菜单通路会改到「当前开着的机器」而不是「绑定的机器」。
-        if (selection.reverseMode || selection.boundMode || selection.activeCircuit == null || selection.activeContainer == null) {
+        // 绑定模式与直达都不走这条：它们的电路要求随投放包一起交给服务端（见 sendBoundInsert /
+        // sendDirectInsert）。这两种模式下玩家可能正开着某台机器的界面，走菜单通路会改到
+        // 「当前开着的机器」而不是「绑定的机器」。
+        if (selection.reverseMode || selection.boundMode || selection.directMode
+                || selection.activeCircuit == null || selection.activeContainer == null) {
             return;
         }
         if (!GtCircuitSupport.isModularUiContainer(selection.activeContainer.getMenu())) {
@@ -1128,11 +1531,11 @@ public final class RecipeSenderClient {
 
     /** 处理服务端返回的周围配方份数。 */
     public static void acceptNearbyAvailability(long requestId, int batches) {
-        if (!selection.selecting || !selection.reverseMode || requestId != activeRequestId) {
+        if (!selection.selecting || !materialFromNearby() || requestId != activeRequestId) {
             return;
         }
         selection.awaitingAvailability = false;
-        selection.availableBatches = Math.max(0, Math.min(RecipeIngredientSpec.MAX_BATCHES, batches));
+        selection.availableBatches = Math.max(0, Math.min(RecipeSenderConfig.maxBatches(), batches));
         if (selection.availableBatches == 0) {
             selection.selectedBatches = 0;
         } else if (!selection.nearbyAvailabilityReceived) {
@@ -1148,8 +1551,13 @@ public final class RecipeSenderClient {
         applyPendingScroll();
         nextAvailabilityRefreshTick = clientTicks + AVAILABILITY_REFRESH_INTERVAL_TICKS;
         if (selection.releasePending) {
-            sendPullRequest();
-            cancelSelection();
+            if (selection.directMode) {
+                // 直达绝不往背包取回：收尾走自己的提交路径（选目标 / 直接投放）。
+                finishDirectSelection(Minecraft.getInstance());
+            } else {
+                sendPullRequest();
+                cancelSelection();
+            }
         }
     }
 
@@ -1160,7 +1568,8 @@ public final class RecipeSenderClient {
      * 继续下去只会在松手时拿到一条「绑定不存在」的失败回执，不如当场说清楚。
      */
     public static void onBoundContainersSynced() {
-        if (selection.selecting && selection.boundMode && (selection.activeBinding == null
+        // 直达与绑定发送的落点都是绑定容器，目标被删掉时同样继续不下去。
+        if (selection.selecting && (selection.boundMode || selection.directMode) && (selection.activeBinding == null
                 || BoundContainerClient.find(selection.activeBinding.id()) == null)) {
             cancelSelection("绑定的容器已被删除");
         }
@@ -1219,6 +1628,102 @@ public final class RecipeSenderClient {
     }
 
     /**
+     * 处理「直达」的回执。
+     *
+     * <p>与绑定回执一样，失败必须说出具体原因：材料是从玩家看不到的周围容器里拿的，
+     * 没有提示就只剩「按了没反应」。
+     *
+     * <p>份数差额用「已放入 / 未放入」两个数字说清楚，而不是笼统的一句失败：
+     * 能塞多少塞多少之后，玩家需要知道是该再按一次还是去清理目标。
+     */
+    public static void acceptDirectInsertResult(long requestId, UUID bindingId, BoundStatus status,
+                                                int insertedBatches, int requestedBatches,
+                                                BoundDetail detail) {
+        if (requestId != selection.directRequestId) {
+            return;
+        }
+        selection.directRequestId = 0;
+        Minecraft minecraft = Minecraft.getInstance();
+        String name = directTargetName(bindingId);
+        if (status != BoundStatus.OK) {
+            String key = BoundContainerService.describe(status);
+            String fallback = "直达失败：目标「" + name + "」不可用";
+            sendMessage(minecraft, key == null ? Component.literal(fallback)
+                    : getMessage(key, fallback), NoticeSeverity.ERROR);
+            return;
+        }
+        if (requestedBatches <= 0) {
+            return;
+        }
+        if (insertedBatches >= requestedBatches) {
+            sendMessage(minecraft, getBoundText("text.recipe_sender.direct_sent",
+                    new Object[]{insertedBatches, name},
+                    "已从周围放入 " + insertedBatches + " 份到「" + name + "」"));
+            return;
+        }
+        int missing = requestedBatches - insertedBatches;
+        if (detail == BoundDetail.NO_FLUID_HUB) {
+            // 配方要流体，但玩家没绑定流体中枢（或中枢所在区块没加载）。这是配置/绑定问题，
+            // 不是「再按一次」能解决的，所以用 ERROR 与材料不足区分开。
+            sendMessage(minecraft, getBoundText("text.recipe_sender.direct_no_hub",
+                    new Object[0],
+                    "没有可用的流体中枢：配方需要流体，请先绑定一个流体中枢"), NoticeSeverity.ERROR);
+            return;
+        }
+        if (detail == BoundDetail.NO_FLUID_TARGET) {
+            // 目标容器一个能装流体的都没有（比如只有物品输入总线）：落点本身不适合这条配方。
+            sendMessage(minecraft, getBoundText("text.recipe_sender.direct_no_fluid_target",
+                    new Object[0],
+                    "目标「" + name + "」不能装流体：配方需要流体，请换一个能装流体的目标"),
+                    NoticeSeverity.WARN);
+            return;
+        }
+        if (detail == BoundDetail.FLUID_SHORT) {
+            // 与材料不足同样报「已放入 / 未放入」，玩家据此决定是补流体还是补物品。
+            sendMessage(minecraft, getBoundText("text.recipe_sender.direct_fluid_short",
+                    new Object[]{insertedBatches, missing},
+                    "流体中枢里的流体不足：放入 " + insertedBatches + " 份，未放入 " + missing + " 份"),
+                    NoticeSeverity.WARN);
+            return;
+        }
+        if (detail == BoundDetail.MATERIALS) {
+            sendMessage(minecraft, getBoundText("text.recipe_sender.direct_short",
+                    new Object[]{insertedBatches, missing},
+                    "周围材料不足：放入 " + insertedBatches + " 份，未放入 " + missing + " 份"),
+                    NoticeSeverity.WARN);
+            return;
+        }
+        if (detail == BoundDetail.ALL_BUSY || detail == BoundDetail.MACHINES_BUSY) {
+            // 1.0.34：没送出去不是「目标满了」，而是主容器与并列成员里有机器在跑、这一次被跳过。
+            // 说成「目标已满」会把玩家引去清空机器，其实只要等它跑完再按一次。
+            sendMessage(minecraft, getBoundText("text.recipe_sender.direct_busy",
+                    new Object[]{insertedBatches, missing},
+                    "有机器在运行被跳过：放入 " + insertedBatches + " 份，未放入 " + missing + " 份"),
+                    NoticeSeverity.WARN);
+            return;
+        }
+        // 剩下的原因（含 detail == null）只有「目标放不下」，用目标已满那一组文案。
+        sendMessage(minecraft, getBoundText("text.recipe_sender.direct_partial",
+                new Object[]{insertedBatches, missing},
+                "目标已满：放入 " + insertedBatches + " 份，未放入 " + missing + " 份"), NoticeSeverity.WARN);
+    }
+
+    /**
+     * 直达回执里的目标名。
+     *
+     * <p>只在主容器里找：直达的落点必然是主容器（候选就是这么筛出来的），
+     * 找不到时退回 id 而不是编一个名字——玩家至少能据此对照管理界面。
+     */
+    private static String directTargetName(UUID bindingId) {
+        for (BoundContainer master : BoundContainerClient.masters()) {
+            if (master.id().equals(bindingId)) {
+                return master.name();
+            }
+        }
+        return bindingId == null ? "" : bindingId.toString();
+    }
+
+    /**
      * 回执里补充说明的中文兜底文案（语言文件缺失时使用）。
      *
      * <p>用穷尽的 {@code switch} 表达式而不是「按语言键名猜后缀」：以后服务端多出一种没送完的原因，
@@ -1228,6 +1733,16 @@ public final class RecipeSenderClient {
         return switch (detail) {
             case TARGET_FULL -> "目标容器放不下（可能已满或不允许该物品）";
             case MATERIALS -> "背包材料不足";
+            // 下面三种只可能出现在直达回执里（绑定发送不碰流体），但穷尽 switch 必须列全，
+            // 否则服务端一加新原因这里就编译不过——这正是这个 switch 存在的意义。
+            case NO_FLUID_HUB -> "没有可用的流体中枢";
+            case NO_FLUID_TARGET -> "目标容器不能装流体";
+            case FLUID_SHORT -> "流体中枢里的流体不足";
+            // 1.0.34：主容器与并列成员里没有空闲机器的两种结果。
+            case ALL_BUSY -> "机器都在运行：一份都没发送";
+            case MACHINES_BUSY -> "有机器在运行被跳过，空闲机器放不下这么多份";
+            // 1.0.38：整体模式里正在跑的机器电路与本次发配不一致，整单取消。
+            case GROUP_CIRCUIT_MISMATCH -> "整体模式电路不一致：已取消，一台机器的电路都没动";
         };
     }
 
@@ -1240,8 +1755,13 @@ public final class RecipeSenderClient {
         applyPendingScroll();
         nextAvailabilityRefreshTick = clientTicks + AVAILABILITY_REFRESH_INTERVAL_TICKS;
         if (selection.releasePending) {
-            sendPullRequest();
-            cancelSelection();
+            if (selection.directMode) {
+                // 统计没回来也要收尾：份数按上一次已知值走，由服务端决定实际能放多少。
+                finishDirectSelection(Minecraft.getInstance());
+            } else {
+                sendPullRequest();
+                cancelSelection();
+            }
         }
     }
 
@@ -1351,11 +1871,23 @@ public final class RecipeSenderClient {
     }
 
     /**
-     * 当前最多可发送的份数：反向模式只看周围存量；
+     * 材料是否来自玩家周围：反转把周围的材料取回背包，直达把周围的材料直接放进目标容器。
+     *
+     * <p>这两条路径的份数都只能由服务端扫描周围得出——客户端看不到那些容器的内容，
+     * 背包里现成的材料也不该混进来。所以凡是「材料来自周围」的判定都必须认这两者，
+     * 不能只看 {@code reverseMode}。
+     */
+    private static boolean materialFromNearby() {
+        return selection.reverseMode || selection.directMode;
+    }
+
+    /**
+     * 当前最多可发送的份数：反转与直达只看周围存量；
      * 正向模式还要受目标容器容量限制。
      */
     private static int maxSendableBatches() {
-        return selection.reverseMode ? selection.availableBatches : Math.min(selection.availableBatches, selection.insertableBatches);
+        return materialFromNearby() ? selection.availableBatches
+                : Math.min(selection.availableBatches, selection.insertableBatches);
     }
 
     /** 绘制当前配方匹配的背包槽位。 */
@@ -1394,9 +1926,9 @@ public final class RecipeSenderClient {
     /**
      * 描述这次发送会怎样改动机器电路。
      *
-     * <p>绑定模式与正向模式的文案必须分开：正向模式的目标就是玩家开着的容器，客户端能直接判定
-     * 它有没有电路槽，所以可以断言；绑定模式的落点在远处，客户端拿不到机器实例，只能写成
-     * 「目标有电路槽时生效」——最终写不写由服务端按真实实例决定。
+     * <p>远程落点（绑定发送 / 直达）与正向模式的文案必须分开：正向模式的目标就是玩家开着的容器，
+     * 客户端能直接判定它有没有电路槽，所以可以断言；绑定与直达的落点在远处，客户端拿不到机器实例，
+     * 只能写成「目标有电路槽时生效」——最终写不写由服务端按真实实例决定。
      *
      * @return 提示行；目标没有电路槽、或不是格雷配方（识别失败、只从 EMI 原料看到电路）时返回
      *         {@code null}
@@ -1405,7 +1937,7 @@ public final class RecipeSenderClient {
         if (selection.activeCircuit == null) {
             return null;
         }
-        if (selection.boundMode) {
+        if (selection.boundMode || selection.directMode) {
             if (selection.activeCircuit.requiresCircuit()) {
                 return getCircuitText(selection.activeCircuit.circuit(), true);
             }
@@ -1425,7 +1957,7 @@ public final class RecipeSenderClient {
     /**
      * 生成带语言文件回退文本的电路提示。
      *
-     * @param remote 落点是否为远程方块（绑定模式）；为真时用「目标有电路槽时生效」那一组文案
+     * @param remote 落点是否为远程方块（绑定发送 / 直达）；为真时用「目标有电路槽时生效」那一组文案
      */
     private static Component getCircuitText(int circuit, boolean remote) {
         String key = remote ? "text.recipe_sender.circuit_bound" : "text.recipe_sender.circuit";
@@ -1436,7 +1968,7 @@ public final class RecipeSenderClient {
     /**
      * 生成带语言文件回退文本的置空提示。
      *
-     * @param remote 落点是否为远程方块（绑定模式）
+     * @param remote 落点是否为远程方块（绑定发送 / 直达）
      */
     private static Component getCircuitClearText(boolean remote) {
         String key = remote ? "text.recipe_sender.circuit_bound_clear"
@@ -1451,20 +1983,35 @@ public final class RecipeSenderClient {
             return 0;
         }
         int direction = scrollDelta > 0 ? 1 : -1;
-        if (isAltDown()) {
+        if (isFillAllDown()) {
             selection.selectAllRequested = true;
             return ceiling;
         }
+        int limit = Math.min(ceiling, RecipeSenderConfig.maxBatches());
         if (isControlDown()) {
-            if (direction > 0) {
-                int next = current == 1 ? CONTROL_STEP : current + CONTROL_STEP;
-                return Math.min(ceiling, Math.min(RecipeIngredientSpec.MAX_BATCHES, next));
-            }
-            return Math.max(1, current <= CONTROL_STEP ? 1 : current - CONTROL_STEP);
+            return snapToStep(current, direction, CONTROL_STEP, limit);
         }
-        int step = isShiftDown() ? SHIFT_STEP : 1;
-        return Math.max(1, Math.min(ceiling,
-                Math.min(RecipeIngredientSpec.MAX_BATCHES, current + direction * step)));
+        if (isShiftDown()) {
+            return snapToStep(current, direction, SHIFT_STEP, limit);
+        }
+        return Math.max(1, Math.min(limit, current + direction));
+    }
+
+    /**
+     * 大步进：落在步长的整数倍上，而不是从当前值往上累加。
+     *
+     * <p>份数的起点是 1（1 份就是一个配方），累加式步进会给出 1 → 9 → 17 这种数列，
+     * 玩家心里想的是 8、16、24 这样的整档，所以这里向上下一个步长倍数对齐。
+     * 向下取到 0 时回落到 1——份数不能小于 1，1 份本身就是最小的「整档」。
+     *
+     * @param step  SHIFT_STEP 或 CONTROL_STEP
+     * @param limit 份数上限（目标当前能接收的份数与配置的 maxBatches 取小）
+     */
+    private static int snapToStep(int current, int direction, int step, int limit) {
+        int next = direction > 0
+                ? (current / step + 1) * step
+                : (Math.max(0, current - 1) / step) * step;
+        return Math.max(1, Math.min(limit, next));
     }
 
     /** 判断 Shift 是否处于按下状态。 */
@@ -1491,6 +2038,16 @@ public final class RecipeSenderClient {
                 || event.getKey() == GLFW.GLFW_KEY_RIGHT_ALT;
     }
 
+    /** 判断「全部数量」是否处于按下状态：任一 Alt 或主键区的 1，两者完全等价。 */
+    private static boolean isFillAllDown() {
+        return isAltDown() || isGlfwKeyDown(FILL_ALL_KEY);
+    }
+
+    /** 判断输入事件是否来自「全部数量」键（任一 Alt 或主键区的 1）。 */
+    private static boolean isFillAllKey(InputEvent.Key event) {
+        return isAltKey(event) || event.getKey() == FILL_ALL_KEY;
+    }
+
     /** 查询 GLFW 中指定按键的实时状态。 */
     private static boolean isGlfwKeyDown(int key) {
         long handle = Minecraft.getInstance().getWindow().getWindow();
@@ -1515,6 +2072,7 @@ public final class RecipeSenderClient {
         selection.selecting = false;
         selection.reverseMode = false;
         selection.boundMode = false;
+        selection.directMode = false;
         selection.activeBinding = null;
         selection.boundCandidates = List.of();
         selection.awaitingAvailability = false;
@@ -1531,6 +2089,8 @@ public final class RecipeSenderClient {
         selection.activeIngredient = null;
         selection.activeRecipe = null;
         selection.activeSpecs = List.of();
+        selection.fluidSpecs = List.of();
+        selection.ignoreFluids = false;
         selection.activeCircuit = null;
         selection.activeTargetHasCircuit = false;
         selection.highlightedInventorySlots = Set.of();

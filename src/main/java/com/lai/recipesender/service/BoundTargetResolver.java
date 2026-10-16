@@ -1,5 +1,7 @@
 package com.lai.recipesender.service;
 
+import com.lai.recipesender.config.RecipeSenderConfig;
+import com.lai.recipesender.integration.gt.InputLimitSupport;
 import com.lai.recipesender.model.BoundContainer;
 import com.lai.recipesender.model.BoundStatus;
 import net.minecraft.core.Direction;
@@ -7,8 +9,10 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.phys.Vec3;
 import net.minecraftforge.common.capabilities.ForgeCapabilities;
 import net.minecraftforge.common.util.LazyOptional;
+import net.minecraftforge.fluids.capability.IFluidHandler;
 import net.minecraftforge.items.IItemHandler;
 
 /**
@@ -24,6 +28,20 @@ public final class BoundTargetResolver {
     public record ResolvedTarget(IItemHandler handler, BlockEntity blockEntity, BoundStatus status) {
         public boolean available() {
             return status == BoundStatus.OK && handler != null;
+        }
+
+        /**
+         * 包成投放目标，顺带现读这台机器的「防止堵料」开关。
+         *
+         * <p>投放目标统一从这里生成，两个投送 service 就都不会漏传开关——漏传的后果是
+         * 模拟容量成倍高估、材料被劈成残片、流体跟着多灌。
+         *
+         * <p>开关是每台机器自己的设置、玩家随时能改，所以每次发送都现读，不缓存；读不到
+         * 按「没开」处理，只会让模拟偏保守，不会少发。
+         */
+        public RemoteTransferPlanner.Target toTarget() {
+            return new RemoteTransferPlanner.Target(handler, blockEntity,
+                    InputLimitSupport.isInputLimited(handler, blockEntity));
         }
     }
 
@@ -46,6 +64,13 @@ public final class BoundTargetResolver {
         ServerLevel level = server.getLevel(binding.dimension());
         if (level == null) {
             return new ResolvedTarget(null, null, BoundStatus.DIMENSION_MISMATCH);
+        }
+        int distanceLimit = RecipeSenderConfig.recipeManagementDistance();
+        if (distanceLimit >= 0
+                && player.distanceToSqr(Vec3.atCenterOf(binding.pos())) > (double) distanceLimit * distanceLimit) {
+            // 配方管理距离（默认 128 格，-1 表示不限）：先于区块判定，
+            // 因为「太远」比「区块没加载」更容易让玩家知道该怎么做。
+            return new ResolvedTarget(null, null, BoundStatus.TOO_FAR);
         }
         if (!level.isLoaded(binding.pos())) {
             // 只判断是否已加载，不为了发送强制加载区块。
@@ -73,6 +98,16 @@ public final class BoundTargetResolver {
     }
 
     /**
+     * 该方块实体是否提供 Forge 流体能力。
+     *
+     * <p>绑定流体中枢前的准入判定用它。只认 Forge 能力，不含 AE2 存储视图——客户端判定
+     * 要能在没有可选模组时照常工作；AE2 那一侧由服务端 {@code FluidHubService} 的判定补齐。
+     */
+    public static boolean hasFluidHandler(BlockEntity blockEntity) {
+        return blockEntity != null && findFluidHandler(blockEntity) != null;
+    }
+
+    /**
      * 取出方块实体的物品容器能力。
      *
      * <p><b>必须先试无面（{@code side == null}）再遍历六个面。</b>
@@ -96,6 +131,28 @@ public final class BoundTargetResolver {
 
     /** 把能力容器解包成实例；缺失时返回 {@code null}。 */
     private static IItemHandler unwrap(LazyOptional<IItemHandler> optional) {
+        return optional != null && optional.isPresent() ? optional.orElse(null) : null;
+    }
+
+    /**
+     * 取出方块实体的流体容器能力，规则与 {@link #findItemHandler(BlockEntity)} 完全一致：
+     * 先试无面，再遍历六个面。
+     */
+    private static IFluidHandler findFluidHandler(BlockEntity blockEntity) {
+        IFluidHandler direct = unwrapFluid(blockEntity.getCapability(ForgeCapabilities.FLUID_HANDLER, null));
+        if (direct != null) {
+            return direct;
+        }
+        for (Direction side : Direction.values()) {
+            IFluidHandler sided = unwrapFluid(blockEntity.getCapability(ForgeCapabilities.FLUID_HANDLER, side));
+            if (sided != null) {
+                return sided;
+            }
+        }
+        return null;
+    }
+
+    private static IFluidHandler unwrapFluid(LazyOptional<IFluidHandler> optional) {
         return optional != null && optional.isPresent() ? optional.orElse(null) : null;
     }
 }

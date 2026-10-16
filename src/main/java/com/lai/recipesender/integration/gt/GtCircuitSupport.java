@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -37,9 +38,13 @@ import java.util.concurrent.ConcurrentHashMap;
  *   <li><b>读电路</b>：优先用 {@code IntCircuitBehaviour}（若该类存在）；不存在时退回
  *       “注册名 {@code programmed_circuit} + NBT 键 {@code Configuration}”，完全不依赖 GT 的类。</li>
  *   <li><b>写电路</b>：不检查机器是否实现 {@code IHasCircuitSlot}，改成鸭子类型——
- *       只要机器（或其父类）有无参方法 {@code getCircuitInventory()} 且返回可写物品槽，就往第 0 格写。
- *       {@code isCircuitSlotEnabled()} 存在时用它把关（蒸汽总线之类靠它关掉），不存在则视为可用；
- *       GTO 用的 gtceu 26.9.70 里已经没有这个方法，所以那里等于只看有没有电路槽。</li>
+ *       只要机器（或其父类）有无参方法 {@code getCircuitInventory()}，就按它返回的东西挑一条通路
+ *       写第 0 格：Forge 的 {@code IItemHandlerModifiable} 直接 {@code setStackInSlot}；
+ *       26.10.34 起 GT 把机器电路槽换成了 AE 键存储（{@code KeyInventory}，返回值是
+ *       {@code NotifiableInventory}），则走 GT 自己电路界面用的 {@code Circuits.get/set}。
+ *       <b>不能只认 Forge 那一套</b>：新版 GT 上那样会“找得到电路槽、却永远写不进去”，
+ *       而且失败是静默的（1.0.39 的实际现象：材料送进去了、电路没动）。
+ *       {@code isCircuitSlotEnabled()} 存在时用它把关（蒸汽总线之类靠它关掉），不存在则视为可用。</li>
  *   <li><b>找机器</b>：不检查菜单是不是 {@code ModularUIContainer}，改成鸭子类型——
  *       先找无参方法 {@code getModularUI()}，找不到再找类型名含 {@code ModularUI} 的字段；
  *       拿到 ModularUI 后读 {@code holder} 字段（找不到就找类型名含 {@code IUIHolder} 的字段）。</li>
@@ -95,6 +100,13 @@ public final class GtCircuitSupport {
             "com.gregtechceu.gtceu.api.recipe.ingredient.IntCircuitBehaviour",
     };
 
+    /** 26.10.34 起机器电路槽改成的 AE 键存储类型（{@code NotifiableInventory} 的真正存储）。 */
+    private static final String KEY_INVENTORY_CLASS = "com.gregtechceu.gtceu.api.transfer.key.KeyInventory";
+    /** AE 键电路槽的官方读写入口，GT 自己的电路界面（GhostCircuitSlotWidget）也用它。 */
+    private static final String CIRCUITS_CLASS = "com.gregtechceu.gtceu.api.recipe.content.Circuits";
+    /** {@code NotifiableInventory} 里装着真正键存储的字段名。 */
+    private static final String KEY_STORAGE_FIELD = "storage";
+
     /** GT 配方对象里可能装着输入原料的字段名，GTCEu 与 GTO 各用一套。 */
     private static final String[] RECIPE_CONTENT_FIELDS = {
             "itemInputs", "inputs", "tickInputs", "inputItems", "itemInput", "input"};
@@ -113,6 +125,14 @@ public final class GtCircuitSupport {
     private static Method isIntegratedCircuitMethod;
     private static Method getCircuitConfigurationMethod;
     private static Method circuitStackMethod;
+    /** AE 键电路槽通路（26.10.34 起）用到的类型与方法；老版本解析不到时为 {@code null}。 */
+    private static Class<?> keyInventoryClass;
+    private static Method keyAtMethod;
+    private static Method amountAtMethod;
+    private static Method circuitsGetMethod;
+    private static Method circuitsSetMethod;
+    /** 已经提醒过“有电路槽、但没有可用写入通路”的机器类，避免刷屏。 */
+    private static final Set<String> UNWRITABLE_REPORTED = ConcurrentHashMap.newKeySet();
 
     // ------------------------------------------------------------------
     // 配方对电路的要求
@@ -609,16 +629,54 @@ public final class GtCircuitSupport {
     }
 
     /**
-     * 判断该机器当前是否提供可调整的电路槽。
-     * 只要有无参方法 {@code getCircuitInventory()} 就认为具备；{@code isCircuitSlotEnabled()}
-     * 存在时用它把关，不存在则视为可用。
+     * 判断该机器当前是否提供<b>可调整</b>的电路槽。
+     *
+     * <p>有无参方法 {@code getCircuitInventory()} 只是前提；{@code isCircuitSlotEnabled()} 存在时
+     * 还要它没把关掉，并且它的返回值得是我们认得出来、写得进去的那两种形态之一
+     * （Forge 物品容器 / AE 键存储）。只认前一种会在 gtceu 26.10.34 上得出“有电路槽、却写不进”
+     * 的错误结论，而写入失败是静默的——那正是 1.0.39 “材料进去了、电路没动”的成因。
      */
     public static boolean canAdjustCircuit(Object holder) {
+        resolve();
         if (holder == null || circuitInventoryMethod(holder) == null) {
             return false;
         }
         Object enabled = invokeNoArg(holder, "isCircuitSlotEnabled");
-        return enabled == null || Boolean.TRUE.equals(enabled);
+        if (enabled != null && !Boolean.TRUE.equals(enabled)) {
+            return false;
+        }
+        // 有电路槽还不够：得有一条我们认得出来的写入通路，否则只是“看得见、写不进”。
+        if (itemCircuitInventory(holder) != null || keyCircuitInventory(holder) != null) {
+            return true;
+        }
+        // 落到这里就是“机器有电路槽、却没有可用写入通路”——1.0.39 之前这类失败完全静默，
+        // 只能靠翻存档才发现。按机器类提醒一次，用户直接把日志发过来就够了。
+        if (UNWRITABLE_REPORTED.add(holder.getClass().getName())) {
+            Object inventory = circuitInventory(holder);
+            LOGGER.warn("[电路] {} 有电路槽，但它的存储类型（{}）没有可用的写入通路，电路调整会静默失效；"
+                            + "请把这条日志反馈给作者",
+                    holder.getClass().getSimpleName(),
+                    inventory == null ? "null" : inventory.getClass().getName());
+        }
+        return false;
+    }
+
+    /**
+     * 读取这台<b>方块实体</b>上第一处可调整电路槽的当前编号。
+     *
+     * <p>与 {@link #findCircuitHoldersAt} 配套：多方块部件自己的电路在控制器上，这里返回的也是
+     * 控制器上的那一格。用于「管理界面显示每台机器的电路」「整体模式的电路一致性判定」这类只读场景。
+     *
+     * @return 当前编号（空槽按 GT 的语义视为 0）；方块实体不是格雷机器、或没有任何可调整的电路槽时
+     *         返回 {@code null}——「没有电路槽」与「电路是 0」是两件事，调用方必须分得清
+     */
+    public static Integer currentCircuit(BlockEntity blockEntity) {
+        for (Object holder : findCircuitHoldersAt(blockEntity)) {
+            if (canAdjustCircuit(holder)) {
+                return readCurrentCircuit(holder);
+            }
+        }
+        return null;
     }
 
     /**
@@ -628,15 +686,20 @@ public final class GtCircuitSupport {
      *         {@link #NO_CIRCUIT}，调用方应照常写入而不是跳过
      */
     public static int readCurrentCircuit(Object holder) {
-        Object inventory = circuitInventory(holder);
-        if (!(inventory instanceof IItemHandlerModifiable handler) || handler.getSlots() < 1) {
-            return NO_CIRCUIT;
+        resolve();
+        IItemHandlerModifiable handler = itemCircuitInventory(holder);
+        if (handler != null) {
+            ItemStack current = handler.getStackInSlot(0);
+            if (current == null || current.isEmpty()) {
+                return 0;
+            }
+            return readCircuit(current);
         }
-        ItemStack current = handler.getStackInSlot(0);
-        if (current == null || current.isEmpty()) {
-            return 0;
+        Object keyInventory = keyCircuitInventory(holder);
+        if (keyInventory != null) {
+            return readKeyCircuit(keyInventory);
         }
-        return readCircuit(current);
+        return NO_CIRCUIT;
     }
 
     /**
@@ -648,16 +711,25 @@ public final class GtCircuitSupport {
         if (circuit < 0 || circuit > MAX_CIRCUIT || !canAdjustCircuit(holder)) {
             return false;
         }
+        IItemHandlerModifiable handler = itemCircuitInventory(holder);
+        if (handler != null) {
+            ItemStack configured = createCircuitStack(circuit);
+            if (configured.isEmpty()) {
+                return false;
+            }
+            handler.setStackInSlot(0, configured);
+            return true;
+        }
+        Object keyInventory = keyCircuitInventory(holder);
+        if (keyInventory != null && writeKeyCircuit(keyInventory, circuit)) {
+            return true;
+        }
         Object inventory = circuitInventory(holder);
-        if (!(inventory instanceof IItemHandlerModifiable handler) || handler.getSlots() < 1) {
-            return false;
-        }
-        ItemStack configured = createCircuitStack(circuit);
-        if (configured.isEmpty()) {
-            return false;
-        }
-        handler.setStackInSlot(0, configured);
-        return true;
+        LOGGER.warn("[电路] {} 的电路槽（{}）没有可用的写入通路，电路 {} 没能生效；请把这条日志反馈给作者",
+                holder.getClass().getSimpleName(),
+                inventory == null ? "null" : inventory.getClass().getName(),
+                circuit);
+        return false;
     }
 
     /**
@@ -675,16 +747,24 @@ public final class GtCircuitSupport {
         if (!canAdjustCircuit(holder)) {
             return false;
         }
-        Object inventory = circuitInventory(holder);
-        if (!(inventory instanceof IItemHandlerModifiable handler) || handler.getSlots() < 1) {
-            return false;
+        IItemHandlerModifiable handler = itemCircuitInventory(holder);
+        if (handler != null) {
+            ItemStack current = handler.getStackInSlot(0);
+            if (current != null && !current.isEmpty() && readCircuit(current) == NO_CIRCUIT) {
+                return false;
+            }
+            handler.setStackInSlot(0, ItemStack.EMPTY);
+            return true;
         }
-        ItemStack current = handler.getStackInSlot(0);
-        if (current != null && !current.isEmpty() && readCircuit(current) == NO_CIRCUIT) {
-            return false;
+        Object keyInventory = keyCircuitInventory(holder);
+        if (keyInventory != null) {
+            // 槽里放着非编程电路的东西就别代玩家删。
+            if (keyCircuitAmount(keyInventory) > 0 && readKeyCircuit(keyInventory) == NO_CIRCUIT) {
+                return false;
+            }
+            return writeKeyCircuit(keyInventory, NO_CIRCUIT);
         }
-        handler.setStackInSlot(0, ItemStack.EMPTY);
-        return true;
+        return false;
     }
 
     /** 取机器的电路槽物品容器。 */
@@ -697,6 +777,92 @@ public final class GtCircuitSupport {
             return method.invoke(holder);
         } catch (ReflectiveOperationException | RuntimeException | LinkageError error) {
             return null;
+        }
+    }
+
+    /**
+     * 取电路槽的 Forge 物品容器（gtceu 26.10.34 之前的形态）。
+     *
+     * @return 可写物品容器；电路槽不是物品容器、或格数为 0 时返回 {@code null}
+     */
+    private static IItemHandlerModifiable itemCircuitInventory(Object holder) {
+        Object inventory = circuitInventory(holder);
+        if (inventory instanceof IItemHandlerModifiable handler && handler.getSlots() >= 1) {
+            return handler;
+        }
+        return null;
+    }
+
+    /**
+     * 取电路槽的 AE 键存储（gtceu 26.10.34 起）。
+     *
+     * <p>那一版把机器电路槽换成了 {@code NotifiableInventory<AEItemKey>}：它不再实现
+     * {@code IItemHandlerModifiable}，真正的存储是它内部字段 {@code storage}（{@code KeyInventory}），
+     * 官方读写入口是 GT 自己电路界面用的 {@code Circuits.get/set}。
+     *
+     * @return 可读写的键存储；该版本没有这套机制、或拿不到时返回 {@code null}
+     */
+    private static Object keyCircuitInventory(Object holder) {
+        if (keyInventoryClass == null || keyAtMethod == null || amountAtMethod == null
+                || circuitsGetMethod == null || circuitsSetMethod == null) {
+            return null;
+        }
+        Object inventory = circuitInventory(holder);
+        if (inventory == null) {
+            return null;
+        }
+        if (keyInventoryClass.isInstance(inventory)) {
+            return inventory;
+        }
+        Object storage = readFieldByName(inventory, KEY_STORAGE_FIELD);
+        return keyInventoryClass.isInstance(storage) ? storage : null;
+    }
+
+    /**
+     * 读 AE 键电路槽的编号。
+     *
+     * <p>不能只看 {@code Circuits.get}：空槽它也返回 -1，与“槽里放着别的东西”混在一起，
+     * 所以先用 {@code amountAt(0)} 把空槽认出来当 0（与 Forge 通路的口径保持一致）。
+     *
+     * @return 编号；空槽 0；槽里是非电路键或读不到时 {@link #NO_CIRCUIT}
+     */
+    private static int readKeyCircuit(Object keyInventory) {
+        if (keyCircuitAmount(keyInventory) <= 0) {
+            return 0;
+        }
+        try {
+            Object configuration = circuitsGetMethod.invoke(null, keyInventory, 0);
+            if (configuration instanceof Integer value && value >= 0 && value <= MAX_CIRCUIT) {
+                return value;
+            }
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError ignored) {
+            // 读不到就按“槽里有异物”处理
+        }
+        return NO_CIRCUIT;
+    }
+
+    /** AE 键电路槽第 0 格的存量；读不到按 0（空槽）算。 */
+    private static long keyCircuitAmount(Object keyInventory) {
+        try {
+            Object amount = amountAtMethod.invoke(keyInventory, 0);
+            return amount instanceof Number number ? number.longValue() : 0L;
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError error) {
+            return 0L;
+        }
+    }
+
+    /**
+     * 通过 GT 自己的入口写 AE 键电路槽。
+     *
+     * @param circuit 编号；{@link #NO_CIRCUIT} 表示清空（{@code Circuits.set} 的语义）
+     * @return 是否写入成功
+     */
+    private static boolean writeKeyCircuit(Object keyInventory, int circuit) {
+        try {
+            circuitsSetMethod.invoke(null, keyInventory, 0, circuit);
+            return true;
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError error) {
+            return false;
         }
     }
 
@@ -747,8 +913,11 @@ public final class GtCircuitSupport {
      *
      * <p>与 {@link #invokeNoArg} 分开：后者只走类层次，找不到 {@code IRecipeLogicMachine} 这类
      * 接口 default 方法。两条通路互不影响，既有的鸭子类型判断不会被这次新增改到。
+     *
+     * <p>包内可见：{@link MachineStateProbe} 用同一张公开方法表去找机器实例的
+     * {@code getRecipeLogic()} 与 {@code isIdle()}，各写一份只会让两处的查找口径慢慢漂开。
      */
-    private static Object invokePublicNoArg(Object owner, String name) {
+    static Object invokePublicNoArg(Object owner, String name) {
         if (owner == null) {
             return null;
         }
@@ -820,7 +989,15 @@ public final class GtCircuitSupport {
         return null;
     }
 
-    private static Object readFieldByName(Object owner, String name) {
+    /**
+     * 按字段名读一个实例字段，逐层往父类找。
+     *
+     * <p>包内可见：{@link InputLimitSupport} 用同一条通路去读格雷机器上的「防止堵料」开关
+     * （{@code CustomItemStackHandler#isInputLimited}），各写一份只会让两处的查找口径慢慢漂开。
+     *
+     * @return 字段值；没有这个字段、读不到或值为 {@code null} 时返回 {@code null}
+     */
+    static Object readFieldByName(Object owner, String name) {
         if (owner == null) {
             return null;
         }
@@ -878,12 +1055,62 @@ public final class GtCircuitSupport {
             problems.add("找不到 IntCircuitBehaviour（已按注册名 + NBT 兜底读电路）");
         }
 
+        resolveKeyInventory();
+
         if (circuitItem == null) {
             LOGGER.debug("未找到编程电路物品，电路自动配置功能已关闭（未安装格雷科技？）");
         } else if (!problems.isEmpty()) {
             // 部分入口没拿到，但功能已经自动降级、仍然可用，打一行说明便于事后排查。
             LOGGER.info("[电路] 部分格雷接口不可用（已自动降级）：{}", String.join("；", problems));
         }
+    }
+
+    /**
+     * 解析 AE 键电路槽通路（gtceu 26.10.34 起）。
+     *
+     * <p>老版本根本没有 {@code KeyInventory}，解析不到属于正常情况：不打日志、也不算问题。
+     * 只有“类在、方法却找不到”才记进 {@code problems}——那种情况下电路槽是看得见但写不进的，
+     * 必须留下痕迹（1.0.39 之前正是这类失败被静默吞掉，表现为“材料进去了、电路没动”）。
+     */
+    private static void resolveKeyInventory() {
+        try {
+            keyInventoryClass = Class.forName(KEY_INVENTORY_CLASS);
+        } catch (ClassNotFoundException | LinkageError | RuntimeException ignored) {
+            keyInventoryClass = null;
+            return;
+        }
+        keyAtMethod = lookupInstanceMethod(keyInventoryClass, "KeyInventory.keyAt", "keyAt", int.class);
+        amountAtMethod = lookupInstanceMethod(keyInventoryClass, "KeyInventory.amountAt", "amountAt",
+                int.class);
+        Class<?> circuitsClass;
+        try {
+            circuitsClass = Class.forName(CIRCUITS_CLASS);
+        } catch (ClassNotFoundException | LinkageError | RuntimeException error) {
+            problems.add("找不到 Circuits（电路槽是 AE 键存储时无法读写）");
+            return;
+        }
+        circuitsGetMethod = lookupStaticMethod(circuitsClass, "Circuits.get", "get",
+                keyInventoryClass, int.class);
+        circuitsSetMethod = lookupStaticMethod(circuitsClass, "Circuits.set", "set",
+                keyInventoryClass, int.class, int.class);
+    }
+
+    /** 找一个公开的实例方法；找不到返回 {@code null} 并记入 {@code problems}。 */
+    private static Method lookupInstanceMethod(Class<?> owner, String label, String name,
+            Class<?>... parameterTypes) {
+        try {
+            Method method = owner.getMethod(name, parameterTypes);
+            if (Modifier.isStatic(method.getModifiers())) {
+                problems.add(label + "：不是实例方法");
+                return null;
+            }
+            return method;
+        } catch (NoSuchMethodException error) {
+            problems.add(label + "：没有方法 " + name + "（参数 " + parameterTypes.length + " 个）");
+        } catch (RuntimeException | LinkageError error) {
+            problems.add(label + "：" + error);
+        }
+        return null;
     }
 
     /** 找编程电路物品：先按标准注册名直接查，查不到再按路径扫描全表兜底。 */

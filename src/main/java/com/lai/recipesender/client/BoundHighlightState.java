@@ -11,6 +11,7 @@ import net.minecraft.world.level.Level;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * ⑪ 世界内高亮：点过「高亮」的容器在 3 秒内以红色描边画出来。
@@ -34,10 +35,11 @@ final class BoundHighlightState {
     }
 
     /**
-     * 高亮一个容器（若它是主容器，则连同整个并列组一起），并重新开始计时。
+     * 高亮一个容器（若它是主容器或并列成员，则连同整个并列组一起），并重新开始计时。
      *
-     * <p>主容器带出一整组是有意为之：主容器 + 并列成员 + 从容器在发送时是**一个主体**，
-     * 只框住主容器会让玩家以为材料只会进那一台，而实际上并列成员要均分、从容器要收溢出。
+     * <p>带出一整组是有意为之：主容器 + 并列成员 + 从容器在发送时是**一个主体**，
+     * 只框住一个方块会让玩家以为材料只会进那一台，而实际上并列成员要均分、从容器要收溢出
+     * （独立模式下每个成员收的是它自己那只箱子里的那份）。
      *
      * @return 目标不在当前维度时返回 false（此时不设高亮，只发一条提示）
      */
@@ -46,11 +48,13 @@ final class BoundHighlightState {
             return false;
         }
         List<BoundContainer> targets = new ArrayList<>();
-        if (binding.role() == BoundContainer.Role.MASTER) {
-            BoundGroupResolver.BoundGroup group = BoundContainerClient.groupOf(binding.id());
+        if (binding.isMaster() || binding.role() == BoundContainer.Role.PARALLEL) {
+            UUID masterId = binding.isMaster() ? binding.id() : binding.parentId();
+            BoundGroupResolver.BoundGroup group = masterId == null
+                    ? null : BoundContainerClient.groupOf(masterId);
             if (group != null) {
                 targets.addAll(group.members());
-                targets.addAll(group.slaves());
+                targets.addAll(group.allSlaves());
             }
         }
         if (targets.isEmpty()) {
