@@ -628,6 +628,13 @@ public final class RecipeSenderClient {
             // 先按直达再补按 ~ 也要算数，而且先松 ~ 再松直达键时结果不能变回去。
             selection.ignoreFluids = true;
         }
+        if (isFillAllDown()) {
+            // 1 / Alt 按住期间每 tick 都顶满，不能只靠那一次按键事件：事件只在按下时来一下，
+            // 而份数要等服务端统计（最长 2 秒）才知道上限，按下那一刻上限往往还是 0，
+            // 之后统计回来也不会再顶一次——玩家看到的就是「按住 1 没用，得滚一下滚轮」。
+            selection.selectAllRequested = true;
+            selection.selectedBatches = maxSendableBatches();
+        }
         if (minecraft.screen != selection.activeScreen) {
             cancelSelection("当前界面已改变");
             return;
@@ -1550,8 +1557,14 @@ public final class RecipeSenderClient {
         selection.availableBatches = Math.max(0, Math.min(RecipeSenderConfig.maxBatches(), batches));
         if (selection.availableBatches == 0) {
             selection.selectedBatches = 0;
+        } else if (isFillAllDown() || selection.selectAllRequested) {
+            // 「给满」的意图必须跟着每一份统计结果走，不能只认第一份：服务端扫描有延迟，
+            // 第一份回执很可能还是 0，而按下 1 的那一刻上限就正好是 0——只认第一份的话
+            // 玩家按住 1 却永远停在 1 份。意图只由玩家自己滚轮调数量时撤销（见 adjustBatches）。
+            selection.selectAllRequested = true;
+            selection.selectedBatches = selection.availableBatches;
         } else if (!selection.nearbyAvailabilityReceived) {
-            selection.selectedBatches = selection.selectAllRequested ? selection.availableBatches : 1;
+            selection.selectedBatches = 1;
         } else if (selection.selectedBatches == 0) {
             selection.selectedBatches = 1;
         } else {
@@ -1840,6 +1853,10 @@ public final class RecipeSenderClient {
         int ceiling = maxSendableBatches();
         if (ceiling == 0) {
             selection.selectedBatches = 0;
+        } else if (isFillAllDown() || selection.selectAllRequested) {
+            // 与 acceptNearbyAvailability 同一套口径：只要「给满」的意图还在，就跟着最新上限走。
+            selection.selectAllRequested = true;
+            selection.selectedBatches = ceiling;
         } else if (selection.selectedBatches == 0) {
             selection.selectedBatches = 1;
         } else {
@@ -1999,6 +2016,9 @@ public final class RecipeSenderClient {
             selection.selectAllRequested = true;
             return ceiling;
         }
+        // 没按 1 / Alt 却滚了滚轮 = 玩家要自己定数量，「给满」的意图到此为止：
+        // 否则下一份统计回执又会把它顶回满值，滚轮就永远减不下去。
+        selection.selectAllRequested = false;
         int limit = Math.min(ceiling, RecipeSenderConfig.maxBatches());
         if (isControlDown()) {
             return snapToStep(current, direction, CONTROL_STEP, limit);
