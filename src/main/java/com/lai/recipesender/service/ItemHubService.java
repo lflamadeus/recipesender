@@ -1,16 +1,19 @@
 package com.lai.recipesender.service;
 
+import com.lai.recipesender.integration.findme.FindMeExtendedAdapter;
 import com.lai.recipesender.model.BoundContainer;
 import com.lai.recipesender.model.SourceScope;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraftforge.common.capabilities.ForgeCapabilities;
 import net.minecraftforge.items.IItemHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.function.Predicate;
 
 /**
@@ -75,69 +78,70 @@ public final class ItemHubService {
     /**
      * 中枢里的物品快照，供份数统计与规划使用。
      *
-     * <p>与 {@code FindMeExtendedAdapter.snapshotNearby} 保持同一套「看得见 ≠ 取得出」语义：
-     * 先按 {@code relevant} 过滤（避免碰无关槽位），再做一次模拟抽取确认真的取得出来。
-     * 唯一区别是不枚举世界——直接读绑定容器的槽位。
+     * <p>读取走 {@link FindMeExtendedAdapter#snapshotContainers}，也就是周围扫描用的同一条路径：
+     * <b>先问 AE2 存储，问不到才退回 Forge 物品处理器</b>。这一点对 GTO 的物品保险库是必须的——
+     * 它把同一份库存同时挂成处理器和 MEStorage，而处理器那一侧只暴露第一个物品键，
+     * 直接按槽位读会读出一堆空槽，中枢直达就会显示「0 份」，明明仓里堆满了料。
+     *
+     * <p>与周围扫描的唯一区别是容器列表来自绑定，不枚举世界：中枢直达的开销只和中枢大小成正比。
      */
     public static List<ItemStack> contents(ServerPlayer player, Predicate<ItemStack> relevant) {
-        List<ItemStack> stacks = new ArrayList<>();
-        for (BoundTargetResolver.ResolvedTarget target : resolve(player)) {
-            IItemHandler handler = target.handler();
-            for (int slot = 0; slot < handler.getSlots(); slot++) {
-                ItemStack stack = handler.getStackInSlot(slot);
-                if (stack.isEmpty() || !relevant.test(stack)) {
-                    continue;
-                }
-                if (!canExtract(handler, slot)) {
-                    continue;
-                }
-                stacks.add(stack.copy());
-            }
-        }
-        return stacks;
+        return FindMeExtendedAdapter.snapshotContainers(blocks(resolve(player)), relevant);
     }
 
     /**
      * 从物品中枢抽料，抽到的追加进 {@code output}。
      *
-     * <p>与周围直达的抽取是两条独立实现，这是有意的：周围直达要经过 FindMeExtended 的反射通路
-     * （AE2 存储、黑名单、模拟抽取的副作用都要照顾），而中枢就是普通的 {@link IItemHandler}，
-     * 直接按槽位 {@code extractItem} 即可，少一层反射也少一处可能对不上的语义。
+     * <p>同样复用 {@code pullAllTo}：它先试 AE2 存储、再按槽位 {@code extractItem}，
+     * 与上面统计时「模拟抽取说抽得出来才抽得出来」的判定是同一套调用，不会出现
+     * 「统计说有、真抽时抽不到」。
      *
      * @return 每一项实际抽到的数量，下标与 {@code requirements} 对齐
      */
     public static int[] extract(ServerPlayer player, List<ItemStack> requirements,
                                 List<ItemStack> output) {
-        int[] pulled = new int[requirements.size()];
         if (player == null || requirements == null || requirements.isEmpty()) {
-            return pulled;
+            return new int[requirements == null ? 0 : requirements.size()];
         }
-        List<BoundTargetResolver.ResolvedTarget> targets = resolve(player);
-        if (targets.isEmpty()) {
-            return pulled;
+        List<BlockEntity> blocks = blocks(resolve(player));
+        if (blocks.isEmpty()) {
+            return new int[requirements.size()];
         }
+        int[] pulled = FindMeExtendedAdapter.pullAllTo(player, blocks, requirements, output);
+        // 没装 FindMeExtended（反射通路为 null）时 pullAllTo 一律返回 0，但普通箱子的
+        // Forge 处理器照样能抽——中枢直达不该因为缺一个可选模组就完全不可用。
         for (int index = 0; index < requirements.size(); index++) {
-            ItemStack requirement = requirements.get(index);
-            if (requirement.isEmpty()) {
-                continue;
+            int missing = requirements.get(index).getCount() - pulled[index];
+            if (missing > 0) {
+                pulled[index] += takeFromHandlers(blocks, requirements.get(index), missing, output);
             }
-            int remaining = requirement.getCount();
-            for (BoundTargetResolver.ResolvedTarget target : targets) {
-                if (remaining <= 0) {
-                    break;
-                }
-                remaining -= take(target, requirement, remaining, output);
-                target.blockEntity().setChanged();
-            }
-            pulled[index] = requirement.getCount() - remaining;
+        }
+        for (BlockEntity block : blocks) {
+            block.setChanged();
         }
         return pulled;
     }
 
-    /** 在单个中枢里按槽位抽一项材料，返回实际抽到的数量。 */
-    private static int take(BoundTargetResolver.ResolvedTarget target, ItemStack requirement,
-                            int wanted, List<ItemStack> output) {
-        IItemHandler handler = target.handler();
+    /** 退回 Forge 槽位抽取；只在反射通路不可用时兜底。 */
+    private static int takeFromHandlers(List<BlockEntity> blocks, ItemStack requirement, int wanted,
+                                        List<ItemStack> output) {
+        int taken = 0;
+        for (BlockEntity block : blocks) {
+            if (taken >= wanted) {
+                break;
+            }
+            Optional<IItemHandler> handler = block.getCapability(ForgeCapabilities.ITEM_HANDLER, null)
+                    .resolve();
+            if (handler.isEmpty()) {
+                continue;
+            }
+            taken += takeFromHandler(handler.get(), requirement, wanted - taken, output);
+        }
+        return taken;
+    }
+
+    private static int takeFromHandler(IItemHandler handler, ItemStack requirement, int wanted,
+                                       List<ItemStack> output) {
         int taken = 0;
         for (int slot = 0; slot < handler.getSlots() && taken < wanted; slot++) {
             ItemStack stack = handler.getStackInSlot(slot);
@@ -158,6 +162,17 @@ public final class ItemHubService {
             output.add(extracted.copy());
         }
         return taken;
+    }
+
+    /** 已解析的中枢方块实体；统计与抽取共用同一份顺序。 */
+    private static List<BlockEntity> blocks(List<BoundTargetResolver.ResolvedTarget> targets) {
+        List<BlockEntity> blocks = new ArrayList<>(targets.size());
+        for (BoundTargetResolver.ResolvedTarget target : targets) {
+            if (target.blockEntity() != null) {
+                blocks.add(target.blockEntity());
+            }
+        }
+        return blocks;
     }
 
     /**
@@ -209,15 +224,5 @@ public final class ItemHubService {
             }
         }
         return remaining;
-    }
-
-    /** 模拟抽取一个槽位：别人的 {@code extractItem} 可能有副作用，所以只探相关的槽位。 */
-    private static boolean canExtract(IItemHandler handler, int slot) {
-        try {
-            return !handler.extractItem(slot, 1, true).isEmpty();
-        } catch (RuntimeException exception) {
-            LOGGER.debug("模拟抽取中枢槽位 {} 失败，本次不统计该槽位", slot, exception);
-            return false;
-        }
     }
 }

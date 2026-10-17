@@ -191,6 +191,43 @@ public final class FindMeExtendedAdapter {
     }
 
     /**
+     * 只读指定容器（不枚举世界）的物品快照，用于物品中枢的份数统计。
+     *
+     * <p>与 {@link #snapshotNearby} 是同一条读取路径，唯一区别是容器列表由调用方给出：
+     * 中枢直达的成本应该只和中枢本身的大小成正比，而不是和整个基地的容器数量成正比。
+     *
+     * <p>为什么不能直接读 Forge 物品处理器：GTO 的物品保险库把同一份库存（keyMap）同时挂成
+     * Forge 处理器和 AE2 MEStorage，而处理器那一侧的 {@code getStackInSlot} 只返回第一个物品键，
+     * 读它既不准也不完整。所以这里与周围扫描一样，<b>先问 AE2 存储，问不到才退回处理器</b>。
+     */
+    public static List<ItemStack> snapshotContainers(List<BlockEntity> containers,
+                                                     Predicate<ItemStack> relevant) {
+        if (containers == null || containers.isEmpty()) {
+            return List.of();
+        }
+        ReflectionAccess reflection = getAccess();
+        List<ItemStack> result = new ArrayList<>();
+        List<Ae2Snapshot> physicalStorages = new ArrayList<>();
+        List<Ae2Snapshot> networkStorages = new ArrayList<>();
+        Set<Object> visitedAe2Storages = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (BlockEntity blockEntity : containers) {
+            if (blockEntity == null || blockEntity.isRemoved()) {
+                continue;
+            }
+            boolean ae2 = reflection != null && reflection.collectAe2Snapshots(blockEntity,
+                    physicalStorages, networkStorages, visitedAe2Storages);
+            if (!ae2) {
+                blockEntity.getCapability(ForgeCapabilities.ITEM_HANDLER, null)
+                        .ifPresent(handler -> copyHandlerContents(handler, result, relevant));
+            }
+        }
+        if (reflection != null) {
+            reflection.appendAe2Stacks(physicalStorages, networkStorages, result);
+        }
+        return List.copyOf(result);
+    }
+
+    /**
      * 一次扫描周围容器后按顺序取回多种材料。
      * 返回每种材料实际取回的数量，顺序与传入列表一致。
      * 分批扫描是必要的：逐种材料各自扫描一遍整个搜索范围会成倍放大服务端主线程开销。
