@@ -113,6 +113,69 @@ public final class FluidTransferPlanner {
     }
 
     /**
+     * 把 {@code batches} 份流体分摊到各个落点，返回每一台分到几份。
+     *
+     * <p>纯液体配方（没有物品输入）没有「每台收下了几份材料」可用：物品那边一份都没有，
+     * {@link RemoteTransferPlanner.Placement#memberBatches()} 全是 0，照它灌流体就一滴也灌不下去。
+     * 这时份数只能由流体这一侧决定，而且要和物品侧的投放语义保持一致：<b>均分</b>。
+     * 逐台把份数堆到第一台装满，会让一台机器吃掉整批液体、其余机器干等，和带物品的配方行为对不上。
+     *
+     * <p>做法与 {@link RemoteTransferPlanner#splitByShares} 同一套：每台先各拿
+     * {@code ⌊份数 ÷ 台数⌋} 份，余数从第一台往后依次多分一份；某台装不下自己那份时，
+     * 差额再轮流摊给还有余量的成员（等价于物品侧的 {@code roundRobin}）。
+     * 真的都装满了才会剩下份数，调用方据此把这一块判成「流体不足」。
+     *
+     * <p>列表里允许出现 {@code null}（这一台没有流体能力），这样返回的份数表可以按位置与调用方的
+     * 成员表对齐——纯液体配方要靠这份对齐关系决定每台灌多少。
+     */
+    public static int[] allocateBatches(List<Target> targets, List<FluidStack> perBatch, int batches) {
+        int[] shares = new int[targets.size()];
+        if (perBatch.isEmpty() || batches <= 0) {
+            return shares;
+        }
+        int capable = 0;
+        for (Target target : targets) {
+            if (target != null) {
+                capable++;
+            }
+        }
+        if (capable == 0) {
+            return shares;
+        }
+        int[] quota = RemoteTransferPlanner.splitByShares(batches, capable);
+        int[] capacity = new int[targets.size()];
+        int deficit = 0;
+        int quotaIndex = 0;
+        for (int index = 0; index < targets.size(); index++) {
+            Target target = targets.get(index);
+            if (target == null) {
+                continue;
+            }
+            int wanted = quota[quotaIndex++];
+            capacity[index] = maxBatches(List.of(target), perBatch, batches);
+            int granted = Math.min(wanted, capacity[index]);
+            shares[index] = granted;
+            deficit += wanted - granted;
+        }
+        // 均分不下的部分轮流摊给还有余量的成员：一次一台加一份，顺序就是绑定顺序。
+        while (deficit > 0) {
+            boolean moved = false;
+            for (int index = 0; index < targets.size() && deficit > 0; index++) {
+                if (targets.get(index) == null || shares[index] >= capacity[index]) {
+                    continue;
+                }
+                shares[index]++;
+                deficit--;
+                moved = true;
+            }
+            if (!moved) {
+                break;
+            }
+        }
+        return shares;
+    }
+
+    /**
      * 把一批流体轮流灌进目标组。
      *
      * @param execute {@code false} = 只模拟（返回已受理的总量），{@code true} = 真填

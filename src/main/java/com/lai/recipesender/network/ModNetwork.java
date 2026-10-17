@@ -67,8 +67,19 @@ public final class ModNetwork {
      * 上线），新增 {@code SetGroupModePacket} 与 {@code AlignGroupCircuitPacket} 两个包，
      * {@code BoundDetail} 尾部加了 {@code GROUP_CIRCUIT_MISMATCH}，{@code MachineStatusPacket}
      * 每条多了电路编号。任一处错位都会读出垃圾数据，必须整体挡开。
+     *
+     * <p>1.0.44 由 16 升到 17：{@code NearbyRecipeQueryPacket} 尾部多了流体需求表（纯液体配方
+     * 只有这一侧），{@code NearbyRecipeAvailabilityPacket} 尾部多了「为什么只有这么多份」的
+     * {@code BoundDetail}。两处都用「读得到才读」守卫，但字段确实是新增的，新旧版本仍按协议
+     * 版本挡开。
+     *
+     * <p>1.0.45 由 17 升到 18：新增「取料范围」{@code SourceScope}（周围 / 物品中枢），
+     * {@code NearbyRecipeQueryPacket}、{@code DirectInsertToBoundPacket}、
+     * {@code DirectInsertResultPacket} 三个包的尾部都多了这一字节；{@code BoundDetail} 尾部加了
+     * {@code NO_ITEM_HUB} 与 {@code HUB_SHORT}；{@code BoundContainer.Kind} 加了
+     * {@code ITEM_HUB}（跟着同步包上线）。枚举按序号写线上，加值就必须升版本。
      */
-    private static final String PROTOCOL_VERSION = "16";
+    private static final String PROTOCOL_VERSION = "18";
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             ResourceLocation.fromNamespaceAndPath(RecipeSenderMod.MOD_ID, "main"),
             () -> PROTOCOL_VERSION, PROTOCOL_VERSION::equals, PROTOCOL_VERSION::equals);

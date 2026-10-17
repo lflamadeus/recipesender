@@ -39,7 +39,7 @@ public final class RecipeSenderConfigScreen extends Screen {
     private static final int FIELD_WIDTH = 66;
     private static final int HINT_GAP = 8;
     private static final int BUTTON_GAP = 6;
-    private static final int ROWS = 3;
+    private static final int ROWS = 4;
 
     private final Screen parent;
 
@@ -47,6 +47,8 @@ public final class RecipeSenderConfigScreen extends Screen {
     private BoundEditBox distanceBox;
     /** 份数上限输入框。 */
     private BoundEditBox batchesBox;
+    /** 单块份数输入框。 */
+    private BoundEditBox chunkBox;
 
     /** 流体开关的草稿值：点「保存」之前不动配置。 */
     private boolean fluidDraft;
@@ -88,8 +90,12 @@ public final class RecipeSenderConfigScreen extends Screen {
         batchesBox = numberBox(1, RecipeSenderConfig.maxBatches(),
                 RecipeSenderConfig::maxBatches,
                 Lang.message("text.recipe_sender.config_batches_narration", "单次份数上限"));
+        chunkBox = numberBox(2, RecipeSenderConfig.chunkBatches(),
+                RecipeSenderConfig::chunkBatches,
+                Lang.message("text.recipe_sender.config_chunk_narration", "单块份数"));
         addRenderableWidget(distanceBox);
         addRenderableWidget(batchesBox);
+        addRenderableWidget(chunkBox);
         fluidDraft = RecipeSenderConfig.fluidSupport();
     }
 
@@ -127,13 +133,15 @@ public final class RecipeSenderConfigScreen extends Screen {
                 Lang.message("text.recipe_sender.config_distance_hint", "-1 = 不限"));
         row(graphics, 1, Lang.message("text.recipe_sender.config_batches_label", "单次份数上限"),
                 Lang.message("text.recipe_sender.config_batches_hint", "1 ~ 16384"));
-        row(graphics, 2, Lang.message("text.recipe_sender.config_fluid_label", "流体支持"),
+        row(graphics, 2, Lang.message("text.recipe_sender.config_chunk_label", "单块份数"),
+                Lang.message("text.recipe_sender.config_chunk_hint", "1 ~ 256，越大越快、余料越多"));
+        row(graphics, 3, Lang.message("text.recipe_sender.config_fluid_label", "流体支持"),
                 Lang.message("text.recipe_sender.config_fluid_hint", "含流体的配方要整份齐备"));
 
         Component fluidLabel = fluidDraft
                 ? Lang.message("text.recipe_sender.config_fluid_on", "已开启")
                 : Lang.message("text.recipe_sender.config_fluid_off", "已关闭");
-        drawButton(graphics, fieldX(), rowY(2) - 4, fluidLabel, "toggle_fluid", mouseX, mouseY,
+        drawButton(graphics, fieldX(), rowY(3) - 4, fluidLabel, "toggle_fluid", mouseX, mouseY,
                 Lang.message("text.recipe_sender.config_fluid_tooltip",
                         "关闭时忽略配方里的流体，只搬运物品；开启后直达会把流体也算进一份"));
 
@@ -224,10 +232,11 @@ public final class RecipeSenderConfigScreen extends Screen {
         }
     }
 
-    /** 把三个控件填回默认值；不写配置，等玩家点「保存」。 */
+    /** 把四个控件填回默认值；不写配置，等玩家点「保存」。 */
     private void applyDefaults() {
         distanceBox.setValue(String.valueOf(RecipeSenderConfig.DEFAULT_RECIPE_MANAGEMENT_DISTANCE));
         batchesBox.setValue(String.valueOf(RecipeSenderConfig.DEFAULT_MAX_BATCHES));
+        chunkBox.setValue(String.valueOf(RecipeSenderConfig.DEFAULT_CHUNK_BATCHES));
         fluidDraft = RecipeSenderConfig.DEFAULT_FLUID_SUPPORT;
         setStatus(Lang.message("text.recipe_sender.config_reset_done", "已填入默认值，点「保存」后生效"),
                 BoundUi.TEXT_DIM);
@@ -254,8 +263,16 @@ public final class RecipeSenderConfigScreen extends Screen {
                     "单次份数上限必须是 1 ~ 16384 之间的整数"), BoundUi.TEXT_DANGER);
             return;
         }
+        Integer chunk = parse(chunkBox.getValue());
+        if (chunk == null || chunk < RecipeSenderConfig.MIN_CHUNK_BATCHES
+                || chunk > RecipeSenderConfig.MAX_CHUNK_BATCHES) {
+            setStatus(Lang.message("text.recipe_sender.config_chunk_invalid",
+                    "单块份数必须是 1 ~ 256 之间的整数"), BoundUi.TEXT_DANGER);
+            return;
+        }
         RecipeSenderConfig.setRecipeManagementDistance(distance);
         RecipeSenderConfig.setMaxBatches(batches);
+        RecipeSenderConfig.setChunkBatches(chunk);
         RecipeSenderConfig.setFluidSupport(fluidDraft);
         setStatus(Lang.message("text.recipe_sender.config_saved",
                 "已保存到 config/recipe_sender-common.toml"), BoundUi.TAG_MASTER);

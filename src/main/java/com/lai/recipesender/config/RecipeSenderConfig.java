@@ -35,8 +35,14 @@ public final class RecipeSenderConfig {
     public static final int DEFAULT_RECIPE_MANAGEMENT_DISTANCE = 128;
     /** 份数上限的默认值。 */
     public static final int DEFAULT_MAX_BATCHES = 8192;
-    /** 流体支持的默认值：关。 */
-    public static final boolean DEFAULT_FLUID_SUPPORT = false;
+    /** 流体支持的默认值：开（1.0.48 起默认打开，纯液体配方与含液体配方开箱即用）。 */
+    public static final boolean DEFAULT_FLUID_SUPPORT = true;
+    /** 单块份数的默认值。 */
+    public static final int DEFAULT_CHUNK_BATCHES = 64;
+    /** 单块份数的允许下限。 */
+    public static final int MIN_CHUNK_BATCHES = 1;
+    /** 单块份数的允许上限（与 {@code defineInRange} 里的上界必须一致）。 */
+    public static final int MAX_CHUNK_BATCHES = 256;
     /** {@link #recipeManagementDistance()} 取这个值表示不限距离。 */
     public static final int UNLIMITED_DISTANCE = -1;
     /** 配方管理距离的允许上限（与 {@code defineInRange} 里的上界必须一致）。 */
@@ -51,6 +57,7 @@ public final class RecipeSenderConfig {
     private static final ForgeConfigSpec.IntValue RECIPE_MANAGEMENT_DISTANCE;
     private static final ForgeConfigSpec.IntValue MAX_BATCHES;
     private static final ForgeConfigSpec.BooleanValue FLUID_SUPPORT;
+    private static final ForgeConfigSpec.IntValue CHUNK_BATCHES;
 
     /** 配置规格；由 {@link #register(ModLoadingContext)} 交给 Forge。 */
     public static final ForgeConfigSpec SPEC;
@@ -78,15 +85,24 @@ public final class RecipeSenderConfig {
                 .defineInRange("maxBatches", DEFAULT_MAX_BATCHES, MIN_BATCHES, MAX_BATCHES_LIMIT);
 
         FLUID_SUPPORT = builder
-                .comment("流体支持开关，默认关闭。",
-                        "关闭时：配方里的流体输入被完全忽略，只搬运物品（与旧版本行为一致）。",
-                        "打开时：含流体的配方「一份」= 物品与流体都齐，缺任何一项都一份都不发。",
+                .comment("流体支持开关，默认开启。",
+                        "打开时：含流体的配方「一份」= 物品与流体都齐，缺任何一项都一份都不发；",
+                        "  纯液体配方（只有流体输入）只走「中枢直达」这一个入口。",
                         "  流体只能来自绑定的「流体中枢」（管理界面 → 流体中枢页签，全局只允许一个），",
                         "  目前只有直达模式（反转键 + 绑定键，或直达快捷键）会搬运流体；",
                         "  目标容器必须能装流体，装不下会提示「目标无法放下流体」。",
-                        "  流体数量不设上限，由配方份数自然限制。",
+                        "关闭时：配方里的流体输入被完全忽略，只搬运物品（与 1.0.43 之前的行为一致），",
+                        "  纯液体配方因此无法发送。",
                         "反转与绑定发送始终只处理物品，不受这个开关影响。")
                 .define("fluidSupport", DEFAULT_FLUID_SUPPORT);
+
+        CHUNK_BATCHES = builder
+                .comment("单块份数，默认 64。",
+                        "一次发送会按这个粒度分块：每块先抽出材料、再放进目标、再抽下一块。",
+                        "块越大，一次抽到手的材料越多（省服务端枚举次数），但失败时退回背包的余料也越多；",
+                        "块越小，余料越好回收，代价是每块都要重新扫一遍来源容器。",
+                        "64 是实测比较平衡的值：多数配方一份只有几种材料，一块的余料通常还能塞回背包。")
+                .defineInRange("chunkBatches", DEFAULT_CHUNK_BATCHES, MIN_CHUNK_BATCHES, MAX_CHUNK_BATCHES);
 
         builder.pop();
         SPEC = builder.build();
@@ -119,6 +135,11 @@ public final class RecipeSenderConfig {
     /** 流体支持是否开启；只影响直达模式，见配置注释。 */
     public static boolean fluidSupport() {
         return read(FLUID_SUPPORT, DEFAULT_FLUID_SUPPORT);
+    }
+
+    /** 单块份数：一次发送按这个粒度分块抽取与投放。 */
+    public static int chunkBatches() {
+        return read(CHUNK_BATCHES, DEFAULT_CHUNK_BATCHES);
     }
 
     /**
@@ -154,6 +175,20 @@ public final class RecipeSenderConfig {
     /** 写入流体支持开关并落盘。 */
     public static void setFluidSupport(boolean enabled) {
         FLUID_SUPPORT.set(enabled);
+        persist();
+    }
+
+    /**
+     * 写入单块份数并落盘；入参必须在
+     * {@link #MIN_CHUNK_BATCHES} ~ {@link #MAX_CHUNK_BATCHES} 之间。
+     *
+     * @throws IllegalArgumentException 入参越界
+     */
+    public static void setChunkBatches(int batches) {
+        if (batches < MIN_CHUNK_BATCHES || batches > MAX_CHUNK_BATCHES) {
+            throw new IllegalArgumentException("单块份数超出范围: " + batches);
+        }
+        CHUNK_BATCHES.set(batches);
         persist();
     }
 

@@ -2,7 +2,11 @@ package com.lai.recipesender.service;
 
 import com.lai.recipesender.config.RecipeSenderConfig;
 import com.lai.recipesender.integration.findme.FindMeExtendedAdapter;
+import com.lai.recipesender.model.BoundContainer;
+import com.lai.recipesender.model.BoundDetail;
+import com.lai.recipesender.model.RecipeFluidSpec;
 import com.lai.recipesender.model.RecipeIngredientSpec;
+import com.lai.recipesender.model.SourceScope;
 import com.lai.recipesender.network.ModNetwork;
 import com.lai.recipesender.network.packet.NearbyRecipeAvailabilityPacket;
 import com.lai.recipesender.network.packet.NearbyRecipePullPacket;
@@ -42,44 +46,127 @@ public final class NearbyRecipeService {
 
     /** 统计背包和周围容器能够支持的最大配方份数。 */
     public static synchronized void query(ServerPlayer player, NearbyRecipeQueryPacket packet) {
-        if (player == null || packet == null || !validIngredients(packet.ingredients())) {
+        if (player == null || packet == null || !validRequest(packet)) {
             return;
         }
 
         long currentTick = player.serverLevel().getGameTime();
         cleanupQueryStates(currentTick);
         QueryState previous = QUERY_STATES.get(player.getUUID());
-        if (previous != null && sameIngredients(previous.ingredients(), packet.ingredients())
+        if (previous != null && sameRequest(previous, packet)
                 && currentTick >= previous.tick()
                 && currentTick - previous.tick() < QUERY_INTERVAL_TICKS) {
-            sendAvailability(player, packet.requestId(), previous.availableBatches());
+            sendAvailability(player, packet.requestId(), previous.availableBatches(), previous.reason());
             return;
         }
 
         int available = 0;
+        BoundDetail reason = null;
         try {
-            if (FindMeExtendedAdapter.isAvailable()) {
-                Predicate<BlockPos> searchable = containerFilter(player, Set.of());
-                // 两种模式都统计玩家背包与快捷栏：反转模式的材料取回背包，背包里的现成材料当然算数；
-                // 直达模式也一样（1.0.32 起直达会把背包与快捷栏里的材料直接送进目标容器），
-                // 所以「周围能做几份」对两边是同一个数字。
-                available = countAvailable(packet.ingredients(),
-                        captureStocks(player, searchable, packet.ingredients()));
+            // 两侧上限分别算，再由 BatchBudget 取最小：纯物品配方只有物品侧，纯液体配方只有流体侧，
+            // 物品 + 液体则两边都要够——「能做几份」对它们本来就是同一件事。
+            BatchBudget budget = BatchBudget.requested(RecipeSenderConfig.maxBatches());
+            if (!packet.ingredients().isEmpty()) {
+                ItemSource items = itemSource(player, packet);
+                budget = budget.withItemSource(items.batches());
+                if (items.reason() != null) {
+                    reason = items.reason();
+                }
+            }
+            FluidSource fluids = fluidSource(player, packet.fluids());
+            budget = budget.withFluidSource(fluids.batches());
+            available = budget.limit();
+            if (available < 1) {
+                reason = fluids.reason() != null ? fluids.reason() : reason;
             }
         } catch (RuntimeException exception) {
             LOGGER.warn("统计玩家 {} 周围的配方材料失败",
                     player.getGameProfile().getName(), exception);
         }
 
-        QUERY_STATES.put(player.getUUID(), new QueryState(currentTick,
-                List.copyOf(packet.ingredients()), available));
-        sendAvailability(player, packet.requestId(), available);
+        QUERY_STATES.put(player.getUUID(), new QueryState(currentTick, packet.scope(),
+                List.copyOf(packet.ingredients()), List.copyOf(packet.fluids()), available, reason));
+        sendAvailability(player, packet.requestId(), available, reason);
+    }
+
+    /**
+     * 物品侧能支持几份，按取料范围分两条来源。
+     *
+     * <p>{@link SourceScope#NEARBY}：背包 + 周围容器（原来的行为，需要 FindMeExtended）。
+     * {@link SourceScope#HUB}：只数绑定的物品中枢，不扫世界、也不看背包——中枢直达的卖点就是
+     * 「只拿中枢里的东西」，把背包算进去会让显示份数与实际能搬的份数对不上。
+     */
+    private static ItemSource itemSource(ServerPlayer player, NearbyRecipeQueryPacket packet) {
+        List<RecipeIngredientSpec> ingredients = packet.ingredients();
+        if (ingredients.isEmpty()) {
+            // 纯液体配方：物品这一侧不构成任何限制。这里绝不能去数中枢或背包——空需求会让
+            // countAvailable 一路二分到 maxBatches，把真正的瓶颈（流体中枢）盖成 8192。
+            return new ItemSource(BatchBudget.UNLIMITED, null);
+        }
+        if (packet.scope() == SourceScope.HUB) {
+            if (ItemHubService.find(player).isEmpty()) {
+                return new ItemSource(0, BoundDetail.NO_ITEM_HUB);
+            }
+            if (ItemHubService.resolve(player).isEmpty()) {
+                // 绑了但此刻都不可用（维度不对、没加载、方块实体没了）。
+                return new ItemSource(0, BoundDetail.NO_ITEM_HUB);
+            }
+            List<ItemStack> stacks = ItemHubService.contents(player, relevance(ingredients));
+            int batches = countAvailable(ingredients,
+                    buildDirectSnapshot(List.of(), stacks));
+            return batches < 1
+                    ? new ItemSource(0, BoundDetail.HUB_SHORT)
+                    : new ItemSource(batches, null);
+        }
+        if (!FindMeExtendedAdapter.isAvailable()) {
+            return new ItemSource(0, null);
+        }
+        // 两种模式都统计玩家背包与快捷栏：反转模式的材料取回背包，背包里的现成材料当然算数；
+        // 直达模式也一样（1.0.32 起直达会把背包与快捷栏里的材料直接送进目标容器），
+        // 所以「周围能做几份」对两边是同一个数字。
+        Predicate<BlockPos> searchable = containerFilter(player, Set.of());
+        return new ItemSource(countAvailable(ingredients,
+                captureStocks(player, searchable, ingredients)), null);
+    }
+
+    /** 物品侧上限，附带「为什么这么少」的原因（只有中枢直达会带原因）。 */
+    private record ItemSource(int batches, BoundDetail reason) {
+    }
+
+    /**
+     * 流体中枢能支持几份。
+     *
+     * <p>中枢内容只有服务端知道，所以流体配方的份数必须在这里算。返回「不限」的两种情况：
+     * 这次没有流体需求，或者配置没开流体支持（那时客户端也不会发流体需求过来）。
+     */
+    private static FluidSource fluidSource(ServerPlayer player, List<RecipeFluidSpec> fluids) {
+        if (fluids == null || fluids.isEmpty() || !RecipeSenderConfig.fluidSupport()) {
+            return FluidSource.UNLIMITED;
+        }
+        BoundContainer hub = FluidHubService.find(player);
+        if (hub == null) {
+            return new FluidSource(0, BoundDetail.NO_FLUID_HUB);
+        }
+        if (!FluidHubService.resolve(player, hub).available()) {
+            // 中枢绑了但此刻不可用（维度不对、没加载、方块实体没了）：对玩家来说等同于没绑。
+            return new FluidSource(0, BoundDetail.NO_FLUID_HUB);
+        }
+        int batches = FluidHubService.countBatches(fluids, FluidHubService.contents(player, hub));
+        return batches < 1
+                ? new FluidSource(0, BoundDetail.FLUID_SHORT)
+                : new FluidSource(batches, null);
+    }
+
+    /** 流体侧上限，附带「为什么这么少」的原因。 */
+    private record FluidSource(int batches, BoundDetail reason) {
+        static final FluidSource UNLIMITED = new FluidSource(BatchBudget.UNLIMITED, null);
     }
 
     /** 将统计结果返回给发起请求的玩家。 */
-    private static void sendAvailability(ServerPlayer player, long requestId, int availableBatches) {
+    private static void sendAvailability(ServerPlayer player, long requestId, int availableBatches,
+                                         BoundDetail reason) {
         ModNetwork.CHANNEL.send(PacketDistributor.PLAYER.with(() -> player),
-                new NearbyRecipeAvailabilityPacket(requestId, availableBatches));
+                new NearbyRecipeAvailabilityPacket(requestId, availableBatches, reason));
     }
 
     /** 清理长时间未更新的玩家缓存，避免服务端长期运行时积累无效记录。 */
@@ -89,6 +176,35 @@ public final class NearbyRecipeService {
             return currentTick < state.tick()
                     || currentTick - state.tick() > QUERY_CACHE_TTL_TICKS;
         });
+    }
+
+    /** 请求内容没变时直接复用上一份统计结果。 */
+    private static boolean sameRequest(QueryState previous, NearbyRecipeQueryPacket packet) {
+        return previous.scope() == packet.scope()
+                && sameIngredients(previous.ingredients(), packet.ingredients())
+                && sameFluids(previous.fluids(), packet.fluids());
+    }
+
+    /** 逐项比较流体快照：用量、候选数、每个候选的流体与 NBT。 */
+    private static boolean sameFluids(List<RecipeFluidSpec> first, List<RecipeFluidSpec> second) {
+        if (first.size() != second.size()) {
+            return false;
+        }
+        for (int index = 0; index < first.size(); index++) {
+            RecipeFluidSpec left = first.get(index);
+            RecipeFluidSpec right = second.get(index);
+            if (left.amountPerBatch() != right.amountPerBatch()
+                    || left.options().size() != right.options().size()) {
+                return false;
+            }
+            for (int option = 0; option < left.options().size(); option++) {
+                if (!RecipeFluidSpec.sameFluid(left.options().get(option),
+                        right.options().get(option))) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /** 逐项比较配方快照，避免仅依赖哈希值造成缓存误判。 */
@@ -394,7 +510,15 @@ public final class NearbyRecipeService {
     public static DirectPlan planDirect(List<RecipeIngredientSpec> ingredients,
                                         List<ItemStack> inventoryItems, List<ItemStack> nearbyStacks,
                                         int requestedBatches) {
-        if (!validIngredients(ingredients) || requestedBatches < 1) {
+        if (requestedBatches < 1) {
+            return new DirectPlan(0, List.of());
+        }
+        if (ingredients == null || ingredients.isEmpty()) {
+            // 纯液体配方没有物品输入：物品这一侧不构成限制，份数全由流体那边决定。
+            // 这里必须给满，否则 BatchBudget 的 itemSource 会把份数压成 0。
+            return new DirectPlan(requestedBatches, List.of());
+        }
+        if (!validIngredients(ingredients)) {
             return new DirectPlan(0, List.of());
         }
         StockSnapshot snapshot = buildDirectSnapshot(
@@ -428,8 +552,31 @@ public final class NearbyRecipeService {
                 && ingredients.stream().allMatch(RecipeIngredientSpec::isValid);
     }
 
-    private record QueryState(long tick, List<RecipeIngredientSpec> ingredients,
-                              int availableBatches) {
+    /**
+     * 统计请求的内容校验。
+     *
+     * <p>物品与流体至少要有一侧：纯液体配方一个物品输入都没有，正是这次要支持的情况；
+     * 两侧都空说明请求是空的，直接丢掉。
+     */
+    private static boolean validRequest(NearbyRecipeQueryPacket packet) {
+        boolean items = validIngredients(packet.ingredients());
+        boolean fluids = packet.fluids() != null
+                && !packet.fluids().isEmpty()
+                && packet.fluids().size() <= RecipeFluidSpec.MAX_FLUIDS
+                && packet.fluids().stream().allMatch(RecipeFluidSpec::isValid);
+        if (!packet.ingredients().isEmpty() && !items) {
+            return false;
+        }
+        if (!packet.fluids().isEmpty() && !fluids) {
+            return false;
+        }
+        return items || fluids;
+    }
+
+    private record QueryState(long tick, SourceScope scope,
+                              List<RecipeIngredientSpec> ingredients,
+                              List<RecipeFluidSpec> fluids, int availableBatches,
+                              BoundDetail reason) {
     }
 
     /** 背包与周围容器的材料快照，计数单独保存以便每轮规划廉价地重置。 */

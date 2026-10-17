@@ -60,7 +60,19 @@ public record BoundContainer(UUID id, String name, ResourceKey<Level> dimension,
      */
     public enum Kind {
         ITEM_TARGET,
-        FLUID_HUB
+        FLUID_HUB,
+        /**
+         * 物品中枢：直达模式的物品<b>来源</b>，与流体中枢同一个思路，只是搬的是物品。
+         *
+         * <p>「中枢直达」只从这里取料，不再扫周围容器；可以绑多个（大型基地里材料常常分在
+         * 几个网络/箱子上）。它同样不参与主/并/从分组，也不带配方类别。
+         */
+        ITEM_HUB;
+
+        /** 这个种类是不是「来源中枢」（物品中枢 / 流体中枢），也就是不参与分组、没有主/并/从。 */
+        public boolean isHub() {
+            return this != ITEM_TARGET;
+        }
     }
 
     /**
@@ -125,6 +137,16 @@ public record BoundContainer(UUID id, String name, ResourceKey<Level> dimension,
         return kind == Kind.FLUID_HUB;
     }
 
+    /** 这条绑定是不是物品中枢（中枢直达的物品来源）。 */
+    public boolean isItemHub() {
+        return kind == Kind.ITEM_HUB;
+    }
+
+    /** 这条绑定是不是某种中枢：中枢只当来源，永远不是投放落点。 */
+    public boolean isHub() {
+        return kind != Kind.ITEM_TARGET;
+    }
+
     /**
      * 这个发送单元是不是「整体模式」。
      *
@@ -155,11 +177,12 @@ public record BoundContainer(UUID id, String name, ResourceKey<Level> dimension,
      */
     public BoundContainer withKind(Kind newKind) {
         Kind target = newKind == null ? Kind.ITEM_TARGET : newKind;
+        boolean hub = target != Kind.ITEM_TARGET;
         return new BoundContainer(id, name, dimension, pos, iconItem,
-                target == Kind.FLUID_HUB ? Role.MASTER : role, target,
-                target == Kind.FLUID_HUB ? null : parentId,
-                target == Kind.FLUID_HUB ? Set.of() : routeKeys, createdAt,
-                target == Kind.FLUID_HUB ? GroupMode.INDEPENDENT : groupMode);
+                hub ? Role.MASTER : role, target,
+                hub ? null : parentId,
+                hub ? Set.of() : routeKeys, createdAt,
+                hub ? GroupMode.INDEPENDENT : groupMode);
     }
 
     /** 生成替换角色与父容器后的副本。 */

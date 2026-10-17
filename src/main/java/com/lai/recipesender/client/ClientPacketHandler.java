@@ -4,6 +4,7 @@ import com.lai.recipesender.model.BoundContainer;
 import com.lai.recipesender.model.BoundDetail;
 import com.lai.recipesender.model.BoundStatus;
 import com.lai.recipesender.model.NoticeSeverity;
+import com.lai.recipesender.model.SourceScope;
 import com.lai.recipesender.network.packet.MachineStatusPacket;
 import net.minecraft.network.chat.Component;
 
@@ -17,8 +18,8 @@ public final class ClientPacketHandler {
     }
 
     /** 将服务端统计结果转交给客户端选择状态。 */
-    public static void acceptNearbyAvailability(long requestId, int batches) {
-        RecipeSenderClient.acceptNearbyAvailability(requestId, batches);
+    public static void acceptNearbyAvailability(long requestId, int batches, BoundDetail reason) {
+        RecipeSenderClient.acceptNearbyAvailability(requestId, batches, reason);
     }
 
     /** 用服务端推送的绑定列表与「上次选择」替换客户端只读缓存。 */
@@ -38,9 +39,9 @@ public final class ClientPacketHandler {
     /** 转交一次「直达」的结果。 */
     public static void acceptDirectInsertResult(long requestId, UUID bindingId, BoundStatus status,
                                                 int insertedBatches, int requestedBatches,
-                                                BoundDetail detail) {
+                                                BoundDetail detail, SourceScope scope) {
         RecipeSenderClient.acceptDirectInsertResult(requestId, bindingId, status, insertedBatches,
-                requestedBatches, detail);
+                requestedBatches, detail, scope);
     }
 
     /**

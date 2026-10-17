@@ -3,6 +3,7 @@ package com.lai.recipesender.network.packet;
 import com.lai.recipesender.client.ClientPacketHandler;
 import com.lai.recipesender.model.BoundDetail;
 import com.lai.recipesender.model.BoundStatus;
+import com.lai.recipesender.model.SourceScope;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraftforge.network.NetworkEvent;
 
@@ -22,9 +23,21 @@ import java.util.function.Supplier;
  * @param insertedBatches  实际完整送达的份数
  * @param requestedBatches 玩家要求的份数
  * @param detail           补充说明的结构化原因；没有补充说明时为 {@code null}
+ * @param scope            本次直达的取料范围，客户端据此说「从周围」还是「从中枢」
  */
 public record DirectInsertResultPacket(long requestId, UUID bindingId, BoundStatus status,
-                                       int insertedBatches, int requestedBatches, BoundDetail detail) {
+                                       int insertedBatches, int requestedBatches, BoundDetail detail,
+                                       SourceScope scope) {
+
+    public DirectInsertResultPacket {
+        scope = SourceScope.of(scope);
+    }
+
+    /** 兼容旧调用点（未带范围时按周围直达处理）。 */
+    public DirectInsertResultPacket(long requestId, UUID bindingId, BoundStatus status,
+                                    int insertedBatches, int requestedBatches, BoundDetail detail) {
+        this(requestId, bindingId, status, insertedBatches, requestedBatches, detail, SourceScope.NEARBY);
+    }
 
     /** 编码回执。 */
     public static void encode(DirectInsertResultPacket packet, FriendlyByteBuf buffer) {
@@ -37,6 +50,7 @@ public record DirectInsertResultPacket(long requestId, UUID bindingId, BoundStat
         if (packet.detail != null) {
             buffer.writeEnum(packet.detail);
         }
+        SourceScope.of(packet.scope).writeTo(buffer);
     }
 
     /** 解码回执。 */
@@ -48,7 +62,7 @@ public record DirectInsertResultPacket(long requestId, UUID bindingId, BoundStat
         int requestedBatches = buffer.readVarInt();
         BoundDetail detail = buffer.readBoolean() ? buffer.readEnum(BoundDetail.class) : null;
         return new DirectInsertResultPacket(requestId, bindingId, status, insertedBatches,
-                requestedBatches, detail);
+                requestedBatches, detail, SourceScope.readFrom(buffer));
     }
 
     /** 交给客户端界面提示。 */
@@ -57,7 +71,7 @@ public record DirectInsertResultPacket(long requestId, UUID bindingId, BoundStat
         NetworkEvent.Context context = contextSupplier.get();
         context.enqueueWork(() -> ClientPacketHandler.acceptDirectInsertResult(packet.requestId(),
                 packet.bindingId(), packet.status(), packet.insertedBatches(),
-                packet.requestedBatches(), packet.detail()));
+                packet.requestedBatches(), packet.detail(), packet.scope()));
         context.setPacketHandled(true);
     }
 }

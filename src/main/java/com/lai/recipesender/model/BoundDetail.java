@@ -26,6 +26,17 @@ public enum BoundDetail {
     /** 配方带流体，中枢里的流体不够这次要发的份数。 */
     FLUID_SHORT("text.recipe_sender.bound_detail.fluid_short"),
 
+    /**
+     * 中枢直达，但玩家一个物品中枢都没绑（或绑了的中枢此刻都不可用）。
+     *
+     * <p>与「周围没有材料」分开说：周围直达找不到材料是正常的（可能确实没库存），
+     * 中枢直达找不到材料则十有八九是忘了绑中枢——这两种情况的处理办法完全不同。
+     */
+    NO_ITEM_HUB("text.recipe_sender.bound_detail.no_item_hub"),
+
+    /** 中枢直达，中枢可用但里面的材料凑不齐一份。 */
+    HUB_SHORT("text.recipe_sender.bound_detail.hub_short"),
+
     /** 主容器与全部并列成员都在跑配方，这一组一台空闲机器都没有：一份都没投，电路也没动。 */
     ALL_BUSY("text.recipe_sender.bound_detail.all_busy"),
 

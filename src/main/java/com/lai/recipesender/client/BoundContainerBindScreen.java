@@ -287,7 +287,7 @@ public class BoundContainerBindScreen extends Screen {
     private void applyDefaultCategory() {
         // 中枢不带类别（服务端保存时也会清空），所以不猜、也不显示。
         if (categoryDefaultApplied || editing != null || !pendingRoutes.isEmpty() || blockIcon.isEmpty()
-                || kind == BoundContainer.Kind.FLUID_HUB) {
+                || kind.isHub()) {
             return;
         }
         List<RecipeCategoryCache.Entry> machineEntries = machineCategories();
@@ -558,15 +558,18 @@ public class BoundContainerBindScreen extends Screen {
                 && kind == BoundContainer.Kind.ITEM_TARGET;
     }
 
-    /** 用途选择：两个并排按钮「物品目标 / 流体中枢」。 */
+    /** 用途选择：三个并排按钮「物品目标 / 物品中枢 / 流体中枢」。 */
     private void drawKindRow(GuiGraphics graphics, int mouseX, int mouseY, int x, int y) {
-        // 两个按钮取同一个宽度（按较宽的那个），并排看起来才齐。
+        // 三个按钮取同一个宽度（按最宽的那个），并排看起来才齐。
         int buttonWidth = Math.max(
                 BoundUi.buttonWidth(Component.translatable("text.recipe_sender.bind_kind_item")),
-                BoundUi.buttonWidth(Component.translatable("text.recipe_sender.bind_kind_fluid")));
+                Math.max(BoundUi.buttonWidth(Component.translatable("text.recipe_sender.bind_kind_item_hub")),
+                        BoundUi.buttonWidth(Component.translatable("text.recipe_sender.bind_kind_fluid"))));
         drawKindButton(graphics, mouseX, mouseY, x, y, buttonWidth,
                 BoundContainer.Kind.ITEM_TARGET, "text.recipe_sender.bind_kind_item");
         drawKindButton(graphics, mouseX, mouseY, x + buttonWidth + KIND_BUTTON_GAP, y, buttonWidth,
+                BoundContainer.Kind.ITEM_HUB, "text.recipe_sender.bind_kind_item_hub");
+        drawKindButton(graphics, mouseX, mouseY, x + (buttonWidth + KIND_BUTTON_GAP) * 2, y, buttonWidth,
                 BoundContainer.Kind.FLUID_HUB, "text.recipe_sender.bind_kind_fluid");
     }
 
@@ -885,7 +888,7 @@ public class BoundContainerBindScreen extends Screen {
             return;
         }
         kind = newKind;
-        if (kind == BoundContainer.Kind.FLUID_HUB) {
+        if (kind.isHub()) {
             closeDropdown();
         }
     }
@@ -908,7 +911,7 @@ public class BoundContainerBindScreen extends Screen {
      */
     private void setRole(BoundContainer.Role newRole) {
         // 中枢没有角色可言：角色行根本不画，这里是防键盘/异常路径把隐藏状态改掉。
-        if (kind == BoundContainer.Kind.FLUID_HUB) {
+        if (kind.isHub()) {
             return;
         }
         role = newRole;
@@ -987,8 +990,8 @@ public class BoundContainerBindScreen extends Screen {
             // 焦点在输入框里：这一次按键是打字（名字里完全可能有个 b），不是绑定请求。
             return;
         }
-        if (editing != null || kind == BoundContainer.Kind.FLUID_HUB) {
-            // 编辑已有绑定、以及流体中枢，都没有可推断的默认关系，按「确定」处理。
+        if (editing != null || kind.isHub()) {
+            // 编辑已有绑定、以及两种中枢，都没有可推断的默认关系，按「确定」处理。
             save();
             return;
         }
@@ -1218,9 +1221,9 @@ public class BoundContainerBindScreen extends Screen {
         if (name.length() > BoundContainer.MAX_NAME_LENGTH) {
             name = name.substring(0, BoundContainer.MAX_NAME_LENGTH);
         }
-        // 流体中枢固定是主容器、没有父容器、也没有配方类别（服务端会再强制一遍）。界面上角色行与
+        // 两种中枢都固定是主容器、没有父容器、也没有配方类别（服务端会再强制一遍）。界面上角色行与
         // 类别区块对它本来就不画，这里仍然按中枢该有的样子算一遍要发出去的值，不依赖隐藏状态。
-        boolean hub = kind == BoundContainer.Kind.FLUID_HUB;
+        boolean hub = kind.isHub();
         BoundContainer.Role sendRole = hub ? BoundContainer.Role.MASTER : role;
         UUID sendParentId = hub ? null : parentId;
         Set<ResourceLocation> sendRoutes = hub ? Set.of() : pendingRoutes;

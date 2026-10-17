@@ -178,6 +178,19 @@ final class RecipeMaterialCollector {
         return List.copyOf(result);
     }
 
+    /**
+     * 这个配方是不是「纯液体」：EMI 里只有流体输入、没有任何物品输入。
+     *
+     * <p>判定与 {@link #createFluidSpecs} 同源，所以只要那张表非空、物品描述为空，就是纯液体配方。
+     * 它决定客户端允许用哪个入口发送：流体只能来自流体中枢，纯液体配方因此只走「中枢直达」，
+     * 用别的模式按下去只会显示一份错误的可用份数（物品侧没有需求，统计会一路二分到上限），
+     * 松手后必然失败。
+     */
+    static boolean isPureFluid(List<RecipeIngredientSpec> itemSpecs,
+                               List<RecipeFluidSpec> fluidSpecs) {
+        return itemSpecs.isEmpty() && !fluidSpecs.isEmpty();
+    }
+
     /** 按指定份数从背包快照中规划正向投放材料。 */
     static CollectionResult collect(EmiRecipe recipe, Player player, int batches) {
         if (recipe == null || player == null || batches < 1

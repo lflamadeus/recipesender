@@ -385,9 +385,13 @@ class BoundContainerManageScreen extends Screen {
         return count;
     }
 
-    /** 当前页签的数据源：物品目标页列全部物品目标，中枢页只列中枢。 */
+    /** 当前页签的数据源：物品目标页列全部物品目标，两种中枢页各自只列对应中枢。 */
     private List<BoundContainer> tabSource() {
-        return tab == Tab.FLUIDS ? BoundContainerClient.fluidHubs() : BoundContainerClient.itemTargets();
+        return switch (tab) {
+            case FLUIDS -> BoundContainerClient.fluidHubs();
+            case ITEM_HUBS -> BoundContainerClient.itemHubs();
+            case ITEMS -> BoundContainerClient.itemTargets();
+        };
     }
 
     // ------------------------------------------------------------------ 数据组织
@@ -405,8 +409,8 @@ class BoundContainerManageScreen extends Screen {
 
     /** 分组：主容器 → 它名下的并列成员与从容器；找不到父容器的单独成组。 */
     private List<Entry> buildEntries() {
-        // 页签决定数据源：中枢页是平铺的几条（正常只有一条），走 buildHubEntries()。
-        if (tab == Tab.FLUIDS) {
+        // 页签决定数据源：中枢页是平铺的几条，走 buildHubEntries()。
+        if (tab != Tab.ITEMS) {
             return buildHubEntries();
         }
         // 物品目标页：中枢绝不能进来。它也是 MASTER 角色，混进来会被当成一个「可展开的主容器」，
@@ -550,7 +554,7 @@ class BoundContainerManageScreen extends Screen {
         String needle = query.trim().toLowerCase(Locale.ROOT);
         searching = !needle.isEmpty();
         int shown = 0;
-        for (BoundContainer hub : BoundContainerClient.fluidHubs()) {
+        for (BoundContainer hub : tabSource()) {
             if (searching && !matches(hub, needle)) {
                 continue;
             }
@@ -663,6 +667,11 @@ class BoundContainerManageScreen extends Screen {
                     centerX, listTop + listHeight / 2 - 4, BoundUi.TEXT_DIM);
             return;
         }
+        if (tab == Tab.ITEM_HUBS) {
+            BoundUi.centered(graphics, Component.translatable("text.recipe_sender.item_hub_empty"),
+                    centerX, listTop + listHeight / 2 - 4, BoundUi.TEXT_DIM);
+            return;
+        }
         int y = listTop + listHeight / 2 - 16;
         BoundUi.centered(graphics, Component.translatable("text.recipe_sender.manage_empty"),
                 centerX, y, BoundUi.TEXT);
@@ -673,19 +682,21 @@ class BoundContainerManageScreen extends Screen {
     }
 
     /**
-     * 画两个页签并登记命中区。
+     * 画三个页签并登记命中区。
      *
-     * <p>两页等宽平分面板内侧宽度，样式沿用本模组的面板配色：选中用 {@code ROW_SELECTED} 底 +
+     * <p>三页等宽平分面板内侧宽度，样式沿用本模组的面板配色：选中用 {@code ROW_SELECTED} 底 +
      * 正常字色，未选中是面板底色 + 暗字色，悬停提亮一档。不另画选中记号（下划线之类），
      * 底色本身就够区分，也和行内的选中样式一致。
      */
     private void drawTabs(GuiGraphics graphics, int mouseX, int mouseY) {
         int innerWidth = panelWidth - PADDING * 2;
-        int tabWidth = (innerWidth - TAB_GAP) / 2;
+        int tabWidth = (innerWidth - TAB_GAP * 2) / 3;
         int y = top + HEADER_HEIGHT + 2;
         int height = TAB_HEIGHT - 4;
         drawTab(graphics, mouseX, mouseY, left + PADDING, y, tabWidth, height, Tab.ITEMS);
         drawTab(graphics, mouseX, mouseY, left + PADDING + tabWidth + TAB_GAP, y, tabWidth, height,
+                Tab.ITEM_HUBS);
+        drawTab(graphics, mouseX, mouseY, left + PADDING + (tabWidth + TAB_GAP) * 2, y, tabWidth, height,
                 Tab.FLUIDS);
     }
 
@@ -1099,7 +1110,7 @@ class BoundContainerManageScreen extends Screen {
         List<Action> actions = new ArrayList<>();
         actions.add(new Action(Component.translatable("text.recipe_sender.button_rename"), false, "rename",
                 Component.translatable("text.recipe_sender.tooltip_rename")));
-        if (!binding.isFluidHub()) {
+        if (!binding.isHub()) {
             actions.add(new Action(Component.translatable("text.recipe_sender.button_relation"), false,
                     "relation", Component.translatable("text.recipe_sender.tooltip_relation")));
             // 「类别」只给主容器：并列成员与从容器跟随父容器，勾类别没有意义（方案 §6⑩ 明确不加）。
@@ -1525,14 +1536,16 @@ class BoundContainerManageScreen extends Screen {
     }
 
     /**
-     * 管理界面的两个页签。
+     * 管理界面的三个页签。
      *
      * <p>页签直接对应绑定的**用途**（{@code BoundContainer.Kind}），所以没有另建数据结构：
-     * 分叉只在「数据源」与「每行有哪几个按钮」两处，行的渲染、滚动、搜索、改名两页共用。
+     * 分叉只在「数据源」与「每行有哪几个按钮」两处，行的渲染、滚动、搜索、改名三页共用。
      */
     private enum Tab {
         /** 容器绑定：全部物品目标。 */
         ITEMS("text.recipe_sender.manage_tab_items"),
+        /** 物品中枢：中枢直达的物品来源，可以有多个。 */
+        ITEM_HUBS("text.recipe_sender.manage_tab_item_hubs"),
         /** 流体中枢：只列流体中枢。 */
         FLUIDS("text.recipe_sender.manage_tab_fluids");
 

@@ -48,6 +48,13 @@ public final class BoundContainerClient {
      */
     private static volatile List<BoundContainer> fluidHubs = List.of();
     /**
+     * 物品中枢（中枢直达的来源），只在同步时重算一次。
+     *
+     * <p>可以有多条：材料分散在几个网络/箱子上时，玩家会各绑一个。它和流体中枢一样不进
+     * {@link #itemTargets}——中枢是来源，不是投放落点。
+     */
+    private static volatile List<BoundContainer> itemHubs = List.of();
+    /**
      * 每个主容器的 {@code {并列成员数(含自己), 从容器数}}，同步时一次算好。
      *
      * <p>从容器数是**整组**的总数：既包括挂在主容器下的组级从容器，也包括挂到各并列成员名下的
@@ -87,12 +94,17 @@ public final class BoundContainerClient {
         List<BoundContainer> targetList = new ArrayList<>(list.size());
         List<BoundContainer> masterList = new ArrayList<>();
         List<BoundContainer> hubList = new ArrayList<>(1);
+        List<BoundContainer> itemHubList = new ArrayList<>(1);
         for (BoundContainer binding : list) {
             index.put(binding.id(), binding);
-            // 流体中枢也是 MASTER 角色，但它不是物品目标：物品通路（直达候选、选择弹窗、
+            // 中枢也是 MASTER 角色，但它不是物品目标：物品通路（直达候选、选择弹窗、
             // 按类别路由）只认物品目标，所以在这里就把它挡在外面，调用方不必各自再判一次。
             if (binding.isFluidHub()) {
                 hubList.add(binding);
+                continue;
+            }
+            if (binding.isItemHub()) {
+                itemHubList.add(binding);
                 continue;
             }
             targetList.add(binding);
@@ -104,6 +116,7 @@ public final class BoundContainerClient {
         byId = Map.copyOf(index);
         itemTargets = List.copyOf(targetList);
         fluidHubs = List.copyOf(hubList);
+        itemHubs = List.copyOf(itemHubList);
         masters = List.copyOf(masterList);
         lastChoices = choices == null ? Map.of() : Map.copyOf(choices);
         groupStats = countGroups(itemTargets, index);
@@ -185,13 +198,28 @@ public final class BoundContainerClient {
     }
 
     /**
-     * 全部物品目标（含主容器、并列成员、从容器），**不含流体中枢**。
+     * 全部物品目标（含主容器、并列成员、从容器），**不含任何中枢**。
      *
      * <p>管理界面的「容器绑定」页用的就是它：那一页要按主容器分组列全部物品目标，
-     * 中枢是另一种用途，只能出现在「流体中枢」页（见 {@link #fluidHubs()}）。
+     * 中枢是另一种用途，只能出现在「流体中枢」/「物品中枢」页（见 {@link #fluidHubs()}、
+     * {@link #itemHubs()}）。
      */
     public static List<BoundContainer> itemTargets() {
         return itemTargets;
+    }
+
+    /**
+     * 全部物品中枢（中枢直达的来源，可以有多个）。
+     *
+     * <p>**不要拿它当物品候选**：中枢不参与物品分摊，只当来源。
+     */
+    public static List<BoundContainer> itemHubs() {
+        return itemHubs;
+    }
+
+    /** 有没有绑物品中枢：中枢直达快捷键的可用性判断用它。 */
+    public static boolean hasItemHub() {
+        return !itemHubs.isEmpty();
     }
 
     /**
@@ -289,7 +317,7 @@ public final class BoundContainerClient {
         UUID id = lastChoices.get(routeKey.toString());
         BoundContainer binding = id == null ? null : find(id);
         // 中枢不是物品候选：老数据里若记着它（那条绑定后来被改成了中枢）也当作「没有上次」。
-        return binding == null || binding.isFluidHub() ? null : binding;
+        return binding == null || binding.isHub() ? null : binding;
     }
 
     /**
@@ -368,6 +396,7 @@ public final class BoundContainerClient {
         byId = Map.of();
         itemTargets = List.of();
         fluidHubs = List.of();
+        itemHubs = List.of();
         masters = List.of();
         groupStats = Map.of();
         lastChoices = Map.of();

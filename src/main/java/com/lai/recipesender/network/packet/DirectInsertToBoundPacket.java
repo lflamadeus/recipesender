@@ -2,6 +2,7 @@ package com.lai.recipesender.network.packet;
 
 import com.lai.recipesender.model.RecipeFluidSpec;
 import com.lai.recipesender.model.RecipeIngredientSpec;
+import com.lai.recipesender.model.SourceScope;
 import com.lai.recipesender.service.DirectInsertionService;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraftforge.network.NetworkEvent;
@@ -27,10 +28,24 @@ import java.util.function.Supplier;
  * @param gregRecipe 客户端是否<b>确认</b>这是格雷配方（认出了配方对象）
  * @param fluids     配方要求的流体输入；流体支持关闭、或配方不含流体时是空表。带流体时
  *                   「一份」的定义是物品与流体都齐，服务端会同时受两边约束
+ * @param scope      取料范围：{@link SourceScope#NEARBY} 扫周围容器与背包，
+ *                   {@link SourceScope#HUB} 只从绑定的物品中枢取料
  */
 public record DirectInsertToBoundPacket(long requestId, UUID bindingId,
                                         List<RecipeIngredientSpec> specs, List<RecipeFluidSpec> fluids,
-                                        int batches, int circuit, boolean gregRecipe) {
+                                        int batches, int circuit, boolean gregRecipe,
+                                        SourceScope scope) {
+
+    /** 兼容旧调用点：不带范围时按「周围直达」。 */
+    public DirectInsertToBoundPacket(long requestId, UUID bindingId, List<RecipeIngredientSpec> specs,
+                                     List<RecipeFluidSpec> fluids, int batches, int circuit,
+                                     boolean gregRecipe) {
+        this(requestId, bindingId, specs, fluids, batches, circuit, gregRecipe, SourceScope.NEARBY);
+    }
+
+    public DirectInsertToBoundPacket {
+        scope = SourceScope.of(scope);
+    }
 
     /** 编码直达请求；配方输入描述的编码规则与周围材料统计完全一致。 */
     public static void encode(DirectInsertToBoundPacket packet, FriendlyByteBuf buffer) {
@@ -41,6 +56,8 @@ public record DirectInsertToBoundPacket(long requestId, UUID bindingId,
         buffer.writeBoolean(packet.gregRecipe);
         RecipeIngredientSpec.writeList(buffer, packet.specs);
         RecipeFluidSpec.writeList(buffer, packet.fluids);
+        // 1.0.45 起末尾多一个取料范围（协议版本同步 +1）。
+        SourceScope.of(packet.scope).writeTo(buffer);
     }
 
     /** 解码直达请求。 */
@@ -52,8 +69,9 @@ public record DirectInsertToBoundPacket(long requestId, UUID bindingId,
         boolean gregRecipe = buffer.readBoolean();
         List<RecipeIngredientSpec> specs = RecipeIngredientSpec.readList(buffer);
         List<RecipeFluidSpec> fluids = RecipeFluidSpec.readList(buffer);
+        SourceScope scope = SourceScope.readFrom(buffer);
         return new DirectInsertToBoundPacket(requestId, bindingId, specs, fluids, batches,
-                circuit, gregRecipe);
+                circuit, gregRecipe, scope);
     }
 
     /** 交给服务端主线程校验并执行。 */

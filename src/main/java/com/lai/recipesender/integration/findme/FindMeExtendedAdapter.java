@@ -392,7 +392,25 @@ public final class FindMeExtendedAdapter {
     }
 
     /**
-     * 一次扫描周围容器后把材料直接抽进 {@code output}，<b>不经过玩家背包</b>。
+     * 扫一遍周围的容器，返回可以抽料的方块实体表。
+     *
+     * <p>直达按块搬运时会反复调用 {@link #pullAllTo}；每次调用都重新枚举一遍附近方块实体是
+     * 纯浪费（半径 128 格要遍历上百个区块，而方块实体在这几毫秒里不会变）。所以枚举与抽取拆开：
+     * 调用方一次发送只枚举一次，之后拿着这张表反复抽。
+     *
+     * <p>表里存的是方块实体本身，抽取时读的仍然是实时的槽位内容，所以别人在这期间搬走了材料
+     * 也不会抽到空气；方块被拆掉的情况由 {@link #pullAllTo} 逐块跳过。
+     */
+    public static List<BlockEntity> nearbyContainers(ServerPlayer player, Predicate<BlockPos> containerFilter) {
+        ReflectionAccess reflection = getAccess();
+        if (player == null || reflection == null) {
+            return List.of();
+        }
+        return reflection.collectNearbyBlockEntities(player, containerFilter);
+    }
+
+    /**
+     * 从已经枚举好的容器表里把材料直接抽进 {@code output}，<b>不经过玩家背包</b>。
      * <p>
      * 直达模式要的是「周围容器 → 绑定容器」：材料在服务端主线程上从一个容器搬进另一个容器，
      * 中间不落背包，也就不该受背包空位、掉落物和背包合并的影响。FindMeExtended 的提取器做不到
@@ -400,18 +418,25 @@ public final class FindMeExtendedAdapter {
      * 代价是只认这两条通路：别的模组注册给 FindMeExtended 的专用提取器在直达模式里用不上，
      * 那些容器里的材料会被算作「周围材料不足」而不是搬错地方。
      *
+     * @param containers 由 {@link #nearbyContainers} 枚举出来的容器表；为 {@code null} 时按空表处理
      * @param output 抽出来的材料按抽取顺序追加到这里；调用方负责把没投出去的部分还回去
      * @return 每种材料实际抽出的数量，顺序与 {@code requirements} 一致
      */
-    public static int[] pullAllTo(ServerPlayer player, List<ItemStack> requirements,
-                                  Predicate<BlockPos> containerFilter, List<ItemStack> output) {
+    public static int[] pullAllTo(ServerPlayer player, List<BlockEntity> containers,
+                                  List<ItemStack> requirements, List<ItemStack> output) {
         ReflectionAccess reflection = getAccess();
         int[] pulled = new int[requirements.size()];
-        if (player == null || reflection == null || output == null || requirements.isEmpty()) {
+        if (player == null || reflection == null || output == null || requirements.isEmpty()
+                || containers == null || containers.isEmpty()) {
             return pulled;
         }
-        List<BlockEntity> containers = reflection.collectNearbyBlockEntities(player, containerFilter);
-        if (containers.isEmpty()) {
+        List<BlockEntity> alive = new ArrayList<>(containers.size());
+        for (BlockEntity container : containers) {
+            if (container != null && !container.isRemoved()) {
+                alive.add(container);
+            }
+        }
+        if (alive.isEmpty()) {
             return pulled;
         }
         for (int index = 0; index < requirements.size(); index++) {
@@ -419,7 +444,7 @@ public final class FindMeExtendedAdapter {
             if (requirement.isEmpty() || requirement.getCount() <= 0) {
                 continue;
             }
-            pulled[index] = reflection.extractTo(containers, player,
+            pulled[index] = reflection.extractTo(alive, player,
                     requirement.copyWithCount(1), requirement.getCount(), output);
         }
         return pulled;

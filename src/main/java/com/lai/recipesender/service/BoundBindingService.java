@@ -101,6 +101,16 @@ public final class BoundBindingService {
             role = BoundContainer.Role.MASTER;
             parentId = null;
             routes = Set.of();
+        } else if (kind == BoundContainer.Kind.ITEM_HUB) {
+            // 物品中枢可以绑多个：材料分在几个网络/箱子上很常见，多绑一个比换绑定省事。
+            // 它与流体中枢一样只是「来源」：不参与分组、不参与路由、也不是投放落点。
+            if (!BoundTargetResolver.hasItemHandler(level.getBlockEntity(pos))) {
+                notice(player, NoticeSeverity.ERROR, "text.recipe_sender.bind_no_container");
+                return;
+            }
+            role = BoundContainer.Role.MASTER;
+            parentId = null;
+            routes = Set.of();
         } else {
             // 没有物品容器的方块绑了也发不进去，当场拒绝而不是留一条永远失败的绑定。
             if (!BoundTargetResolver.hasItemHandler(level.getBlockEntity(pos))) {
@@ -172,6 +182,10 @@ public final class BoundBindingService {
                                        List<BoundContainer> existing) {
         if (bound.isFluidHub()) {
             notice(player, NoticeSeverity.INFO, "text.recipe_sender.bound_added_hub", bound.name());
+            return;
+        }
+        if (bound.isItemHub()) {
+            notice(player, NoticeSeverity.INFO, "text.recipe_sender.bound_added_item_hub", bound.name());
             return;
         }
         if (bound.isMaster()) {
