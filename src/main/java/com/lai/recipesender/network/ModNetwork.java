@@ -2,6 +2,8 @@ package com.lai.recipesender.network;
 
 import com.lai.recipesender.RecipeSenderMod;
 import com.lai.recipesender.network.packet.AlignGroupCircuitPacket;
+import com.lai.recipesender.network.packet.BatchBindPacket;
+import com.lai.recipesender.network.packet.BatchBindResultPacket;
 import com.lai.recipesender.network.packet.BindContainerPacket;
 import com.lai.recipesender.network.packet.BoundInsertResultPacket;
 import com.lai.recipesender.network.packet.BoundNoticePacket;
@@ -78,8 +80,12 @@ public final class ModNetwork {
      * {@code DirectInsertResultPacket} 三个包的尾部都多了这一字节；{@code BoundDetail} 尾部加了
      * {@code NO_ITEM_HUB} 与 {@code HUB_SHORT}；{@code BoundContainer.Kind} 加了
      * {@code ITEM_HUB}（跟着同步包上线）。枚举按序号写线上，加值就必须升版本。
+     *
+     * <p>1.0.52 由 18 升到 19：新增批量绑定的两个包（{@code BatchBindPacket}、
+     * {@code BatchBindResultPacket}）。批量绑定本身是「客户端算好计划、服务端一次校验」，
+     * 没有改动任何旧包的字段，只是新增。
      */
-    private static final String PROTOCOL_VERSION = "18";
+    private static final String PROTOCOL_VERSION = "19";
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             ResourceLocation.fromNamespaceAndPath(RecipeSenderMod.MOD_ID, "main"),
             () -> PROTOCOL_VERSION, PROTOCOL_VERSION::equals, PROTOCOL_VERSION::equals);
@@ -199,6 +205,16 @@ public final class ModNetwork {
                 .encoder(AlignGroupCircuitPacket::encode)
                 .decoder(AlignGroupCircuitPacket::decode)
                 .consumerMainThread(AlignGroupCircuitPacket::handle)
+                .add();
+        CHANNEL.messageBuilder(BatchBindPacket.class, id++, NetworkDirection.PLAY_TO_SERVER)
+                .encoder(BatchBindPacket::encode)
+                .decoder(BatchBindPacket::decode)
+                .consumerMainThread(BatchBindPacket::handle)
+                .add();
+        CHANNEL.messageBuilder(BatchBindResultPacket.class, id++, NetworkDirection.PLAY_TO_CLIENT)
+                .encoder(BatchBindResultPacket::encode)
+                .decoder(BatchBindResultPacket::decode)
+                .consumerMainThread(BatchBindResultPacket::handle)
                 .add();
     }
 }

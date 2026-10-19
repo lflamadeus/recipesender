@@ -5,7 +5,11 @@ import com.lai.recipesender.model.BoundDetail;
 import com.lai.recipesender.model.BoundStatus;
 import com.lai.recipesender.model.NoticeSeverity;
 import com.lai.recipesender.model.SourceScope;
+import com.lai.recipesender.client.batch.BatchBindScreen;
+import com.lai.recipesender.client.batch.BatchSelection;
+import com.lai.recipesender.network.packet.BatchBindResultPacket;
 import com.lai.recipesender.network.packet.MachineStatusPacket;
+import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 
 import java.util.List;
@@ -65,5 +69,39 @@ public final class ClientPacketHandler {
             return;
         }
         NoticeOverlay.show(Component.translatable(key, args.toArray()), severity);
+    }
+
+    /**
+     * 转交一次批量绑定的汇总结果：清掉批量状态，再按成功/失败给出提示。
+     *
+     * <p>失败项逐条进聊天栏（最多 5 条，其余汇总成一句）——整批静默失败会让玩家以为全绑上了。
+     */
+    public static void acceptBatchBindResult(UUID requestId, int created,
+                                             List<BatchBindResultPacket.Failure> failures) {
+        BatchSelection.cancel();
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.screen instanceof BatchBindScreen) {
+            minecraft.setScreen(null);
+        }
+        int failed = failures == null ? 0 : failures.size();
+        NoticeOverlay.show(Component.translatableWithFallback("text.recipe_sender.batch_result",
+                        "批量绑定：成功 %s 项，失败 %s 项", created, failed),
+                failed == 0 ? NoticeSeverity.INFO : NoticeSeverity.WARN);
+        if (failed == 0 || minecraft.player == null) {
+            return;
+        }
+        int shown = 0;
+        for (BatchBindResultPacket.Failure failure : failures) {
+            if (shown++ >= 5) {
+                minecraft.player.displayClientMessage(
+                        Component.translatableWithFallback("text.recipe_sender.batch_more_failures",
+                                "还有 %s 项失败未列出", failed - 5), false);
+                break;
+            }
+            minecraft.player.displayClientMessage(Component.translatableWithFallback(
+                    "text.recipe_sender.batch_failure", "(%s, %s, %s) 失败：%s",
+                    failure.pos().getX(), failure.pos().getY(), failure.pos().getZ(),
+                    Lang.text(failure.reasonKey(), failure.reasonKey())), false);
+        }
     }
 }

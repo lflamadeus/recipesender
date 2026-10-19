@@ -16,20 +16,16 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.world.phys.Vec3;
 import org.lwjgl.opengl.GL11;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 高亮的落笔处：把 {@link BoundHighlightState} 里的坐标画成红色描边，**只画棱、不画填充**。
+ * 描边的落笔处：把一组包围盒画成彩色棱框，**只画棱、不画填充**。
  *
  * <p>画法照抄同作者的 FindMeExtended（{@code BlacklistHighlighter}，源头是 WorldEditCUI 的
  * {@code BufferBuilderRenderSink}）：**不走 {@code RenderType} / {@code MultiBufferSource}**，
  * 自己开 {@link Tesselator}、自己设 GL 状态。原因是 {@code RenderType} 会在 {@code endBatch}
  * 里把整套状态重新设一遍，从外面压不住深度测试——而「穿墙」恰恰只能靠直接改深度状态实现。
- *
- * <p>（tasks.md 的 T5.2 原本写的是 {@code RenderType.lines()}。实测这条路走不通：
- * {@code RenderStateShard.NO_DEPTH_TEST} 之类的常量在 1.20.1 里全是 {@code protected}，
- * 自建 RenderType 要自己拼 {@code LayeringStateShard}/{@code OutputStateShard} 的一堆 GL 开关，
- * 既脆又难验证。这里按 BlacklistHighlighter 的成熟写法来。）
  *
  * <p>具体对应关系：
  * <ul>
@@ -47,7 +43,7 @@ import java.util.List;
  *   <li>所有改过的状态都在 {@code finally} 里还原。</li>
  * </ul>
  */
-final class BoundHighlightRenderer {
+public final class BoundHighlightRenderer {
 
     /** 相对方块表面的外扩量，防共面。 */
     private static final double EXPAND = 0.002D;
@@ -59,10 +55,8 @@ final class BoundHighlightRenderer {
      */
     private static final float LINE_WIDTH = 2.5F;
 
-    private static final float RED = 1.0F;
-    private static final float GREEN = 0.16F;
-    private static final float BLUE = 0.16F;
-    private static final float ALPHA = 1.0F;
+    /** ⑪ 世界内高亮用的红色。 */
+    private static final int HIGHLIGHT_COLOR = 0xFFFF2929;
 
     /**
      * 12 条棱，每条两个端点，每个端点 3 个数：0 表示取包围盒的 min、1 表示取 max。
@@ -77,8 +71,40 @@ final class BoundHighlightRenderer {
     private BoundHighlightRenderer() {
     }
 
+    /** 一条要画的棱框；颜色按 ARGB 给。 */
+    public record Box(double minX, double minY, double minZ, double maxX, double maxY, double maxZ,
+                      float red, float green, float blue, float alpha) {
+
+        /** 一个方块格（四周外扩防共面）。 */
+        public static Box block(BlockPos pos, int argb) {
+            return of(pos.getX() - EXPAND, pos.getY() - EXPAND, pos.getZ() - EXPAND,
+                    pos.getX() + 1.0D + EXPAND, pos.getY() + 1.0D + EXPAND, pos.getZ() + 1.0D + EXPAND,
+                    argb);
+        }
+
+        /** 两个方块之间的整个 AABB（含两端）。 */
+        public static Box between(BlockPos a, BlockPos b, int argb) {
+            return of(Math.min(a.getX(), b.getX()) - EXPAND,
+                    Math.min(a.getY(), b.getY()) - EXPAND,
+                    Math.min(a.getZ(), b.getZ()) - EXPAND,
+                    Math.max(a.getX(), b.getX()) + 1.0D + EXPAND,
+                    Math.max(a.getY(), b.getY()) + 1.0D + EXPAND,
+                    Math.max(a.getZ(), b.getZ()) + 1.0D + EXPAND,
+                    argb);
+        }
+
+        private static Box of(double minX, double minY, double minZ, double maxX, double maxY, double maxZ,
+                              int argb) {
+            return new Box(minX, minY, minZ, maxX, maxY, maxZ,
+                    ((argb >> 16) & 0xFF) / 255.0F,
+                    ((argb >> 8) & 0xFF) / 255.0F,
+                    (argb & 0xFF) / 255.0F,
+                    ((argb >>> 24) & 0xFF) / 255.0F);
+        }
+    }
+
     /**
-     * 在关卡渲染结束时画出高亮框。
+     * ⑪ 世界内高亮：把一组方块坐标画成红框。
      *
      * @param poseStack 事件给的姿态（只有视图旋转 V，不含投影）；会被并进 model-view，
      *                  顶点随后用「相对摄像机的世界坐标」
@@ -90,6 +116,29 @@ final class BoundHighlightRenderer {
             return;
         }
         Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.level == null) {
+            return;
+        }
+        List<Box> boxes = new ArrayList<>(positions.size());
+        for (BlockPos pos : positions) {
+            // 区块没加载时不画：坐标还在，但方块不在视野里，画出来只是一团悬空的框。
+            if (minecraft.level.hasChunkAt(pos)) {
+                boxes.add(Box.block(pos, HIGHLIGHT_COLOR));
+            }
+        }
+        renderBoxes(poseStack, camera, boxes);
+    }
+
+    /**
+     * 画任意一组彩色棱框（批量绑定的角色色、框线都走这里）。
+     *
+     * <p>不做区块加载判断：调用方给的框可能横跨多个区块，逐块判断没有意义。
+     */
+    public static void renderBoxes(PoseStack poseStack, Camera camera, List<Box> boxes) {
+        if (boxes == null || boxes.isEmpty()) {
+            return;
+        }
+        Minecraft minecraft = Minecraft.getInstance();
         if (minecraft.level == null || minecraft.player == null) {
             return;
         }
@@ -98,7 +147,7 @@ final class BoundHighlightRenderer {
         PoseStack modelView = RenderSystem.getModelViewStack();
         modelView.pushPose();
         // 必须先把栈顶清成单位阵再并：AFTER_WEATHER 是在 LevelRenderer 自己
-        // pushPose + mulPoseMatrix(V) 的那一段里派发的（bc 2761-2778），栈顶此刻已经是 V，
+        // pushPose + mulPoseMatrix(V) 的那一段里派发的，栈顶此刻已经是 V，
         // 直接 mulPoseMatrix(V) 会得到 V·V，框会被画到屏幕外。
         modelView.setIdentity();
         modelView.mulPoseMatrix(poseStack.last().pose());
@@ -116,7 +165,7 @@ final class BoundHighlightRenderer {
         RenderSystem.lineWidth(LINE_WIDTH);
         FogRenderer.setupNoFog();
         try {
-            drawOutline(minecraft, positions, origin);
+            drawOutlines(boxes, origin);
         } finally {
             RenderSystem.setShaderFogStart(fogStart);
             RenderSystem.lineWidth(previousLineWidth);
@@ -130,30 +179,26 @@ final class BoundHighlightRenderer {
         }
     }
 
-    private static void drawOutline(Minecraft minecraft, List<BlockPos> positions, Vec3 origin) {
+    private static void drawOutlines(List<Box> boxes, Vec3 origin) {
         Tesselator tesselator = Tesselator.getInstance();
         BufferBuilder builder = tesselator.getBuilder();
         builder.begin(VertexFormat.Mode.LINES, DefaultVertexFormat.POSITION_COLOR_NORMAL);
-        for (BlockPos pos : positions) {
-            // 区块没加载时不画：坐标还在，但方块不在视野里，画出来只是一团悬空的框。
-            if (!minecraft.level.hasChunkAt(pos)) {
-                continue;
-            }
-            drawBoxOutline(builder, pos, origin);
+        for (Box box : boxes) {
+            drawBoxOutline(builder, box, origin);
         }
-        // 着色器颜色是全局状态，别处可能留了非白色，不重置会把红色乘歪。
+        // 着色器颜色是全局状态，别处可能留了非白色，不重置会把颜色乘歪。
         RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
         RenderSystem.setShader(GameRenderer::getRendertypeLinesShader);
         tesselator.end();
     }
 
-    private static void drawBoxOutline(VertexConsumer builder, BlockPos pos, Vec3 origin) {
-        double minX = pos.getX() - EXPAND - origin.x;
-        double minY = pos.getY() - EXPAND - origin.y;
-        double minZ = pos.getZ() - EXPAND - origin.z;
-        double maxX = pos.getX() + 1.0D + EXPAND - origin.x;
-        double maxY = pos.getY() + 1.0D + EXPAND - origin.y;
-        double maxZ = pos.getZ() + 1.0D + EXPAND - origin.z;
+    private static void drawBoxOutline(VertexConsumer builder, Box box, Vec3 origin) {
+        double minX = box.minX() - origin.x;
+        double minY = box.minY() - origin.y;
+        double minZ = box.minZ() - origin.z;
+        double maxX = box.maxX() - origin.x;
+        double maxY = box.maxY() - origin.y;
+        double maxZ = box.maxZ() - origin.z;
 
         for (int[] edge : EDGE_CORNERS) {
             double ax = edge[0] == 0 ? minX : maxX;
@@ -174,8 +219,10 @@ final class BoundHighlightRenderer {
             float uy = (float) (ny / length);
             float uz = (float) (nz / length);
 
-            builder.vertex(ax, ay, az).color(RED, GREEN, BLUE, ALPHA).normal(ux, uy, uz).endVertex();
-            builder.vertex(bx, by, bz).color(RED, GREEN, BLUE, ALPHA).normal(ux, uy, uz).endVertex();
+            builder.vertex(ax, ay, az).color(box.red(), box.green(), box.blue(), box.alpha())
+                    .normal(ux, uy, uz).endVertex();
+            builder.vertex(bx, by, bz).color(box.red(), box.green(), box.blue(), box.alpha())
+                    .normal(ux, uy, uz).endVertex();
         }
     }
 }

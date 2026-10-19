@@ -14,7 +14,7 @@ import net.minecraft.network.chat.Component;
  * <p>兜底为什么必须留：整合包会替换语言文件，模组自带的条目可能被删掉、也可能被改坏模板。
  * 宁可在聊天栏看到一句中文兜底，也不要看到内部键名。
  */
-final class Lang {
+public final class Lang {
 
     /** 语言文件缺条目时 {@link I18n#get} 原样返回 key；模板参数对不上时返回带这个前缀的文本。 */
     private static final String FORMAT_ERROR = "Format error:";
@@ -29,7 +29,7 @@ final class Lang {
      * @param fallback 兜底文案
      * @param args     传给语言模板的参数；没有参数时留空
      */
-    static String text(String key, String fallback, Object... args) {
+    public static String text(String key, String fallback, Object... args) {
         String text = args.length == 0 ? I18n.get(key) : I18n.get(key, args);
         if (text.equals(key) || text.startsWith(FORMAT_ERROR)) {
             return fallback;
@@ -38,7 +38,7 @@ final class Lang {
     }
 
     /** 同 {@link #text}，但返回可直接发给玩家的 {@link Component}。 */
-    static Component message(String key, String fallback, Object... args) {
+    public static Component message(String key, String fallback, Object... args) {
         return Component.literal(text(key, fallback, args));
     }
 }

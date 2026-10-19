@@ -21,7 +21,7 @@ import java.util.List;
  * 红底红字在游戏里的深色画面上根本读不出来，「提示显眼」不能以「看不清写的什么」为代价。
  * 文案过长会自动折行（中文没有空格，按字符断），不会横穿整个屏幕。
  */
-final class NoticeOverlay {
+public final class NoticeOverlay {
     /** 提示停留时间：60 tick = 3 秒。 */
     private static final int DURATION_TICKS = 60;
     /** 最后 10 tick 淡出，别让提示「啪」地消失。 */
@@ -65,7 +65,7 @@ final class NoticeOverlay {
      * <p>已有提示时<b>直接替换</b>而不是排队：连续操作产生的旧提示已经没有意义，
      * 排队只会让玩家看到一串过时的话。
      */
-    static void show(Component notice, NoticeSeverity level) {
+    public static void show(Component notice, NoticeSeverity level) {
         if (notice == null) {
             return;
         }

@@ -51,6 +51,8 @@ import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.InputEvent;
 import net.minecraftforge.client.event.RegisterKeyMappingsEvent;
 import net.minecraftforge.client.event.RenderGuiEvent;
+import com.lai.recipesender.client.batch.BatchRenderer;
+import com.lai.recipesender.client.batch.BatchSelection;
 import net.minecraftforge.client.event.RenderLevelStageEvent;
 import net.minecraftforge.client.event.ScreenEvent;
 import net.minecraftforge.client.settings.KeyConflictContext;
@@ -638,6 +640,8 @@ public final class RecipeSenderClient {
         NoticeOverlay.tick();
         // 高亮的倒计时与界面无关，同样不能被下面的早退挡掉。
         BoundHighlightState.tick();
+        // 批量绑定的框选状态同理：换维度就该作废，不能等下一次按键。
+        BatchSelection.tick();
         Minecraft minecraft = Minecraft.getInstance();
         if (!selection.bindingLogged) {
             logReverseBinding(minecraft);
@@ -796,6 +800,8 @@ public final class RecipeSenderClient {
     @SubscribeEvent
     public static void onRenderGui(RenderGuiEvent.Post event) {
         NoticeOverlay.renderInHud(event.getGuiGraphics());
+        // 批量绑定的计数条：框选期间玩家不在界面里，只能画在 HUD 上。
+        BatchRenderer.renderHud(event.getGuiGraphics());
     }
 
     /**
@@ -821,6 +827,8 @@ public final class RecipeSenderClient {
         }
         BoundHighlightRenderer.render(event.getPoseStack(), event.getCamera(),
                 BoundHighlightState.positionsFor(minecraft.level.dimension()));
+        // 批量绑定的框选描边：同一套渲染，只是每个方块按角色给不同颜色。
+        BatchRenderer.renderWorld(event.getPoseStack(), event.getCamera());
     }
 
     /** 生成带语言文件回退文本的「已发送 N 份到 X」提示。 */
