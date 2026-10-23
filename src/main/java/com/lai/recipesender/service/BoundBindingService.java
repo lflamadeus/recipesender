@@ -29,6 +29,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -274,13 +275,45 @@ public final class BoundBindingService {
         }
     }
 
-    /** 处理一次解绑请求。 */
+    /**
+     * 处理一次解绑请求。
+     *
+     * <p>{@code cascade} 时先按 parentId 链收齐所有子孙（最多两级：并列成员 → 它的从容器），
+     * 再逐个删，最后删自己。**要删哪些由服务端算**：客户端那份列表可能比服务端旧，
+     * 让客户端算会漏掉刚在别处绑上的子节点，留下孤儿。
+     */
     public static void unbind(ServerPlayer player, UnbindContainerPacket packet) {
         if (player == null || packet == null) {
             return;
         }
-        if (BoundContainerService.unbind(player, packet.id())) {
-            sync(player);
+        List<UUID> victims = new ArrayList<>();
+        if (packet.cascade()) {
+            collectDescendants(BoundContainerService.list(player), packet.id(), victims, new HashSet<>());
+        }
+        victims.add(packet.id());
+        boolean changed = false;
+        for (UUID victim : victims) {
+            changed |= BoundContainerService.unbind(player, victim);
+        }
+        if (!changed) {
+            return;
+        }
+        sync(player);
+        if (victims.size() > 1) {
+            notice(player, NoticeSeverity.INFO, "text.recipe_sender.manage_delete_cascade_done",
+                    victims.size() - 1);
+        }
+    }
+
+    /** 递归收子节点；{@code seen} 防数据里出现环（不该有，但别让一个坏记录把服务端转死）。 */
+    private static void collectDescendants(List<BoundContainer> all, UUID parentId,
+                                           List<UUID> out, Set<UUID> seen) {
+        for (BoundContainer binding : all) {
+            if (!parentId.equals(binding.parentId()) || !seen.add(binding.id())) {
+                continue;
+            }
+            out.add(binding.id());
+            collectDescendants(all, binding.id(), out, seen);
         }
     }
 

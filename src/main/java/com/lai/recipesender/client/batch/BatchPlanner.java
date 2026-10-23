@@ -3,20 +3,26 @@ package com.lai.recipesender.client.batch;
 import com.lai.recipesender.model.BoundContainer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
- * 候选池 → 角色分配。纯函数，不认识界面、渲染与网络。
+ * 候选池 → 分组与配对。纯函数，不认识界面、渲染与网络。
  *
- * <p>排序规则：主向投影升序 → 次轴投影 → y。主向取 AABB 最长边：它比「玩家朝向」稳，
- * 玩家站歪了也不会把一行机器排成锯齿；三轴跨度一样（或都为零）时才退回玩家朝向。
+ * <p>排序规则：主向投影升序 → 次轴投影 → y。主向取 AABB 最长边（或玩家手动指定的轴），
+ * 它比「玩家朝向」稳——玩家站歪了也不会把一行机器排成锯齿。
  *
- * <p>第一个可用项当主容器，其余当并列成员；与主容器不同类的标
- * {@link BatchCandidate.Reject#NOT_SAME_KIND}，不参与提交。
+ * <p>分组与配对见 {@link #plan(List, Direction.Axis)}。整条规则的目的只有一个：
+ * **可以不绑，不能绑错**——配不起来的宁可标成未配对让玩家处理，也不猜一个最近的。
  */
 public final class BatchPlanner {
 
@@ -69,34 +75,105 @@ public final class BatchPlanner {
         return sorted;
     }
 
-    /** 并列成员方案：第一个可用项当主容器，其余同类项当并列成员。 */
-    public static List<BatchCandidate> planMembers(List<BatchCandidate> ordered) {
-        List<BatchCandidate> planned = new ArrayList<>(ordered.size());
-        ItemStack reference = null;
+    /**
+     * 分组与配对。
+     *
+     * <p>机器（格雷的机器/总线/仓）按<b>方块物品完全相同</b>分组：每组排序第一个当主容器，
+     * 其余当并列成员。不同电压等级的同类机器算不同组——产能不一样，并到一起没有意义。
+     *
+     * <p>非机器（箱子、桶、抽屉、接口）只能当从容器，按<b>主向切片</b>配对：同一个主向坐标
+     * 算一片。一片里恰好一台机器 + 一个非机器才绑；其余情况（多机器、多箱子、这一片没有机器）
+     * 一律标 {@link BatchCandidate.Reject#UNPAIRED}——宁可让玩家剔掉，也不猜一个"最近的"。
+     *
+     * <p>整池一台机器都没有时退回老办法：全部当从容器，父容器由调用方按目标组的成员顺序配
+     * （见 {@code BatchSelection.pairing()}）。
+     */
+    public static List<BatchCandidate> plan(List<BatchCandidate> ordered, Direction.Axis primary) {
+        boolean anyMachine = false;
         for (BatchCandidate candidate : ordered) {
+            if (candidate.accepted() && candidate.machine()) {
+                anyMachine = true;
+                break;
+            }
+        }
+        if (!anyMachine) {
+            return planSlaves(ordered);
+        }
+
+        List<BatchCandidate> planned = new ArrayList<>(ordered);
+
+        // 1. 机器分组：按物品身份，组号从 1 开始，按排序首次出现的顺序给。
+        Map<Item, Integer> groupOfItem = new LinkedHashMap<>();
+        int[] groupOfIndex = new int[ordered.size()];
+        int nextGroup = 1;
+        for (int index = 0; index < ordered.size(); index++) {
+            BatchCandidate candidate = ordered.get(index);
+            if (!candidate.accepted() || !candidate.machine()) {
+                continue;
+            }
+            Item item = candidate.icon().getItem();
+            Integer group = groupOfItem.get(item);
+            if (group == null) {
+                group = nextGroup++;
+                groupOfItem.put(item, group);
+            }
+            groupOfIndex[index] = group;
+        }
+
+        // 2. 每组的第一个当主容器，其余当并列成员（并列成员要记住它挂哪台主容器）。
+        Set<Integer> seenGroups = new HashSet<>();
+        Map<Integer, BlockPos> masterOfGroup = new LinkedHashMap<>();
+        for (int index = 0; index < ordered.size(); index++) {
+            BatchCandidate candidate = ordered.get(index);
+            if (!candidate.accepted() || !candidate.machine()) {
+                continue;
+            }
+            int group = groupOfIndex[index];
+            boolean first = seenGroups.add(group);
+            if (first) {
+                masterOfGroup.put(group, candidate.pos());
+                planned.set(index, candidate.withPlan(BoundContainer.Role.MASTER, group, null));
+            } else {
+                planned.set(index, candidate.withPlan(BoundContainer.Role.PARALLEL, group,
+                        masterOfGroup.get(group)));
+            }
+        }
+
+        // 3. 非机器按主向切片配对。
+        Map<Integer, List<Integer>> machinesBySlice = new LinkedHashMap<>();
+        Map<Integer, List<Integer>> othersBySlice = new LinkedHashMap<>();
+        for (int index = 0; index < ordered.size(); index++) {
+            BatchCandidate candidate = ordered.get(index);
             if (!candidate.accepted()) {
-                planned.add(candidate);
                 continue;
             }
-            if (reference == null) {
-                reference = candidate.icon();
-                planned.add(candidate.withRole(BoundContainer.Role.MASTER));
+            int slice = along(candidate.pos(), primary);
+            Map<Integer, List<Integer>> bucket = candidate.machine() ? machinesBySlice : othersBySlice;
+            bucket.computeIfAbsent(slice, key -> new ArrayList<>()).add(index);
+        }
+        for (Map.Entry<Integer, List<Integer>> entry : othersBySlice.entrySet()) {
+            List<Integer> machines = machinesBySlice.getOrDefault(entry.getKey(), List.of());
+            List<Integer> others = entry.getValue();
+            if (machines.size() == 1 && others.size() == 1) {
+                BatchCandidate machine = planned.get(machines.get(0));
+                int slaveIndex = others.get(0);
+                planned.set(slaveIndex, planned.get(slaveIndex)
+                        .withPlan(BoundContainer.Role.SLAVE, machine.group(), machine.pos()));
                 continue;
             }
-            if (!sameKind(reference, candidate.icon())) {
-                planned.add(candidate.withReject(BatchCandidate.Reject.NOT_SAME_KIND));
-                continue;
+            for (int index : others) {
+                planned.set(index, planned.get(index).withReject(BatchCandidate.Reject.UNPAIRED));
             }
-            planned.add(candidate.withRole(BoundContainer.Role.PARALLEL));
         }
         return planned;
     }
 
-    /** 从容器方案：全部可用项当从容器，父容器由调用方按顺序配给目标组。 */
+    /** 从容器方案（整池没有机器时）：全部可用项当从容器，父容器由调用方按顺序配给目标组。 */
     public static List<BatchCandidate> planSlaves(List<BatchCandidate> ordered) {
         List<BatchCandidate> planned = new ArrayList<>(ordered.size());
         for (BatchCandidate candidate : ordered) {
-            planned.add(candidate.accepted() ? candidate.withRole(BoundContainer.Role.SLAVE) : candidate);
+            planned.add(candidate.accepted()
+                    ? candidate.withPlan(BoundContainer.Role.SLAVE, 0, null) : candidate);
         }
         return planned;
     }

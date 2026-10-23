@@ -19,6 +19,32 @@ public final class MachineStateProbe {
     private MachineStateProbe() {
     }
 
+    /**
+     * 这个方块实体是不是格雷的机器/总线/仓。
+     *
+     * <p>判据是 {@code getMetaMachine()} 能不能拿到东西：{@code MetaMachineBlockEntity} 全都有，
+     * 管道（{@code PipeBlockEntity}）、原版箱子、其它模组的方块都没有。纯反射，格雷不在时恒 false。
+     *
+     * <p>批量绑定用它区分「机器」和「普通容器」：前者能当主容器/并列成员，后者只能当从容器。
+     * 只问一次、只在扫描时问，不参与每帧渲染。
+     */
+    public static boolean isMachine(BlockEntity blockEntity) {
+        if (blockEntity == null) {
+            return false;
+        }
+        if (GtCircuitSupport.invokePublicNoArg(blockEntity, "getMetaMachine") != null) {
+            return true;
+        }
+        // 兜底按类型认：客户端刚进世界时 meta machine 可能还没建出来，那一下 getMetaMachine
+        // 会返回 null，光看它会把刚加载的机器当成普通箱子（只能当从容器）。
+        for (Class<?> type = blockEntity.getClass(); type != null; type = type.getSuperclass()) {
+            if ("MetaMachineBlockEntity".equals(type.getSimpleName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** 探测这个方块实体上的机器此刻忙不忙。 */
     public static MachineState stateOf(BlockEntity blockEntity) {
         if (blockEntity == null) {

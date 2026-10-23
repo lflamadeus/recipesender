@@ -8,6 +8,7 @@ import com.lai.recipesender.network.packet.BatchBindResultPacket;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.ResourceKey;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.Level;
@@ -19,6 +20,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -75,9 +77,13 @@ public final class BatchBindService {
             }
             BlockState state = level.getBlockState(entry.pos());
             UUID parentId = entry.parentPos() == null ? null : ids.get(entry.parentPos());
+            // 类别只挂在主容器上（和单绑一致）：客户端按 EMI 登记的类别算好带过来，
+            // 服务端没有 EMI，算不了。空集合 = 不参与自动路由。
+            Set<ResourceLocation> routes = entry.role() == BoundContainer.Role.MASTER && entry.routeKeys() != null
+                    ? entry.routeKeys() : Set.of();
             BoundContainer bound = BoundContainerService.bind(player, dimension, entry.pos(),
                     defaultName(state, created), state.getBlock().asItem().getDefaultInstance(),
-                    entry.role(), parentId);
+                    entry.role(), parentId, routes);
             ids.put(entry.pos(), bound.id());
             roles.put(entry.pos(), entry.role());
             created++;

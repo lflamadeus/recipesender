@@ -23,10 +23,16 @@ versionRange="${minecraft_version_range}"
 ordering="NONE"
 side="BOTH"
 
+# 下限只取「用到的 API 都存在」的版本（EmiApi 的 getHoveredStack / getHandledScreen /
+# getRecipeContext / isSearchFocused、EmiIngredient.areEqual 在 1.1.13 就已齐备）。
+# 不跟着编译版本走的原因：EMI 1.1.24 的 GlobalMixin 把 dev.emi.emi.api.EmiPlugin 列进了
+# @Mixin targets，而 LDLib 1.0.33 的 MixinPluginShared 用 Class.forName 探测 EMI，
+# 会把该类提前加载，导致 mixin 准备阶段报 "loaded too early" 直接崩启动。
+# 放宽下限后，这类老整合包可以用 EMI 1.1.22 正常跑。
 [[dependencies.${mod_id}]]
 modId="emi"
 mandatory=true
-versionRange="[1.1.24,)"
+versionRange="[1.1.13,)"
 ordering="AFTER"
 side="CLIENT"
 

@@ -61,6 +61,10 @@ import java.util.function.Predicate;
  * （{@link BatchBudget}）、{@link #execute} 分块搬运、{@link #detailFor} 把差额翻译成原因。
  * 加新的一侧（比如纯流体配方）只需要让对应上限变成「无限制」，不必再改这四步的骨架。
  *
+ * <p><b>电路</b>（1.0.50）：接料成员一确定就按配方要求调电路（含「格雷配方不用电路 → 置空」），
+ * 位置在 {@link #planSources} 与 {@link #execute} 之间，<b>不受份数影响</b>——份数被目标容量压到 0
+ * 时同样要调，理由见 {@link #insert} 里的注释。
+ *
  * <p>已知的一处不精确：客户端 HUD 上的「周围现有 N 份」来自不带绑定 id 的统计请求，
  * 会把目标容器自己的存量也数进去。所以那个数字只是上限，真正搬得动几份以这里的现场规划为准，
  * 差额由回执提示说清楚。
@@ -122,11 +126,22 @@ public final class DirectInsertionService {
             }
             if (plan.placeMembers().isEmpty()) {
                 // 一台都装不下配方流体：一份都不投（材料放进干等的机器里比留在原地更糟），
-                // 但已经调过的电路仍要落盘。
+                // 电路也不动——这次没有任何一台机器会收到材料，改电路只会让它们空等。
                 markChanged(targets);
                 reply(player, packet, BoundStatus.OK, 0, BoundDetail.NO_FLUID_TARGET);
                 return;
             }
+            // 电路必须在抽料与投料之前调完，与绑定发送同一段逻辑、同一个理由：材料一进机器，
+            // 配方逻辑就会按当时的电路立刻开始匹配，调晚了等于先跑错一次。
+            //
+            // 位置刻意排在「份数」之前：份数被目标模拟容量压到 0 时，这一次同样一份都投不进去，
+            // 但玩家按的是这个配方——电路仍要调成它要求的样子（格雷配方不用电路时就是置空），
+            // 否则「目标满了」和「电路没清」会一起出现，玩家还得手动去改。绑定发送不预判目标
+            // 容量，它的电路调整本来就在这个位置，两条路从此一致。
+            //
+            // 只调真的会收到材料的成员：装不下配方流体的那几台，这一次连电路都不该动。
+            BoundInsertionService.applyCircuits(DirectTargets.slots(plan.placeMembers()),
+                    packet.circuit(), packet.gregRecipe());
             Execution execution = execute(player, packet, plan, searchable);
             markChanged(targets);
             reply(player, packet, BoundStatus.OK, execution.moved(),
@@ -300,10 +315,6 @@ public final class DirectInsertionService {
             return new Execution(0, false, false);
         }
         List<DirectTargets.Member> placeMembers = plan.placeMembers();
-        // 电路必须在投料之前调完，与绑定发送同一段逻辑、同一个理由。只调真的会收到材料的成员：
-        // 装不下配方流体的那几台，这一次连电路都不该动。
-        BoundInsertionService.applyCircuits(DirectTargets.slots(placeMembers),
-                packet.circuit(), packet.gregRecipe());
         int moved = 0;
         boolean sourceShort = false;
         boolean fluidShort = false;

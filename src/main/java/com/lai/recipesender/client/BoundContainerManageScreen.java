@@ -3,6 +3,7 @@ package com.lai.recipesender.client;
 import com.lai.recipesender.model.BoundContainer;
 import com.lai.recipesender.model.BoundStatus;
 import com.lai.recipesender.model.MachineState;
+import com.lai.recipesender.model.NoticeSeverity;
 import com.lai.recipesender.network.ModNetwork;
 import com.lai.recipesender.network.packet.AlignGroupCircuitPacket;
 import com.lai.recipesender.network.packet.UnbindContainerPacket;
@@ -110,6 +111,13 @@ class BoundContainerManageScreen extends Screen {
     private Button expandButton;
     private UUID renamingId;
     private UUID pendingDeleteId;
+    /**
+     * 这次待确认的删除是不是「连子节点一起删」。
+     *
+     * <p>进入确认状态时按当时有没有按住 Shift 决定，之后**不能改**：否则先 Shift 点一下、
+     * 再松手点第二下，玩家以为是普通删除，实际删了一整串。
+     */
+    private boolean pendingDeleteCascade;
     private int pendingDeleteTicks;
     private String query = "";
     private int scrollOffset;
@@ -342,6 +350,7 @@ class BoundContainerManageScreen extends Screen {
             pendingDeleteTicks--;
             if (pendingDeleteTicks <= 0) {
                 pendingDeleteId = null;
+                pendingDeleteCascade = false;
             }
         }
         // 每秒重问一次存活性：界面是非模态的（世界继续跑），区块可能在界面开着的时候才加载完，
@@ -1104,8 +1113,12 @@ class BoundContainerManageScreen extends Screen {
      */
     private List<Action> actionsFor(BoundContainer binding) {
         if (binding.id().equals(pendingDeleteId)) {
+            Component tooltip = pendingDeleteCascade
+                    ? Component.translatableWithFallback("text.recipe_sender.tooltip_delete_confirm_cascade",
+                    "按住 Shift 再点一次：连同所有子节点一起删除")
+                    : Component.translatable("text.recipe_sender.tooltip_delete_confirm");
             return List.of(new Action(Component.translatable("text.recipe_sender.button_delete_confirm"),
-                    true, "delete", Component.translatable("text.recipe_sender.tooltip_delete_confirm")));
+                    true, "delete", tooltip));
         }
         List<Action> actions = new ArrayList<>();
         actions.add(new Action(Component.translatable("text.recipe_sender.button_rename"), false, "rename",
@@ -1363,18 +1376,66 @@ class BoundContainerManageScreen extends Screen {
         setFocused(null);
     }
 
-    /** 二次确认：第一次点变成红色的「确认删除」，3 秒内再点才真的删。 */
+    /**
+     * 二次确认：第一次点变成红色的「确认删除」，3 秒内再点才真的删。
+     *
+     * <p><b>按住 Shift 点删除 = 连它和所有子节点一起删</b>（主容器 → 并列成员 → 从容器）。
+     * 这种删除**确认时也必须按住 Shift**：确认按钮的位置和普通删除完全一样，松手再点很容易
+     * 在没意识到的情况下删掉一整串。
+     */
     private void requestDelete(BoundContainer binding) {
+        boolean shift = hasShiftDown();
         if (binding.id().equals(pendingDeleteId)) {
+            if (pendingDeleteCascade && !shift) {
+                pendingDeleteId = null;
+                pendingDeleteCascade = false;
+                pendingDeleteTicks = 0;
+                NoticeOverlay.show(Component.translatableWithFallback(
+                                "text.recipe_sender.manage_delete_need_shift",
+                                "级联删除需要按住 Shift 再点一次确认"),
+                        NoticeSeverity.WARN);
+                return;
+            }
+            UUID id = binding.id();
+            boolean cascade = pendingDeleteCascade;
             pendingDeleteId = null;
-            ModNetwork.CHANNEL.sendToServer(new UnbindContainerPacket(binding.id()));
-            if (binding.id().equals(renamingId)) {
+            pendingDeleteCascade = false;
+            pendingDeleteTicks = 0;
+            ModNetwork.CHANNEL.sendToServer(new UnbindContainerPacket(id, cascade));
+            if (id.equals(renamingId)) {
                 cancelRename();
             }
             return;
         }
         pendingDeleteId = binding.id();
+        pendingDeleteCascade = shift;
         pendingDeleteTicks = DELETE_CONFIRM_TICKS;
+        if (shift) {
+            int children = descendants(binding.id()).size();
+            if (children > 0) {
+                NoticeOverlay.show(Component.translatableWithFallback(
+                                "text.recipe_sender.manage_delete_cascade",
+                                "将连同 %s 个子节点一起删除：按住 Shift 再点一次确认", children),
+                        NoticeSeverity.WARN);
+            }
+        }
+    }
+
+    /** 这个节点下面挂着哪些（含孙子）；客户端只用来显示数量，真正删哪些由服务端算。 */
+    private List<UUID> descendants(UUID root) {
+        List<UUID> found = new ArrayList<>();
+        collectDescendants(root, found, new HashSet<>());
+        return found;
+    }
+
+    private void collectDescendants(UUID parentId, List<UUID> out, Set<UUID> seen) {
+        for (BoundContainer binding : BoundContainerClient.all()) {
+            if (!parentId.equals(binding.parentId()) || !seen.add(binding.id())) {
+                continue;
+            }
+            out.add(binding.id());
+            collectDescendants(binding.id(), out, seen);
+        }
     }
 
     @Override

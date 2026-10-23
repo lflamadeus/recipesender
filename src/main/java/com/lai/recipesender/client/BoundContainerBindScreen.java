@@ -290,11 +290,11 @@ public class BoundContainerBindScreen extends Screen {
                 || kind.isHub()) {
             return;
         }
-        List<RecipeCategoryCache.Entry> machineEntries = machineCategories();
-        if (machineEntries.isEmpty() || machineEntries.size() > 2) {
+        Set<ResourceLocation> guessed = MachineRoutes.defaultFor(blockIcon);
+        if (guessed.isEmpty()) {
             return;
         }
-        pendingRoutes = Set.of(machineEntries.get(0).id());
+        pendingRoutes = guessed;
         categoryDefaultApplied = true;
     }
 

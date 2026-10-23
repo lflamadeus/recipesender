@@ -51,6 +51,7 @@ import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.InputEvent;
 import net.minecraftforge.client.event.RegisterKeyMappingsEvent;
 import net.minecraftforge.client.event.RenderGuiEvent;
+import com.lai.recipesender.client.batch.BatchBindInput;
 import com.lai.recipesender.client.batch.BatchRenderer;
 import com.lai.recipesender.client.batch.BatchSelection;
 import net.minecraftforge.client.event.RenderLevelStageEvent;
@@ -192,6 +193,18 @@ public final class RecipeSenderClient {
     private static final KeyMapping IGNORE_FLUIDS_KEY = new KeyMapping(
             "key.recipe_sender.ignore_fluids", KeyConflictContext.GUI, KeyModifier.NONE,
             InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_GRAVE_ACCENT, "key.categories.recipe_sender");
+    /**
+     * 退出批量绑定。
+     *
+     * <p>以前靠「对着空气按绑定键」退出，那个判定拿的是<b>准星指着什么</b>：模式里别的功能
+     * （按住绑定键 + P 定主向、Shift+绑定键+左右 改角点）都得为它绕开，稍微动一下就可能误退，
+     * 而误退会丢掉整框。所以给它一个独立键位，默认 {@code Backspace}，玩家可以在控制设置里改。
+     *
+     * <p>上下文 {@code UNIVERSAL}：批量模式里没有任何界面，键必须能收到。
+     */
+    private static final KeyMapping BATCH_EXIT_KEY = new KeyMapping(
+            "key.recipe_sender.batch_exit", KeyConflictContext.UNIVERSAL, KeyModifier.NONE,
+            InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_BACKSPACE, "key.categories.recipe_sender");
 
     private static long clientTicks;
     private static long nextAvailabilityRefreshTick;
@@ -364,6 +377,7 @@ public final class RecipeSenderClient {
         event.register(DIRECT_KEY);
         event.register(HUB_DIRECT_KEY);
         event.register(IGNORE_FLUIDS_KEY);
+        event.register(BATCH_EXIT_KEY);
     }
 
     /**
@@ -379,6 +393,79 @@ public final class RecipeSenderClient {
     /** 判断「发送到已绑定容器」模式键当前是否按下；判定方式与反转键完全一致。 */
     public static boolean isBoundSendKeyHeld() {
         return isKeyHeld(BOUND_SEND_KEY);
+    }
+
+    /**
+     * 绑定键「按下只登记、抬起才执行」的待绑定标记。
+     *
+     * <p>为什么不能按下就开界面：Shift+绑定键+右键 这条批量绑定手势，右键还没发生，
+     * 绑定界面就已经挡在前面了。改成抬起触发之后，右键可以在按下与抬起之间把这次登记取消掉
+     * （见 {@code BatchBindInput}），手势才走得通。
+     */
+    private static boolean pendingBind;
+
+    /** 登记一次待绑定；批量模式里不登记（那时绑定键只用来配合改角点与切主向）。 */
+    private static void armPendingBind() {
+        if (BatchSelection.active()) {
+            return;
+        }
+        pendingBind = true;
+    }
+
+    /**
+     * 取消这次待绑定。
+     *
+     * <p>公开给 {@code BatchBindInput}：进入批量模式的那一下必须调它，这就是「取消本次绑定
+     * 事项的监听」的唯一实现。
+     */
+    public static void cancelPendingBind() {
+        pendingBind = false;
+    }
+
+    /**
+     * 松开绑定键：执行绑定。
+     *
+     * <p>这里只判「还该不该绑」，具体校验（准星有没有方块、是不是容器、是否已绑）仍在
+     * {@link #bindLookedAtBlock()} 里，与按下触发的老路径完全一致。
+     */
+    private static void completePendingBind() {
+        if (!pendingBind) {
+            return;
+        }
+        pendingBind = false;
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.player == null || minecraft.level == null) {
+            return;
+        }
+        if (minecraft.screen != null || isOwnScreenOpen() || selection.selecting) {
+            return;
+        }
+        bindLookedAtBlock();
+    }
+
+    /** 这个键码是不是绑定键（批量模式里判「空绑定退出」用）。 */
+    public static boolean matchesBindKey(int key, int scanCode) {
+        return BOUND_SEND_KEY.matches(key, scanCode);
+    }
+
+    /** 这个鼠标按钮是不是绑定键（玩家可以把它绑成鼠标侧键）。 */
+    public static boolean matchesBindMouseButton(int button) {
+        return isBoundMouseButton(BOUND_SEND_KEY, button);
+    }
+
+    /** 这个按键是不是「退出批量绑定」。 */
+    public static boolean matchesBatchExitKey(int key, int scanCode) {
+        return BATCH_EXIT_KEY.matches(key, scanCode);
+    }
+
+    /** 退出键的显示名：常驻提示里要写「X 退出」，玩家改键后提示跟着变。 */
+    public static String batchExitKeyName() {
+        return BATCH_EXIT_KEY.getTranslatedKeyMessage().getString();
+    }
+
+    /** 绑定键的显示名：常驻提示里要写「对空气按 X 退出」，玩家改键后提示跟着变。 */
+    public static String boundKeyName() {
+        return BOUND_SEND_KEY.getTranslatedKeyMessage().getString();
     }
 
     /**
@@ -468,10 +555,20 @@ public final class RecipeSenderClient {
             }
             return;
         }
+        // 绑定键：按下只登记、抬起才绑定（1.0.53）。批量手势要在两者之间把它取消掉。
+        // 这里**不判 MANAGE_KEY**：Ctrl+B 松开时 Ctrl 往往已经先抬起，判了就会漏掉这次抬起，
+        // 待绑定一直挂着，等到下一次松手才莫名其妙弹出界面。
+        if (event.getAction() == GLFW.GLFW_RELEASE
+                && BOUND_SEND_KEY.matches(event.getKey(), event.getScanCode())) {
+            completePendingBind();
+            return;
+        }
         // 1.0.35：绑定界面已经开着时再按一次绑定键 = 「接受默认」（连续挂同类并列成员时的快捷路径：
         // 第一下开界面、第二下确定）。必须放在下面的 isOwnScreenOpen() 之前——那个守卫会把界面开着时
         // 的所有按键都吞掉。真正「能不能接受默认」由界面自己判定：输入框聚焦时它什么都不做，
         // 那一次按键就是打字（名字里完全可能有个 b）。
+        // 仍在「按下」触发：界面已经开着，按下立即响应比抬起手感好；而且界面开着时
+        // screen != null，本来也不会登记待绑定。
         if (event.getAction() == GLFW.GLFW_PRESS && !selection.selecting
                 && Minecraft.getInstance().screen instanceof BoundContainerBindScreen bindScreen
                 && BOUND_SEND_KEY.matches(event.getKey(), event.getScanCode())
@@ -501,7 +598,7 @@ public final class RecipeSenderClient {
         // 靠上面管理键分支先判并 return 把 Ctrl+B 截走。
         if (event.getAction() == GLFW.GLFW_PRESS && !selection.selecting
                 && BOUND_SEND_KEY.matches(event.getKey(), event.getScanCode())) {
-            bindLookedAtBlock();
+            armPendingBind();
         }
     }
 
@@ -530,6 +627,11 @@ public final class RecipeSenderClient {
             }
             return;
         }
+        // 绑定键被绑到鼠标键时：抬起才绑定，与键盘那条完全同源（见 onKeyInput）。
+        if (event.getAction() == GLFW.GLFW_RELEASE && isBoundMouseButton(BOUND_SEND_KEY, event.getButton())) {
+            completePendingBind();
+            return;
+        }
         // 1.0.35：绑定界面已经开着时再按一次绑定键（也可能是鼠标键）= 「接受默认」，见 onKeyInput()。
         if (event.getAction() == GLFW.GLFW_PRESS && !selection.selecting
                 && Minecraft.getInstance().screen instanceof BoundContainerBindScreen bindScreen) {
@@ -548,7 +650,7 @@ public final class RecipeSenderClient {
             return;
         }
         if (BOUND_SEND_KEY.isActiveAndMatches(button)) {
-            bindLookedAtBlock();
+            armPendingBind();
         }
     }
 
@@ -642,7 +744,13 @@ public final class RecipeSenderClient {
         BoundHighlightState.tick();
         // 批量绑定的框选状态同理：换维度就该作废，不能等下一次按键。
         BatchSelection.tick();
+        // 左键定起点在生存模式会被 missTime 吞掉事件，这里补一次（见 BatchBindInput）。
+        BatchBindInput.tick();
         Minecraft minecraft = Minecraft.getInstance();
+        // 断线 / 换存档时把待绑定清掉：不然下次进世界一松手就弹出绑定界面。
+        if (pendingBind && (minecraft.player == null || minecraft.level == null)) {
+            pendingBind = false;
+        }
         if (!selection.bindingLogged) {
             logReverseBinding(minecraft);
         }
@@ -796,12 +904,15 @@ public final class RecipeSenderClient {
         }
     }
 
-    /** 把提示画在 HUD 层；没有界面时走这里。 */
+    /**
+     * 把提示画在 HUD 层；没有界面时走这里。
+     *
+     * <p>批量绑定的常驻提示也在这一层（{@link NoticeOverlay#showSticky}）——1.0.53 起它不再
+     * 自绘在屏幕顶部：那里会盖住 Willa 这类机器信息条，而且自绘的样式和本模组其它提示对不上。
+     */
     @SubscribeEvent
     public static void onRenderGui(RenderGuiEvent.Post event) {
         NoticeOverlay.renderInHud(event.getGuiGraphics());
-        // 批量绑定的计数条：框选期间玩家不在界面里，只能画在 HUD 上。
-        BatchRenderer.renderHud(event.getGuiGraphics());
     }
 
     /**
@@ -1194,6 +1305,8 @@ public final class RecipeSenderClient {
 
     /** 初始化当前悬停配方，并根据按键状态进入正向、反向或「发送到已绑定容器」模式。 */
     private static void beginSelection() {
+        // 按了绑定键又按 Z：这次 B 的抬起不能再去绑方块，意图已经换成「发配方」了。
+        cancelPendingBind();
         Minecraft minecraft = Minecraft.getInstance();
         if (minecraft.player == null || minecraft.screen == null) {
             return;

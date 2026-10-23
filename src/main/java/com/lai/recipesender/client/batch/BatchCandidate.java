@@ -12,8 +12,15 @@ import net.minecraft.world.item.ItemStack;
  *
  * <p>{@link Reject#EXCLUDED} 是玩家自己剔除的，与「扫出来就不可用」分开记：两者都能在确认页
  * 里重新加回来，只是剔除项默认不提交。
+ *
+ * <p>{@link #machine()} 是「能不能当主容器」的判据：格雷的机器/总线/仓是 {@code true}，
+ * 箱子、桶、抽屉、接口、其它模组的机器是 {@code false}（只能当从容器）。
+ *
+ * <p>{@link #group()} 是 1 起的组号（0 = 还没分组），{@link #parent()} 是从容器挂靠的那台机器的
+ * 坐标（不是从容器时为 {@code null}）。确认页的编号 `2-3` / `2-3'` 就是从这两个字段来的。
  */
-public record BatchCandidate(BlockPos pos, ItemStack icon, Reject reject, BoundContainer.Role role) {
+public record BatchCandidate(BlockPos pos, ItemStack icon, Reject reject, BoundContainer.Role role,
+                             boolean machine, int group, BlockPos parent) {
 
     /** 候选不可用的原因。 */
     public enum Reject {
@@ -23,21 +30,32 @@ public record BatchCandidate(BlockPos pos, ItemStack icon, Reject reject, BoundC
         ALREADY_BOUND,
         /** 已经是物品中枢或流体中枢：物品通路不能把它当目标。 */
         HUB,
-        /** 与这一组的主容器不是同类机器。 */
-        NOT_SAME_KIND,
         /** 玩家自己剔除了。 */
-        EXCLUDED
+        EXCLUDED,
+        /**
+         * 这一片配不起来（机器不是恰好一台，或者非机器不是恰好一个）。
+         *
+         * <p>单独一种原因而不是复用 {@link #EXCLUDED}：玩家没有剔除它，是规则不让他绑。
+         * 混在一起会让「为什么提交不了」说不清楚。
+         */
+        UNPAIRED
+    }
+
+    /** 刚扫出来、还没规划的样子。 */
+    public static BatchCandidate unplanned(BlockPos pos, ItemStack icon, Reject reject, boolean machine) {
+        return new BatchCandidate(pos, icon, reject, null, machine, 0, null);
     }
 
     public boolean accepted() {
         return reject == Reject.NONE;
     }
 
-    public BatchCandidate withRole(BoundContainer.Role newRole) {
-        return new BatchCandidate(pos, icon, reject, newRole);
+    public BatchCandidate withReject(Reject newReject) {
+        return new BatchCandidate(pos, icon, newReject, role, machine, group, parent);
     }
 
-    public BatchCandidate withReject(Reject newReject) {
-        return new BatchCandidate(pos, icon, newReject, role);
+    /** 规划结果：角色 + 组号 + 挂靠的机器坐标。 */
+    public BatchCandidate withPlan(BoundContainer.Role newRole, int newGroup, BlockPos newParent) {
+        return new BatchCandidate(pos, icon, reject, newRole, machine, newGroup, newParent);
     }
 }

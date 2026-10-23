@@ -25,12 +25,25 @@ import java.util.function.Supplier;
 public record BatchBindPacket(UUID requestId, ResourceLocation dimension, BlockPos cornerA, BlockPos cornerB,
                               BoundContainer.GroupMode mode, List<Entry> entries) {
 
-    /** 计划里的一项：坐标 + 角色 + 父容器坐标（主容器为 {@code null}）。 */
-    public record Entry(BlockPos pos, BoundContainer.Role role, BlockPos parentPos) {
+    /**
+     * 计划里的一项：坐标 + 角色 + 父容器坐标（主容器为 {@code null}）+ 配方类别。
+     *
+     * <p>{@code routeKeys} 只有主容器会带：类别来自 EMI 的配方管理器，服务端没有 EMI，
+     * 所以只能客户端算好带过来。空集合 = 「不参与自动路由」（和单绑的语义一致）。
+     */
+    public record Entry(BlockPos pos, BoundContainer.Role role, BlockPos parentPos,
+                        java.util.Set<ResourceLocation> routeKeys) {
+
+        /** 不带类别的条目（并列成员、从容器）。 */
+        public Entry(BlockPos pos, BoundContainer.Role role, BlockPos parentPos) {
+            this(pos, role, parentPos, java.util.Set.of());
+        }
     }
 
     /** 上限只是防垃圾包：单边 32 格的框里不可能有这么多个容器。 */
     public static final int MAX_ENTRIES = 4096;
+    /** 一台机器登记的类别不会超过几十个，这个上限同样只是防垃圾包。 */
+    public static final int MAX_ROUTES = 256;
 
     /** 编码。 */
     public static void encode(BatchBindPacket packet, FriendlyByteBuf buffer) {
@@ -47,6 +60,12 @@ public record BatchBindPacket(UUID requestId, ResourceLocation dimension, BlockP
             buffer.writeBoolean(entry.parentPos() != null);
             if (entry.parentPos() != null) {
                 buffer.writeBlockPos(entry.parentPos());
+            }
+            java.util.Set<ResourceLocation> routes = entry.routeKeys() == null
+                    ? java.util.Set.of() : entry.routeKeys();
+            buffer.writeVarInt(routes.size());
+            for (ResourceLocation route : routes) {
+                buffer.writeResourceLocation(route);
             }
         }
     }
@@ -67,7 +86,15 @@ public record BatchBindPacket(UUID requestId, ResourceLocation dimension, BlockP
             BlockPos pos = buffer.readBlockPos();
             BoundContainer.Role role = buffer.readEnum(BoundContainer.Role.class);
             BlockPos parentPos = buffer.readBoolean() ? buffer.readBlockPos() : null;
-            entries.add(new Entry(pos, role, parentPos));
+            int routeCount = buffer.readVarInt();
+            if (routeCount < 0 || routeCount > MAX_ROUTES) {
+                throw new IllegalArgumentException("配方类别数量超出限制: " + routeCount);
+            }
+            java.util.Set<ResourceLocation> routes = new java.util.LinkedHashSet<>();
+            for (int route = 0; route < routeCount; route++) {
+                routes.add(buffer.readResourceLocation());
+            }
+            entries.add(new Entry(pos, role, parentPos, java.util.Set.copyOf(routes)));
         }
         return new BatchBindPacket(requestId, dimension, cornerA, cornerB, mode, entries);
     }

@@ -5,7 +5,6 @@ import com.lai.recipesender.model.BoundDetail;
 import com.lai.recipesender.model.BoundStatus;
 import com.lai.recipesender.model.NoticeSeverity;
 import com.lai.recipesender.model.SourceScope;
-import com.lai.recipesender.client.batch.BatchBindScreen;
 import com.lai.recipesender.client.batch.BatchSelection;
 import com.lai.recipesender.network.packet.BatchBindResultPacket;
 import com.lai.recipesender.network.packet.MachineStatusPacket;
@@ -80,9 +79,6 @@ public final class ClientPacketHandler {
                                              List<BatchBindResultPacket.Failure> failures) {
         BatchSelection.cancel();
         Minecraft minecraft = Minecraft.getInstance();
-        if (minecraft.screen instanceof BatchBindScreen) {
-            minecraft.setScreen(null);
-        }
         int failed = failures == null ? 0 : failures.size();
         NoticeOverlay.show(Component.translatableWithFallback("text.recipe_sender.batch_result",
                         "批量绑定：成功 %s 项，失败 %s 项", created, failed),

@@ -93,6 +93,30 @@ public final class BoundHighlightRenderer {
                     argb);
         }
 
+        /**
+         * 垂直于某个轴的一层薄片（主向分片轮廓）。
+         *
+         * <p>厚度是一格：画出来是这一层的外框，而不是一条悬空的线——一层一层的框叠起来
+         * 正好把「哪些方块算同一片」说清楚。{@code maxY}/{@code maxZ} 传的是<b>开区间</b>上界
+         * （已经 +1 过），和 {@link #between} 的语义一致。
+         */
+        public static Box planeX(int x, int minY, int minZ, int maxY, int maxZ, int argb) {
+            return of(x - EXPAND, minY - EXPAND, minZ - EXPAND,
+                    x + 1.0D + EXPAND, maxY + EXPAND, maxZ + EXPAND, argb);
+        }
+
+        /** 垂直于 Y 的一层薄片。 */
+        public static Box planeY(int y, int minX, int minZ, int maxX, int maxZ, int argb) {
+            return of(minX - EXPAND, y - EXPAND, minZ - EXPAND,
+                    maxX + EXPAND, y + 1.0D + EXPAND, maxZ + EXPAND, argb);
+        }
+
+        /** 垂直于 Z 的一层薄片。 */
+        public static Box planeZ(int z, int minX, int minY, int maxX, int maxY, int argb) {
+            return of(minX - EXPAND, minY - EXPAND, z - EXPAND,
+                    maxX + EXPAND, maxY + EXPAND, z + 1.0D + EXPAND, argb);
+        }
+
         private static Box of(double minX, double minY, double minZ, double maxX, double maxY, double maxZ,
                               int argb) {
             return new Box(minX, minY, minZ, maxX, maxY, maxZ,
@@ -130,12 +154,38 @@ public final class BoundHighlightRenderer {
     }
 
     /**
+     * 一条线段；批量绑定的配对连线用它。
+     *
+     * <p>不塞进 {@link Box} 是因为退化包围盒会把同一条线画四遍（另外三条棱长度为零被跳过），
+     * 半透明时叠加起来会比别的线亮一截。
+     */
+    public record Segment(double x1, double y1, double z1, double x2, double y2, double z2,
+                          float red, float green, float blue, float alpha) {
+
+        /** 两个世界坐标之间的一条线。 */
+        public static Segment of(double x1, double y1, double z1, double x2, double y2, double z2, int argb) {
+            return new Segment(x1, y1, z1, x2, y2, z2,
+                    ((argb >> 16) & 0xFF) / 255.0F,
+                    ((argb >> 8) & 0xFF) / 255.0F,
+                    (argb & 0xFF) / 255.0F,
+                    ((argb >>> 24) & 0xFF) / 255.0F);
+        }
+    }
+
+    /**
      * 画任意一组彩色棱框（批量绑定的角色色、框线都走这里）。
      *
      * <p>不做区块加载判断：调用方给的框可能横跨多个区块，逐块判断没有意义。
      */
     public static void renderBoxes(PoseStack poseStack, Camera camera, List<Box> boxes) {
-        if (boxes == null || boxes.isEmpty()) {
+        renderAll(poseStack, camera, boxes, List.of());
+    }
+
+    /** 棱框 + 线段一起画：同一个批次，省一次 GL 状态切换。 */
+    public static void renderAll(PoseStack poseStack, Camera camera, List<Box> boxes, List<Segment> segments) {
+        boolean noBoxes = boxes == null || boxes.isEmpty();
+        boolean noSegments = segments == null || segments.isEmpty();
+        if (noBoxes && noSegments) {
             return;
         }
         Minecraft minecraft = Minecraft.getInstance();
@@ -165,7 +215,7 @@ public final class BoundHighlightRenderer {
         RenderSystem.lineWidth(LINE_WIDTH);
         FogRenderer.setupNoFog();
         try {
-            drawOutlines(boxes, origin);
+            drawOutlines(boxes == null ? List.of() : boxes, segments == null ? List.of() : segments, origin);
         } finally {
             RenderSystem.setShaderFogStart(fogStart);
             RenderSystem.lineWidth(previousLineWidth);
@@ -179,17 +229,139 @@ public final class BoundHighlightRenderer {
         }
     }
 
-    private static void drawOutlines(List<Box> boxes, Vec3 origin) {
+    private static void drawOutlines(List<Box> boxes, List<Segment> segments, Vec3 origin) {
         Tesselator tesselator = Tesselator.getInstance();
         BufferBuilder builder = tesselator.getBuilder();
         builder.begin(VertexFormat.Mode.LINES, DefaultVertexFormat.POSITION_COLOR_NORMAL);
         for (Box box : boxes) {
             drawBoxOutline(builder, box, origin);
         }
+        for (Segment segment : segments) {
+            drawSegment(builder, segment, origin);
+        }
         // 着色器颜色是全局状态，别处可能留了非白色，不重置会把颜色乘歪。
         RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
         RenderSystem.setShader(GameRenderer::getRendertypeLinesShader);
         tesselator.end();
+    }
+
+    /**
+     * 半透明填充：给每个盒子染一层色，**只画朝向摄像机的那三个面**。
+     *
+     * <p>为什么只画三个面：一个方块六个面里，朝外那三个才是看得见的；全画会让相邻方块共用的那个面
+     * 叠两次（同一个颜色混两遍，出现深浅不一的格子），也会把「贴着墙的那一面」透出来。
+     *
+     * <p>为什么填充**不穿墙**：线框穿墙是为了找远处的容器，而填充穿墙会变成隔着一面墙看到一片彩色，
+     * 比线更糊。所以这里用默认的 {@code LEQUAL}，被挡住的方块自然不染色——这正是想要的效果
+     * （玩家看到的是「这排机器被标了色」，而不是「屏幕上多了一层雾」）。
+     *
+     * <p>和描边一样不走 {@code RenderType}：{@code endBatch} 会重置深度状态，这里必须自己管。
+     */
+    public static void renderFills(PoseStack poseStack, Camera camera, List<Box> boxes) {
+        if (boxes == null || boxes.isEmpty()) {
+            return;
+        }
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.level == null || minecraft.player == null) {
+            return;
+        }
+        Vec3 origin = camera.getPosition();
+
+        PoseStack modelView = RenderSystem.getModelViewStack();
+        modelView.pushPose();
+        modelView.setIdentity();
+        modelView.mulPoseMatrix(poseStack.last().pose());
+        RenderSystem.applyModelViewMatrix();
+
+        float fogStart = RenderSystem.getShaderFogStart();
+        ShaderInstance previousShader = RenderSystem.getShader();
+        RenderSystem.enableDepthTest();
+        RenderSystem.enableBlend();
+        RenderSystem.defaultBlendFunc();
+        // 只挑朝向摄像机的那三个面，绕序不用管，关掉背面剔除最省事。
+        RenderSystem.disableCull();
+        // 不写深度：填充只是染色，不该在深度缓冲里留下痕迹挡住别的东西。
+        RenderSystem.depthMask(false);
+        FogRenderer.setupNoFog();
+        try {
+            Tesselator tesselator = Tesselator.getInstance();
+            BufferBuilder builder = tesselator.getBuilder();
+            builder.begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_COLOR);
+            for (Box box : boxes) {
+                addFilledCube(builder, box, origin);
+            }
+            RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
+            RenderSystem.setShader(GameRenderer::getPositionColorShader);
+            tesselator.end();
+        } finally {
+            RenderSystem.setShaderFogStart(fogStart);
+            RenderSystem.depthMask(true);
+            RenderSystem.setShader(() -> previousShader);
+            RenderSystem.disableBlend();
+            RenderSystem.enableCull();
+            modelView.popPose();
+            RenderSystem.applyModelViewMatrix();
+        }
+    }
+
+    /** 按摄像机位置挑三个朝外的面画；摄像机在盒子里时一个面都不画（方块尺寸下不会发生）。 */
+    private static void addFilledCube(VertexConsumer builder, Box box, Vec3 origin) {
+        double x0 = box.minX() - origin.x;
+        double y0 = box.minY() - origin.y;
+        double z0 = box.minZ() - origin.z;
+        double x1 = box.maxX() - origin.x;
+        double y1 = box.maxY() - origin.y;
+        double z1 = box.maxZ() - origin.z;
+
+        if (origin.x <= box.minX()) {
+            quad(builder, box, x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0);
+        } else if (origin.x >= box.maxX()) {
+            quad(builder, box, x1, y0, z0, x1, y1, z0, x1, y1, z1, x1, y0, z1);
+        }
+        if (origin.y <= box.minY()) {
+            quad(builder, box, x0, y0, z0, x0, y0, z1, x1, y0, z1, x1, y0, z0);
+        } else if (origin.y >= box.maxY()) {
+            quad(builder, box, x0, y1, z0, x1, y1, z0, x1, y1, z1, x0, y1, z1);
+        }
+        if (origin.z <= box.minZ()) {
+            quad(builder, box, x0, y0, z0, x1, y0, z0, x1, y1, z0, x0, y1, z0);
+        } else if (origin.z >= box.maxZ()) {
+            quad(builder, box, x0, y0, z1, x0, y1, z1, x1, y1, z1, x1, y0, z1);
+        }
+    }
+
+    private static void quad(VertexConsumer builder, Box box,
+                             double ax, double ay, double az, double bx, double by, double bz,
+                             double cx, double cy, double cz, double dx, double dy, double dz) {
+        builder.vertex(ax, ay, az).color(box.red(), box.green(), box.blue(), box.alpha()).endVertex();
+        builder.vertex(bx, by, bz).color(box.red(), box.green(), box.blue(), box.alpha()).endVertex();
+        builder.vertex(cx, cy, cz).color(box.red(), box.green(), box.blue(), box.alpha()).endVertex();
+        builder.vertex(dx, dy, dz).color(box.red(), box.green(), box.blue(), box.alpha()).endVertex();
+    }
+
+    private static void drawSegment(VertexConsumer builder, Segment segment, Vec3 origin) {
+        double ax = segment.x1() - origin.x;
+        double ay = segment.y1() - origin.y;
+        double az = segment.z1() - origin.z;
+        double bx = segment.x2() - origin.x;
+        double by = segment.y2() - origin.y;
+        double bz = segment.z2() - origin.z;
+
+        double nx = bx - ax;
+        double ny = by - ay;
+        double nz = bz - az;
+        double length = Math.sqrt(nx * nx + ny * ny + nz * nz);
+        if (length < 1.0E-6D) {
+            return;
+        }
+        float ux = (float) (nx / length);
+        float uy = (float) (ny / length);
+        float uz = (float) (nz / length);
+
+        builder.vertex(ax, ay, az).color(segment.red(), segment.green(), segment.blue(), segment.alpha())
+                .normal(ux, uy, uz).endVertex();
+        builder.vertex(bx, by, bz).color(segment.red(), segment.green(), segment.blue(), segment.alpha())
+                .normal(ux, uy, uz).endVertex();
     }
 
     private static void drawBoxOutline(VertexConsumer builder, Box box, Vec3 origin) {

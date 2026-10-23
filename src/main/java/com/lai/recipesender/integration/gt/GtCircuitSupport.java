@@ -60,6 +60,11 @@ import java.util.concurrent.ConcurrentHashMap;
  * （界面槽位单独走 {@code getXEIIngredients()}），却根本不会出现在原料列表里。
  * 因此除了扫 EMI 列表，还必须有一条直接翻配方内部数据的通路（{@link #scanGtRecipe}）。
  *
+ * <p>26.10.34 起这一代又换了表示：配方输入成了 {@code ContentList}（{@code KeyIngredient[]}
+ * 平行数组，既不是 Map 也不是 Iterable），电路是其中的 {@code CircuitIngredient}。
+ * {@link #scanGtRecipe} 必须同时认这两代结构，否则「格雷配方且不使用电路」会整条判不出来
+ * （材料照发、电路不清）。
+ *
  * <h2>为什么“配方不需要电路”时要把电路置空</h2>
  * 格雷的配方匹配是按键匹配的：配方侧把 {@code IntCircuitIngredient} 变成搜索表里的一个键，
  * 机器侧再把电路槽里的编号加成同一个键。不需要电路的配方根本不产生电路键，于是槽里放着
@@ -114,6 +119,9 @@ public final class GtCircuitSupport {
     private static final String[] WRAPPER_FIELDS = {"inner", "content", "value", "ingredient"};
     /** 包装层数上限：Content -> ItemIngredient -> Ingredient 已经够用。 */
     private static final int MAX_WRAPPER_DEPTH = 4;
+    /** gtceu 26.10.34 起的 {@code ContentList}：对外只有 {@code size()} 与 {@code ingredient(int)}。 */
+    private static final String CONTENT_LIST_SIZE = "size";
+    private static final String CONTENT_LIST_ELEMENT = "ingredient";
 
     /** {@code resolve()} 期间发现的问题，只在解析完成后打一次日志。 */
     private static final List<String> problems = new ArrayList<>();
@@ -336,9 +344,10 @@ public final class GtCircuitSupport {
      *
      * <p>GTCEu 的 {@code GTEmiRecipe} 持有 {@code GTRecipe recipe}（{@code inputs} 是
      * {@code Map<RecipeCapability, List<Content>>}，{@code Content.content} 是 {@code Object}）；
-     * GTO 的 {@code GTEMIRecipe} 持有 {@code GTRecipeDefinition recipe}（{@code itemInputs} 是
-     * {@code List<Content>}，{@code Content.inner} 再包一层）。两条都按“字段名 + 递归解包”处理，
-     * 不依赖具体类名。
+     * GTO 的 {@code GTEMIRecipe} 持有 {@code GTRecipeDefinition recipe}，它的 {@code itemInputs}
+     * 在 26.10.34 之前是 {@code List<Content>}、之后换成了 {@code ContentList}。
+     * 两条都按“字段名 + 递归解包”处理，不依赖具体类名；容器的形态差异由
+     * {@link #contentElements} 统一摊平。
      *
      * @return 配方对电路的要求；连 GT 配方对象或它的输入字段都找不到时返回 {@code null}
      *         —— 结构不认识时宁可不动电路，也不能误判成“这个配方不使用电路”
@@ -350,12 +359,12 @@ public final class GtCircuitSupport {
         }
         boolean scanned = false;
         for (String fieldName : RECIPE_CONTENT_FIELDS) {
-            Object collection = readFieldByName(gtRecipe, fieldName);
-            if (!(collection instanceof Map<?, ?>) && !(collection instanceof Iterable<?>)) {
+            List<?> elements = contentElements(readFieldByName(gtRecipe, fieldName));
+            if (elements == null) {
                 continue;
             }
             scanned = true;
-            int circuit = scanCollection(collection);
+            int circuit = scanElements(elements);
             if (circuit != NO_CIRCUIT) {
                 return new CircuitRequirement(circuit, true);
             }
@@ -436,25 +445,67 @@ public final class GtCircuitSupport {
         return null;
     }
 
-    /** 把 Map 的 values 或 Iterable 的元素逐个当“配方内容”扫描。 */
-    private static int scanCollection(Object value) {
-        if (value instanceof Map<?, ?> map) {
-            for (Object entry : map.values()) {
-                int circuit = scanElements(entry);
-                if (circuit != NO_CIRCUIT) {
-                    return circuit;
-                }
-            }
-            return NO_CIRCUIT;
+    /**
+     * 把一个「配方内容容器」摊成元素列表；不是内容容器时返回 {@code null}。
+     *
+     * <p>三种形态都要认，否则「这个配方到底有没有电路」会整条判不出来：
+     * <ul>
+     *   <li>{@code Map<RecipeCapability, List<Content>>}（gtceu 26.10.34 之前）：取 values，
+     *       每个 value 还是一个列表，由 {@link #scanElement} 的 Iterable 分支再摊一层；</li>
+     *   <li>裸 {@code Iterable}：直接当元素列表；</li>
+     *   <li>{@code ContentList}（gtceu 26.10.34 起）：<b>既不是 Map 也不是 Iterable</b>，
+     *       内部是 {@code KeyIngredient[]} 平行数组，只能走 {@code size()} / {@code ingredient(int)}。
+     *       漏掉这一代时 {@link #scanGtRecipe} 会认为「结构不认识」而返回 {@code null}，
+     *       于是「格雷配方且不使用电路」永远判不出来——表现就是材料能发进去、
+     *       机器上的旧电路却清不掉。</li>
+     * </ul>
+     */
+    private static List<?> contentElements(Object container) {
+        if (container instanceof Map<?, ?> map) {
+            return new ArrayList<>(map.values());
         }
-        return scanElements(value);
+        if (container instanceof Iterable<?> iterable) {
+            List<Object> elements = new ArrayList<>();
+            for (Object element : iterable) {
+                elements.add(element);
+            }
+            return elements;
+        }
+        return contentListElements(container);
     }
 
-    private static int scanElements(Object value) {
-        if (!(value instanceof Iterable<?> iterable)) {
-            return NO_CIRCUIT;
+    /**
+     * {@code ContentList} 的元素；不是这种结构时返回 {@code null}。
+     *
+     * <p>认它靠 {@code ingredient(int)} 这个方法：只看 {@code size()} 会把任何碰巧有
+     * {@code size()} 的对象当成空内容容器，从而把「读不出来」误判成「配方里没有电路」。
+     */
+    private static List<?> contentListElements(Object container) {
+        if (container == null) {
+            return null;
         }
-        for (Object element : iterable) {
+        Method elementAt = findIntMethod(container.getClass(), CONTENT_LIST_ELEMENT);
+        Object size = invokeNoArg(container, CONTENT_LIST_SIZE);
+        if (elementAt == null || !(size instanceof Integer count)) {
+            return null;
+        }
+        List<Object> elements = new ArrayList<>(Math.max(0, count));
+        for (int index = 0; index < count; index++) {
+            try {
+                Object element = elementAt.invoke(container, index);
+                if (element != null) {
+                    elements.add(element);
+                }
+            } catch (ReflectiveOperationException | RuntimeException | LinkageError error) {
+                // 读一半读不下去：已经拿到的照样返回，别把整条通路判死。
+                break;
+            }
+        }
+        return elements;
+    }
+
+    private static int scanElements(Iterable<?> elements) {
+        for (Object element : elements) {
             int circuit = scanElement(element, 0);
             if (circuit != NO_CIRCUIT) {
                 return circuit;
@@ -467,6 +518,15 @@ public final class GtCircuitSupport {
     private static int scanElement(Object element, int depth) {
         if (element == null || depth > MAX_WRAPPER_DEPTH) {
             return NO_CIRCUIT;
+        }
+        // 老结构的 Map 值是列表，摊平后再往下走。
+        if (element instanceof Iterable<?> iterable) {
+            return scanElements(iterable);
+        }
+        // gtceu 26.10.34 起的 KeyIngredient：电路编号直接挂在元素上，不需要再解包。
+        int keyCircuit = readCircuitFromKeyIngredient(element);
+        if (keyCircuit != NO_CIRCUIT) {
+            return keyCircuit;
         }
         if (element instanceof Ingredient ingredient) {
             return readCircuitFromIngredient(ingredient);
@@ -513,6 +573,24 @@ public final class GtCircuitSupport {
             if (circuit != NO_CIRCUIT) {
                 return circuit;
             }
+        }
+        return NO_CIRCUIT;
+    }
+
+    /**
+     * 从 gtceu 26.10.34 起的 {@code KeyIngredient} 里读电路编号。
+     *
+     * <p>这一代把电路表示成 {@code CircuitIngredient}，编号走接口的
+     * {@code circuitConfiguration()}：默认实现返回 -1，只有电路实现返回真实编号，
+     * 所以非电路原料会自然落到后面的通路，不必再判 {@code kind() == CIRCUIT}。
+     *
+     * <p>必须按<b>公开方法表</b>找（{@link #invokePublicNoArg}）：它是接口上的 default 方法，
+     * 只查实现类的 declared method 会漏掉那些没有覆写它的实现。
+     */
+    private static int readCircuitFromKeyIngredient(Object element) {
+        Object configuration = invokePublicNoArg(element, "circuitConfiguration");
+        if (configuration instanceof Integer value && value >= 0 && value <= MAX_CIRCUIT) {
+            return value;
         }
         return NO_CIRCUIT;
     }
@@ -941,6 +1019,20 @@ public final class GtCircuitSupport {
                     method.setAccessible(true);
                     return method;
                 }
+            } catch (NoSuchMethodException | RuntimeException | LinkageError ignored) {
+                // 继续往父类找
+            }
+        }
+        return null;
+    }
+
+    /** 在类层次里找带一个 {@code int} 参数的方法（{@code ContentList#ingredient(int)} 用）。 */
+    private static Method findIntMethod(Class<?> owner, String name) {
+        for (Class<?> type = owner; type != null && type != Object.class; type = type.getSuperclass()) {
+            try {
+                Method method = type.getDeclaredMethod(name, int.class);
+                method.setAccessible(true);
+                return method;
             } catch (NoSuchMethodException | RuntimeException | LinkageError ignored) {
                 // 继续往父类找
             }

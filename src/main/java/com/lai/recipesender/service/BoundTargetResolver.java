@@ -8,6 +8,8 @@ import net.minecraft.core.Direction;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.phys.Vec3;
 import net.minecraftforge.common.capabilities.ForgeCapabilities;
@@ -95,6 +97,43 @@ public final class BoundTargetResolver {
      */
     public static boolean hasItemHandler(BlockEntity blockEntity) {
         return blockEntity != null && findItemHandler(blockEntity) != null;
+    }
+
+    /**
+     * 批量绑定用的准入判定：**这个容器真的能收下东西吗**。
+     *
+     * <p>比 {@link #hasItemHandler} 严两级，因为框选会把一整片方块都扫进来：
+     * <ol>
+     *   <li>至少有一个槽位，且这个槽位的容量大于 0（管道、只读视图、外壳在这里出局）；</li>
+     *   <li>这个槽位接受物品（有些总线带过滤，只收特定物品）。</li>
+     * </ol>
+     *
+     * <p><b>全是只读查询</b>：只问 {@code getSlots / getSlotLimit / isItemValid}，不做模拟插入。
+     * 以前吃过「模拟抽取把无人机弄没了」的亏（见 {@code copyHandlerContents}），凡是会碰真实
+     * 处理器状态的判定，都不该在「看一眼」的时候跑。
+     *
+     * <p>样本物品用圆石：绝大多数容器都收，能过这一关就说明它至少不是一个"只认某一种东西"的
+     * 专用口。代价是**过滤得很死、恰好不收圆石的容器会被漏掉**——那属于玩家自己设的过滤器，
+     * 少收几个比误收一片管道好，真需要就手动绑。
+     *
+     * <p>不按名字判断：方块名字是本地化文本，客户端说「管道」、服务端可能说 "Pipe"，两边
+     * 判不一致；而且不同模组还叫 Cable / Conduit / 导管。
+     */
+    public static boolean canAcceptItems(BlockEntity blockEntity) {
+        IItemHandler handler = findItemHandler(blockEntity);
+        if (handler == null) {
+            return false;
+        }
+        ItemStack sample = new ItemStack(Items.COBBLESTONE);
+        for (int slot = 0; slot < handler.getSlots(); slot++) {
+            if (handler.getSlotLimit(slot) <= 0) {
+                continue;
+            }
+            if (handler.isItemValid(slot, sample)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

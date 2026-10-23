@@ -85,7 +85,7 @@ public final class ModNetwork {
      * {@code BatchBindResultPacket}）。批量绑定本身是「客户端算好计划、服务端一次校验」，
      * 没有改动任何旧包的字段，只是新增。
      */
-    private static final String PROTOCOL_VERSION = "19";
+    private static final String PROTOCOL_VERSION = "21";
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             ResourceLocation.fromNamespaceAndPath(RecipeSenderMod.MOD_ID, "main"),
             () -> PROTOCOL_VERSION, PROTOCOL_VERSION::equals, PROTOCOL_VERSION::equals);
