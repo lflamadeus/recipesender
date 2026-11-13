@@ -118,7 +118,7 @@ public final class DirectInsertionService {
             // 万一哪条路径漏了判断也只会「找不到来源」，不会偷偷去拿周围的材料。
             Predicate<BlockPos> searchable = packet.scope() == SourceScope.HUB
                     ? container -> false
-                    : NearbyRecipeService.containerFilter(player, targets.positions());
+                    : NearbyRecipeService.containerFilter(player, targets.positionsIn(player.level().dimension()));
             SourcePlan plan = planSources(player, packet, targets, searchable);
             if (plan.blocked() != null) {
                 reply(player, packet, BoundStatus.OK, 0, plan.blocked());
@@ -155,6 +155,11 @@ public final class DirectInsertionService {
     /**
      * 校验并解析整组落点。
      *
+     * <p>按<b>直达口径</b>解析（{@link BoundTargetResolver.Mode#DIRECT}）：不限距离，
+     * 跨维度由配置项 {@code directCrossDimension} 决定（默认允许）。唯一保留的硬条件是
+     * 「目标区块已加载」——本模组从不为了发送去加载区块，所以跨维度时目标那一侧通常需要有
+     * 别的玩家或区块加载器。绑定发送走的是另一套口径，两边不共享这个放宽。
+     *
      * @return 落点集合；校验不通过时已经回过执，返回 {@code null}
      */
     private static DirectTargets.TargetSet resolveTargets(ServerPlayer player,
@@ -171,12 +176,14 @@ public final class DirectInsertionService {
             reply(player, packet, BoundStatus.FORBIDDEN, 0, null);
             return null;
         }
-        BoundTargetResolver.ResolvedTarget master = BoundTargetResolver.resolve(player, group.master());
+        BoundTargetResolver.ResolvedTarget master =
+                BoundTargetResolver.resolve(player, group.master(), BoundTargetResolver.Mode.DIRECT);
         if (!master.available()) {
             reply(player, packet, master.status(), 0, null);
             return null;
         }
-        return DirectTargets.resolve(player, group, master, needsFluids(packet));
+        return DirectTargets.resolve(player, group, master, needsFluids(packet),
+                BoundTargetResolver.Mode.DIRECT);
     }
 
     /** 整体模式下的电路闸门：在忙的机器电路必须已经符合本次要求，否则整单取消。 */
@@ -198,11 +205,13 @@ public final class DirectInsertionService {
      *
      * @param blocked        非空表示这一侧根本走不通，一份都不发
      * @param placeMembers   真正会接料的成员（已按流体容量筛过）
-     * @param perBatchItems  每份配方的物品用量
+     * @param itemBatches    已经按份拆好的物品材料，下标就是份号。一份可能是同类材料的不同变体
+     *                       拼起来的（配方要两个电路板时允许两种板各一个），所以这里不能退回
+     *                       一张「每种物品各多少」的平表
      */
     private record SourcePlan(BoundDetail blocked, FluidPlan fluid, BatchBudget budget,
                               List<DirectTargets.Member> placeMembers,
-                              List<ItemStack> perBatchItems,
+                              List<List<ItemStack>> itemBatches,
                               List<RemoteTransferPlanner.Target> groupOverflow) {
 
         private static SourcePlan blocked(BoundDetail detail) {
@@ -244,7 +253,7 @@ public final class DirectInsertionService {
                 // 中枢直达却没有可用的物品中枢：一份都不抽，让玩家先去绑。
                 return SourcePlan.blocked(BoundDetail.NO_ITEM_HUB);
             }
-            items = NearbyRecipeService.planDirect(packet.specs(), List.of(),
+            items = NearbyRecipeService.planDirect(packet.specs(), player.getInventory().items,
                     ItemHubService.contents(player, NearbyRecipeService.relevance(packet.specs())),
                     packet.batches());
         } else {
@@ -268,17 +277,24 @@ public final class DirectInsertionService {
                         targets.groupOverflowSlots());
             }
         }
-        List<ItemStack> perBatchItems = items.batches() >= 1
-                ? scale(items.requirements(), items.batches(), 1)
+        // 先把材料按份拆好，再拿它做目标容量预检。拆份必须按「配方输入」分组：同一组里的变体
+        // 可以互换（配方要两个电路板时允许两种板各一个），旧的「逐物品除以份数」会把每份
+        // 算成零份，再把余料全塞进最后一台。
+        List<List<ItemStack>> itemBatches = items.batches() >= 1
+                ? MaterialBatches.split(items.groups(), items.batches())
                 : List.of();
         // 目标容量预检（1.0.38）：先问一句「这组落点最多还能完整收下几份」，再决定抽多少。
         // 抽出来的材料投不进去就得还回去，纯属浪费。模拟是真实容量的上界，所以封顶不会让份数
         // 变少，只会去掉本来就要还回去的那部分。
-        int itemTarget = perBatchItems.isEmpty() ? BatchBudget.UNLIMITED
+        int itemTarget = itemBatches.isEmpty() ? BatchBudget.UNLIMITED
                 : RemoteTransferPlanner.maxBatches(DirectTargets.slots(placeMembers),
                 DirectTargets.ownOverflows(placeMembers), targets.groupOverflowSlots(),
-                perBatchItems, budget.limit());
-        return new SourcePlan(null, fluid, budget.withItemTarget(itemTarget), placeMembers, perBatchItems,
+                itemBatches, budget.limit());
+        BatchBudget limited = budget.withItemTarget(itemTarget);
+        int sendable = itemBatches.isEmpty()
+                ? limited.limit() : Math.min(limited.limit(), itemBatches.size());
+        return new SourcePlan(null, fluid, limited, placeMembers,
+                itemBatches.isEmpty() ? List.of() : itemBatches.subList(0, sendable),
                 targets.groupOverflowSlots());
     }
 
@@ -319,7 +335,7 @@ public final class DirectInsertionService {
         boolean sourceShort = false;
         boolean fluidShort = false;
         // 纯液体配方没有物品可搬：份数完全由流体这一侧决定，灌进去多少就是发出去多少。
-        boolean fluidOnly = plan.perBatchItems().isEmpty();
+        boolean fluidOnly = plan.itemBatches().isEmpty();
         boolean hubScope = packet.scope() == SourceScope.HUB;
         // 周围容器只枚举一次：分块循环里每块都重扫一遍附近方块实体是纯浪费，
         // 而这张表里存的是方块实体本身，抽取时读的仍是实时槽位，不会抽到空气。
@@ -343,11 +359,15 @@ public final class DirectInsertionService {
                     fluidShort = true;
                 }
             } else {
-                List<ItemStack> requirements = times(plan.perBatchItems(), chunk);
+                // 这一块要发的是哪几份材料：按份切，不按「每份用量 × 块内份数」放大。
+                // 一份可能是同类材料的不同变体拼成，放大后的平表就丢了「哪几个凑成一份」。
+                List<List<ItemStack>> chunkBatches = plan.itemBatches().subList(start, start + chunk);
+                List<ItemStack> requirements = MaterialBatches.flatten(chunkBatches);
                 List<ItemStack> extracted = new ArrayList<>();
                 if (hubScope) {
-                    // 中枢直达：只从中枢抽，不从背包补料——「只拿中枢里的东西」正是这个模式的承诺。
+                    // 中枢直达：优先从中枢抽，不够时从背包补料。
                     ItemHubService.extract(player, requirements, extracted);
+                    takeFromInventory(player, requirements, extracted);
                 } else {
                     FindMeExtendedAdapter.pullAllTo(player, sources, requirements, extracted);
                     takeFromInventory(player, requirements, extracted);
@@ -361,7 +381,7 @@ public final class DirectInsertionService {
                 // 也不会出现「材料均分了、流体全灌进第一台」。
                 RemoteTransferPlanner.Placement placement = RemoteTransferPlanner.placeByShares(
                         DirectTargets.slots(chunkMembers), DirectTargets.ownOverflows(chunkMembers),
-                        plan.groupOverflow(), extracted, chunk);
+                        plan.groupOverflow(), chunkBatches);
                 if (plan.fluid().active()) {
                     // 只有这次真的要灌流体才比对：没有流体需求时 pourFluidsByMember 恒返回 0，
                     // 拿它跟「每台收下的份数」比会把每一单都误判成流体不足。
@@ -372,8 +392,9 @@ public final class DirectInsertionService {
                     }
                 }
                 returnLeftovers(player, packet.scope(), extracted, placement.inserted());
-                done = BoundInsertionService.countInsertedBatches(requirements,
-                        placement.inserted(), chunk);
+                // 按「整份都落地」计份数：缺一个电路板的半份不算发出去，否则回执会把缺料
+                // 说成送达，玩家按显示的数字等配方却永远等不来产物。
+                done = placement.completeBatches();
             }
             moved += done;
             if (done < chunk || fluidShort) {
@@ -442,37 +463,6 @@ public final class DirectInsertionService {
     private static boolean needsFluids(DirectInsertToBoundPacket packet) {
         return RecipeSenderConfig.fluidSupport() && packet.fluids() != null
                 && !packet.fluids().isEmpty();
-    }
-
-    /**
-     * 把「共 {@code total} 份」的材料清单缩到 {@code chunk} 份。
-     * <p>
-     * 总量本来就是「每份用量 × total」，所以整除是精确的，分块不会丢掉零头。
-     */
-    private static List<ItemStack> scale(List<ItemStack> requirements, int total, int chunk) {
-        if (total <= 0) {
-            return List.of();
-        }
-        List<ItemStack> scaled = new ArrayList<>(requirements.size());
-        for (ItemStack stack : requirements) {
-            int count = stack.getCount() * chunk / total;
-            if (count > 0) {
-                scaled.add(stack.copyWithCount(count));
-            }
-        }
-        return scaled;
-    }
-
-    /** 把「每份用量」乘成 {@code batches} 份的用量。 */
-    private static List<ItemStack> times(List<ItemStack> perBatch, int batches) {
-        List<ItemStack> scaled = new ArrayList<>(perBatch.size());
-        for (ItemStack stack : perBatch) {
-            int count = stack.getCount() * batches;
-            if (count > 0) {
-                scaled.add(stack.copyWithCount(count));
-            }
-        }
-        return scaled;
     }
 
     /** 数一数一组物品堆一共多少个。 */

@@ -510,7 +510,9 @@ public final class BatchSelection {
             cancel();
             return;
         }
-        pruneVanished(minecraft.level);
+        if (minecraft.level.getGameTime() % 10 == 0) {
+            pruneVanished(minecraft.level);
+        }
         NoticeOverlay.showSticky(banner(), NoticeSeverity.INFO);
     }
 
@@ -558,7 +560,7 @@ public final class BatchSelection {
                     "没有数量匹配的组").getString()
                     : BoundContainerClient.displayName(target);
             return Component.translatableWithFallback("text.recipe_sender.batch_banner_slave",
-                    "批量绑定 · 纯容器池 · 挂到「{0}」\n{1}\nShift+右键 加一台 · Shift+左键 移除 · 回车 提交 · {2} 退出",
+                    "批量绑定 · 纯容器池 · 挂到「{0}」\n{1}\nShift+右键 加一台 · Shift+左键 移除 · 回车/中键 提交 · {2} 退出",
                     targetName, axisHint, exitName);
         }
         String state = unpaired > 0
@@ -567,7 +569,7 @@ public final class BatchSelection {
                 : Component.translatableWithFallback("text.recipe_sender.batch_banner_groups",
                 "批量绑定 · {0} 组 · 已选 {1} 台", groupCount(), acceptedCount()).getString();
         return Component.translatableWithFallback("text.recipe_sender.batch_banner_box",
-                "{0}\n{1}\nShift+右键 加一台 · Shift+左键 移除 · 回车 提交 · {2} 退出",
+                "{0}\n{1}\nShift+右键 加一台 · Shift+左键 移除 · 回车/中键 提交 · {2} 退出",
                 state, axisHint, exitName);
     }
 
@@ -583,7 +585,13 @@ public final class BatchSelection {
     }
 
     public static int acceptedCount() {
-        return accepted().size();
+        int count = 0;
+        for (BatchCandidate candidate : candidates) {
+            if (candidate.accepted()) {
+                count++;
+            }
+        }
+        return count;
     }
 
     /** 主容器坐标（第一组的第一个可用项）。 */

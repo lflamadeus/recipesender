@@ -84,8 +84,14 @@ public final class ModNetwork {
      * <p>1.0.52 由 18 升到 19：新增批量绑定的两个包（{@code BatchBindPacket}、
      * {@code BatchBindResultPacket}）。批量绑定本身是「客户端算好计划、服务端一次校验」，
      * 没有改动任何旧包的字段，只是新增。
+     *
+     * <p>1.0.67 由 21 升到 22：{@code InsertRecipeItemsToBoundPacket} 的材料清单从扁平的
+     * {@code List<ItemStack>} 改成按配方输入分组的 {@code List<List<ItemStack>>}。同一项输入下的
+     * 不同变体（例如不同材料的 LV 电路板）在一份配方里可以互相顶替，扁平清单丢掉分组后服务端
+     * 无从判断「哪些堆属于同一项、可以拆开凑数」。编码随之从「堆数 + 逐堆」变成「组数 + 逐组堆数
+     * + 逐堆」，两种布局在字节层面直接错位，必须整体挡开。
      */
-    private static final String PROTOCOL_VERSION = "21";
+    private static final String PROTOCOL_VERSION = "22";
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             ResourceLocation.fromNamespaceAndPath(RecipeSenderMod.MOD_ID, "main"),
             () -> PROTOCOL_VERSION, PROTOCOL_VERSION::equals, PROTOCOL_VERSION::equals);

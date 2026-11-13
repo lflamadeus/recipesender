@@ -39,7 +39,7 @@ public final class RecipeSenderConfigScreen extends Screen {
     private static final int FIELD_WIDTH = 66;
     private static final int HINT_GAP = 8;
     private static final int BUTTON_GAP = 6;
-    private static final int ROWS = 4;
+    private static final int ROWS = 5;
 
     private final Screen parent;
 
@@ -52,6 +52,8 @@ public final class RecipeSenderConfigScreen extends Screen {
 
     /** 流体开关的草稿值：点「保存」之前不动配置。 */
     private boolean fluidDraft;
+    /** 「直达允许跨维度」开关的草稿值。 */
+    private boolean crossDimensionDraft;
 
     /** 最近一次操作的结果提示（空串 = 不画）。 */
     private String status = "";
@@ -97,6 +99,7 @@ public final class RecipeSenderConfigScreen extends Screen {
         addRenderableWidget(batchesBox);
         addRenderableWidget(chunkBox);
         fluidDraft = RecipeSenderConfig.fluidSupport();
+        crossDimensionDraft = RecipeSenderConfig.directCrossDimension();
     }
 
     /**
@@ -137,6 +140,8 @@ public final class RecipeSenderConfigScreen extends Screen {
                 Lang.message("text.recipe_sender.config_chunk_hint", "1 ~ 256，越大越快、余料越多"));
         row(graphics, 3, Lang.message("text.recipe_sender.config_fluid_label", "流体支持"),
                 Lang.message("text.recipe_sender.config_fluid_hint", "含流体的配方要整份齐备"));
+        row(graphics, 4, Lang.message("text.recipe_sender.config_cross_dimension_label", "跨维度直达"),
+                Lang.message("text.recipe_sender.config_cross_dimension_hint", "只对直达生效"));
 
         Component fluidLabel = fluidDraft
                 ? Lang.message("text.recipe_sender.config_fluid_on", "已开启")
@@ -144,6 +149,15 @@ public final class RecipeSenderConfigScreen extends Screen {
         drawButton(graphics, fieldX(), rowY(3) - 4, fluidLabel, "toggle_fluid", mouseX, mouseY,
                 Lang.message("text.recipe_sender.config_fluid_tooltip",
                         "关闭时忽略配方里的流体，只搬运物品；开启后直达会把流体也算进一份"));
+
+        Component crossDimensionLabel = crossDimensionDraft
+                ? Lang.message("text.recipe_sender.config_cross_dimension_on", "已开启")
+                : Lang.message("text.recipe_sender.config_cross_dimension_off", "已关闭");
+        drawButton(graphics, fieldX(), rowY(4) - 4, crossDimensionLabel, "toggle_cross_dimension",
+                mouseX, mouseY,
+                Lang.message("text.recipe_sender.config_cross_dimension_tooltip",
+                        "开启后直达可以把材料送进其他维度的绑定容器（目标区块仍需已加载）；"
+                                + "关闭后直达与绑定发送一样只认当前维度"));
 
         int statusY = top + HEADER_HEIGHT + ROW_GAP * ROWS + 2;
         if (!status.isEmpty()) {
@@ -224,6 +238,7 @@ public final class RecipeSenderConfigScreen extends Screen {
     private void act(String action) {
         switch (action) {
             case "toggle_fluid" -> fluidDraft = !fluidDraft;
+            case "toggle_cross_dimension" -> crossDimensionDraft = !crossDimensionDraft;
             case "reset" -> applyDefaults();
             case "save" -> save();
             case "cancel" -> onClose();
@@ -232,12 +247,13 @@ public final class RecipeSenderConfigScreen extends Screen {
         }
     }
 
-    /** 把四个控件填回默认值；不写配置，等玩家点「保存」。 */
+    /** 把五个控件填回默认值；不写配置，等玩家点「保存」。 */
     private void applyDefaults() {
         distanceBox.setValue(String.valueOf(RecipeSenderConfig.DEFAULT_RECIPE_MANAGEMENT_DISTANCE));
         batchesBox.setValue(String.valueOf(RecipeSenderConfig.DEFAULT_MAX_BATCHES));
         chunkBox.setValue(String.valueOf(RecipeSenderConfig.DEFAULT_CHUNK_BATCHES));
         fluidDraft = RecipeSenderConfig.DEFAULT_FLUID_SUPPORT;
+        crossDimensionDraft = RecipeSenderConfig.DEFAULT_DIRECT_CROSS_DIMENSION;
         setStatus(Lang.message("text.recipe_sender.config_reset_done", "已填入默认值，点「保存」后生效"),
                 BoundUi.TEXT_DIM);
     }
@@ -274,6 +290,7 @@ public final class RecipeSenderConfigScreen extends Screen {
         RecipeSenderConfig.setMaxBatches(batches);
         RecipeSenderConfig.setChunkBatches(chunk);
         RecipeSenderConfig.setFluidSupport(fluidDraft);
+        RecipeSenderConfig.setDirectCrossDimension(crossDimensionDraft);
         setStatus(Lang.message("text.recipe_sender.config_saved",
                 "已保存到 config/recipe_sender-common.toml"), BoundUi.TAG_MASTER);
     }

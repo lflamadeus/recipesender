@@ -8,9 +8,11 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.chunk.LevelChunk;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 把 AABB 里的方块扫成候选池。
@@ -40,7 +42,12 @@ public final class BatchScanner {
                 && Math.abs(a.getZ() - b.getZ()) <= MAX_SIDE;
     }
 
-    /** 扫描两个角点之间的闭区间；未加载的区块直接跳过（不当作拒绝项）。 */
+    /**
+     * 扫描两个角点之间的闭区间；未加载的区块直接跳过（不当作拒绝项）。
+     *
+     * <p>按相交区块遍历已存在的方块实体表，不再逐格暴力扫描数万个空方块，大幅减少 BlockPos
+     * 临时对象分配与哈希查找开销。
+     */
     public static List<BatchCandidate> scan(Level level, ResourceLocation dimension, BlockPos a, BlockPos b) {
         int minX = Math.min(a.getX(), b.getX());
         int minY = Math.min(a.getY(), b.getY());
@@ -49,16 +56,30 @@ public final class BatchScanner {
         int maxY = Math.max(a.getY(), b.getY());
         int maxZ = Math.max(a.getZ(), b.getZ());
 
+        int minChunkX = minX >> 4;
+        int maxChunkX = maxX >> 4;
+        int minChunkZ = minZ >> 4;
+        int maxChunkZ = maxZ >> 4;
+
         List<BatchCandidate> found = new ArrayList<>();
-        for (int x = minX; x <= maxX; x++) {
-            for (int y = minY; y <= maxY; y++) {
-                for (int z = minZ; z <= maxZ; z++) {
-                    BlockPos pos = new BlockPos(x, y, z);
-                    if (!level.hasChunkAt(pos)) {
+        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
+                if (!level.hasChunk(chunkX, chunkZ)) {
+                    continue;
+                }
+                LevelChunk chunk = level.getChunk(chunkX, chunkZ);
+                if (chunk == null) {
+                    continue;
+                }
+                for (Map.Entry<BlockPos, BlockEntity> entry : chunk.getBlockEntities().entrySet()) {
+                    BlockPos pos = entry.getKey();
+                    if (pos.getX() < minX || pos.getX() > maxX
+                            || pos.getY() < minY || pos.getY() > maxY
+                            || pos.getZ() < minZ || pos.getZ() > maxZ) {
                         continue;
                     }
-                    BlockEntity blockEntity = level.getBlockEntity(pos);
-                    if (blockEntity == null) {
+                    BlockEntity blockEntity = entry.getValue();
+                    if (blockEntity == null || blockEntity.isRemoved()) {
                         continue;
                     }
                     BatchCandidate candidate = classify(level, dimension, pos, blockEntity);

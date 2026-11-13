@@ -1,16 +1,11 @@
 package com.lai.recipesender.service;
 
-import com.lai.recipesender.config.RecipeSenderConfig;
 import com.lai.recipesender.integration.findme.FindMeExtendedAdapter;
 import com.lai.recipesender.model.BoundContainer;
 import com.lai.recipesender.model.BoundStatus;
 import com.lai.recipesender.model.RecipeFluidSpec;
-import net.minecraft.core.BlockPos;
-import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.block.entity.BlockEntity;
-import net.minecraft.world.phys.Vec3;
 import net.minecraftforge.fluids.FluidStack;
 import net.minecraftforge.fluids.capability.IFluidHandler;
 import org.slf4j.Logger;
@@ -24,7 +19,8 @@ import java.util.List;
  *
  * <p>中枢是绑定系统里的一个独立用途（{@link BoundContainer.Kind#FLUID_HUB}），固定只有一个，
  * 不参与主 / 并列 / 从的分组，也不参与按类别自动路由——它是「源」，而现有绑定全是「目标」。
- * 位置解析与 {@link BoundTargetResolver} 同口径（维度、距离、区块、方块实体），
+ * 位置解析复用 {@link BoundTargetResolver#locate} 的前置判定，口径是
+ * {@link BoundTargetResolver.Mode#DIRECT}（不限距离、跨维度看配置），
  * 只把最后一步的能力判定从物品容器换成流体能力。
  */
 public final class FluidHubService {
@@ -54,32 +50,21 @@ public final class FluidHubService {
         return null;
     }
 
-    /** 解析中枢位置；任何一步不满足都返回带原因的失败结果，不抛异常。 */
+    /**
+     * 解析中枢位置；任何一步不满足都返回带原因的失败结果，不抛异常。
+     *
+     * <p>按<b>直达口径</b>解析（{@link BoundTargetResolver.Mode#DIRECT}）：中枢是「来源」，
+     * 只服务直达，玩家把中枢放在基地、人跑到别的维度去干活正是它的意义。所以这里不限距离，
+     * 跨维度由 {@code directCrossDimension} 决定——与落点用的是同一个开关，不会出现
+     * 「材料能跨维度送、流体不能」这种半通不通的状态。
+     */
     public static ResolvedHub resolve(ServerPlayer player, BoundContainer binding) {
-        if (player == null || binding == null) {
-            return new ResolvedHub(null, BoundStatus.FORBIDDEN);
+        BoundTargetResolver.Located located =
+                BoundTargetResolver.locate(player, binding, BoundTargetResolver.Mode.DIRECT);
+        if (located.level() == null) {
+            return new ResolvedHub(null, located.status());
         }
-        MinecraftServer server = player.getServer();
-        if (server == null) {
-            return new ResolvedHub(null, BoundStatus.FORBIDDEN);
-        }
-        if (!player.level().dimension().equals(binding.dimension())) {
-            return new ResolvedHub(null, BoundStatus.DIMENSION_MISMATCH);
-        }
-        ServerLevel level = server.getLevel(binding.dimension());
-        if (level == null) {
-            return new ResolvedHub(null, BoundStatus.DIMENSION_MISMATCH);
-        }
-        int distanceLimit = RecipeSenderConfig.recipeManagementDistance();
-        BlockPos pos = binding.pos();
-        if (distanceLimit >= 0
-                && player.distanceToSqr(Vec3.atCenterOf(pos)) > (double) distanceLimit * distanceLimit) {
-            return new ResolvedHub(null, BoundStatus.TOO_FAR);
-        }
-        if (!level.isLoaded(pos)) {
-            return new ResolvedHub(null, BoundStatus.CHUNK_UNLOADED);
-        }
-        BlockEntity blockEntity = level.getBlockEntity(pos);
+        BlockEntity blockEntity = located.level().getBlockEntity(binding.pos());
         if (blockEntity == null) {
             return new ResolvedHub(null, BoundStatus.MISSING);
         }

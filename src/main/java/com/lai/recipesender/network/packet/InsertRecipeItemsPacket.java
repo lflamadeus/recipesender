@@ -16,6 +16,8 @@ import java.util.function.Supplier;
 public record InsertRecipeItemsPacket(int containerId, List<ItemStack> requirements) {
     public static final int MAX_REQUIREMENTS = 128;
     public static final int MAX_ITEMS_PER_REQUIREMENT = 4096;
+    /** 分组数组的组数上限，与 {@code RecipeIngredientSpec.MAX_INGREDIENTS} 对齐。 */
+    public static final int MAX_GROUPS = 64;
 
     /** 编码正向材料投放请求。 */
     public static void encode(InsertRecipeItemsPacket packet, FriendlyByteBuf buffer) {
@@ -57,6 +59,42 @@ public record InsertRecipeItemsPacket(int containerId, List<ItemStack> requireme
             requirements.add(stack);
         }
         return requirements;
+    }
+
+    /**
+     * 写入「按配方输入分组」的材料表。
+     *
+     * <p>分组是发送端把同类材料的不同变体各发一个的前提：一份配方要两个电路板时，允许两种板
+     * 各一个。摊成一张平表以后「哪几个凑成一份」的信息就没了，发送端只能按物品逐堆除以份数，
+     * 多变体必然算不出一整份来。
+     *
+     * <p>组数有上限；组内仍用 {@link #writeRequirements} 编码，单组的堆数上限与旧接口一致。
+     */
+    public static void writeGroups(FriendlyByteBuf buffer, List<List<ItemStack>> groups) {
+        int size = Math.min(groups.size(), MAX_GROUPS);
+        buffer.writeVarInt(size);
+        for (int i = 0; i < size; i++) {
+            writeRequirements(buffer, groups.get(i));
+        }
+    }
+
+    /** 读取按配方输入分组的材料表。组数或总堆数超限直接抛异常，不按截断处理。 */
+    public static List<List<ItemStack>> readGroups(FriendlyByteBuf buffer) {
+        int size = buffer.readVarInt();
+        if (size < 0 || size > MAX_GROUPS) {
+            throw new IllegalArgumentException("Too many recipe requirement groups: " + size);
+        }
+        List<List<ItemStack>> groups = new ArrayList<>(size);
+        int total = 0;
+        for (int i = 0; i < size; i++) {
+            List<ItemStack> group = readRequirements(buffer);
+            total += group.size();
+            if (total > MAX_REQUIREMENTS) {
+                throw new IllegalArgumentException("Too many recipe requirements in groups: " + total);
+            }
+            groups.add(group);
+        }
+        return groups;
     }
 
     /** 解码正向材料投放请求。 */

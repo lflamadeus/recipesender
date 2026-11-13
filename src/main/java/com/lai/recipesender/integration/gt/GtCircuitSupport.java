@@ -986,8 +986,16 @@ public final class GtCircuitSupport {
         }
     }
 
+    private record MethodKey(Class<?> clazz, String name) {
+    }
+
+    private static final Map<MethodKey, Optional<Method>> PUBLIC_NO_ARG_CACHE = new ConcurrentHashMap<>();
+
     /**
      * 反射调用一个公开的无参方法，按公开方法表查找（含继承来的接口 default 方法）。
+     *
+     * <p>带静态二级缓存：{@code Class.getMethods()} 每次调用都会分配新数组，机器忙闲与电路每秒
+     * 轮询几十次方块，缓存后消除热路径上的反射分配开销。
      *
      * <p>与 {@link #invokeNoArg} 分开：后者只走类层次，找不到 {@code IRecipeLogicMachine} 这类
      * 接口 default 方法。两条通路互不影响，既有的鸭子类型判断不会被这次新增改到。
@@ -999,16 +1007,26 @@ public final class GtCircuitSupport {
         if (owner == null) {
             return null;
         }
+        Method method = PUBLIC_NO_ARG_CACHE.computeIfAbsent(
+                new MethodKey(owner.getClass(), name), key -> {
+                    try {
+                        for (Method m : key.clazz().getMethods()) {
+                            if (m.getName().equals(key.name()) && m.getParameterCount() == 0) {
+                                return Optional.of(m);
+                            }
+                        }
+                    } catch (SecurityException | LinkageError ignored) {
+                    }
+                    return Optional.empty();
+                }).orElse(null);
+        if (method == null) {
+            return null;
+        }
         try {
-            for (Method method : owner.getClass().getMethods()) {
-                if (method.getName().equals(name) && method.getParameterCount() == 0) {
-                    return method.invoke(owner);
-                }
-            }
+            return method.invoke(owner);
         } catch (ReflectiveOperationException | RuntimeException | LinkageError error) {
             return null;
         }
-        return null;
     }
 
     private static Method findNoArgMethod(Class<?> owner, String name) {

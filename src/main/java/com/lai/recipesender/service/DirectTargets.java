@@ -5,7 +5,9 @@ import com.lai.recipesender.integration.gt.MachineStateProbe;
 import com.lai.recipesender.model.BoundContainer;
 import com.lai.recipesender.model.MachineState;
 import net.minecraft.core.BlockPos;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraftforge.fluids.capability.IFluidHandler;
 import org.slf4j.Logger;
@@ -66,12 +68,15 @@ final class DirectTargets {
      * @param groupOverflow 组级从容器：整体模式下是整组的溢出缓冲，独立模式下为空
      * @param unified       整体模式
      * @param busy          整体模式下正在运行的成员，交给电路闸门判定
+     * @param positions     整组占据的坐标（统计与抽取时排除）
+     * @param dimension     整组所在的维度；落点全在同一维度，因为分组本身就按绑定记录分
      */
     record TargetSet(List<Member> members,
                      List<BoundTargetResolver.ResolvedTarget> groupOverflow,
                      boolean unified,
                      List<GroupCircuitGate.Member> busy,
-                     Set<BlockPos> positions) {
+                     Set<BlockPos> positions,
+                     ResourceKey<Level> dimension) {
 
         /** 这一次真正接料的成员。 */
         List<Member> active() {
@@ -117,6 +122,17 @@ final class DirectTargets {
         List<RemoteTransferPlanner.Target> groupOverflowSlots() {
             return slotsOf(groupOverflow);
         }
+
+        /**
+         * 整组占据的坐标，<b>仅当观察者与目标同维度时</b>才有意义。
+         *
+         * <p>这张表的用途是「别从落点里掏材料再放回去」。直达允许跨维度之后，目标坐标属于另一个
+         * 维度，拿它们去排除玩家周围的容器纯属误伤——两个维度里同坐标的箱子是两回事。
+         * 跨维度时本来也扫不到目标，返回空集既正确又省一次比对。
+         */
+        Set<BlockPos> positionsIn(ResourceKey<Level> viewer) {
+            return viewer != null && viewer.equals(dimension) ? positions : Set.of();
+        }
     }
 
     /**
@@ -133,27 +149,31 @@ final class DirectTargets {
      * <p>两种模式都只过滤主容器与并列成员：从容器是容量备份（通常是箱子），本来就没有配方逻辑。
      *
      * @param probeFluids 是否顺带探测流体能力；只有这一次真的要搬流体时才为真
+     * @param mode        解析口径：绑定发送传 {@link BoundTargetResolver.Mode#BOUND}（同维度 + 限距），
+     *                    直达传 {@link BoundTargetResolver.Mode#DIRECT}（不限距，跨维度看配置）。
+     *                    落点语义两条路径必须一致，差别只能由这个参数表达，不能在调用方各判一套。
      */
     static TargetSet resolve(ServerPlayer player, BoundGroupResolver.BoundGroup group,
-                             BoundTargetResolver.ResolvedTarget master, boolean probeFluids) {
+                             BoundTargetResolver.ResolvedTarget master, boolean probeFluids,
+                             BoundTargetResolver.Mode mode) {
         boolean unified = group.unified();
         List<Member> members = new ArrayList<>();
         List<GroupCircuitGate.Member> busy = new ArrayList<>();
-        members.add(member(player, group, group.master(), master, unified, probeFluids, busy));
+        members.add(member(player, group, group.master(), master, unified, probeFluids, busy, mode));
         for (BoundContainer parallel : group.parallels()) {
-            BoundTargetResolver.ResolvedTarget target = BoundTargetResolver.resolve(player, parallel);
+            BoundTargetResolver.ResolvedTarget target = BoundTargetResolver.resolve(player, parallel, mode);
             if (!target.available()) {
                 LOGGER.debug("并列成员「{}」当前不可用（{}），本次均分跳过", parallel.name(), target.status());
                 continue;
             }
-            members.add(member(player, group, parallel, target, unified, probeFluids, busy));
+            members.add(member(player, group, parallel, target, unified, probeFluids, busy, mode));
         }
         List<BoundTargetResolver.ResolvedTarget> groupOverflow = new ArrayList<>();
         // 组级从容器（挂在主容器下的那些）：整体模式下它们就是整组的溢出缓冲，材料由玩家自己
         // 铺的路径补进组内；独立模式下 effectiveSlaves() 返回空——那时每个成员的余量由它<b>自己</b>
         // 的从容器接住，组级从容器不再是落点。
         for (BoundContainer slave : group.effectiveSlaves()) {
-            BoundTargetResolver.ResolvedTarget target = BoundTargetResolver.resolve(player, slave);
+            BoundTargetResolver.ResolvedTarget target = BoundTargetResolver.resolve(player, slave, mode);
             if (!target.available()) {
                 LOGGER.debug("从容器「{}」当前不可用（{}），本次溢出跳过", slave.name(), target.status());
                 continue;
@@ -161,7 +181,7 @@ final class DirectTargets {
             groupOverflow.add(target);
         }
         return new TargetSet(List.copyOf(members), List.copyOf(groupOverflow),
-                unified, List.copyOf(busy), positionsOf(group));
+                unified, List.copyOf(busy), positionsOf(group), group.master().dimension());
     }
 
     /**
@@ -196,9 +216,10 @@ final class DirectTargets {
     private static Member member(ServerPlayer player, BoundGroupResolver.BoundGroup group,
                                  BoundContainer container, BoundTargetResolver.ResolvedTarget target,
                                  boolean unified, boolean probeFluids,
-                                 List<GroupCircuitGate.Member> busy) {
+                                 List<GroupCircuitGate.Member> busy,
+                                 BoundTargetResolver.Mode mode) {
         List<BoundTargetResolver.ResolvedTarget> ownOverflow =
-                ownOverflowOf(player, group, container);
+                ownOverflowOf(player, group, container, mode);
         boolean running = MachineStateProbe.stateOf(target.blockEntity()) == MachineState.BUSY;
         if (running && unified) {
             // 在忙也接料：记下来交给闸门判定电路，落点表里留着它。
@@ -224,10 +245,11 @@ final class DirectTargets {
      * <p>不可用的从容器直接跳过（记一条 debug 日志），不让一只没加载的箱子把整单拦下来。
      */
     private static List<BoundTargetResolver.ResolvedTarget> ownOverflowOf(
-            ServerPlayer player, BoundGroupResolver.BoundGroup group, BoundContainer member) {
+            ServerPlayer player, BoundGroupResolver.BoundGroup group, BoundContainer member,
+            BoundTargetResolver.Mode mode) {
         List<BoundTargetResolver.ResolvedTarget> targets = new ArrayList<>();
         for (BoundContainer slave : group.effectiveMemberSlaves(member)) {
-            BoundTargetResolver.ResolvedTarget target = BoundTargetResolver.resolve(player, slave);
+            BoundTargetResolver.ResolvedTarget target = BoundTargetResolver.resolve(player, slave, mode);
             if (!target.available()) {
                 LOGGER.debug("成员「{}」的从容器「{}」当前不可用（{}），本次跳过",
                         member.name(), slave.name(), target.status());

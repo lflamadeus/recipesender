@@ -198,7 +198,8 @@ final class RecipeMaterialCollector {
             return CollectionResult.failure("配方份数超出允许范围");
         }
         List<ItemStack> remaining = copyInventory(player);
-        List<ItemStack> requirements = new ArrayList<>();
+        List<List<ItemStack>> groups = new ArrayList<>();
+        int total = 0;
         List<EmiIngredient> inputs = recipe.getInputs();
         for (int index = 0; index < inputs.size(); index++) {
             EmiIngredient ingredient = inputs.get(index);
@@ -211,14 +212,25 @@ final class RecipeMaterialCollector {
                 return CollectionResult.failure("第 " + (index + 1) + " 项材料数量过大");
             }
             boolean wildcard = ingredient.getEmiStacks().size() > 1;
-            if (!consumeMatching(ingredient, remaining, (int) requested, wildcard, requirements)) {
+            // 一个配方输入自成一组，组内是这一项实际要从背包哪几堆里拿多少。分组必须一路带到
+            // 服务端：发送端只有按组拆份，才能像统计时那样把同标签的多变体当成可互换的同类
+            // （一份要两个电路板时允许两种板各一个）。摊成平表以后这个等价关系就丢了。
+            List<ItemStack> group = new ArrayList<>();
+            if (!consumeMatching(ingredient, remaining, (int) requested, wildcard, group)) {
                 return CollectionResult.failure("第 " + (index + 1) + " 项材料不足");
             }
+            total += group.size();
+            if (total > InsertRecipeItemsPacket.MAX_REQUIREMENTS) {
+                return CollectionResult.failure("配方材料过于零碎");
+            }
+            if (!group.isEmpty()) {
+                groups.add(List.copyOf(group));
+            }
         }
-        if (requirements.isEmpty()) {
+        if (groups.isEmpty()) {
             return CollectionResult.failure("配方没有可发送的物品输入");
         }
-        return CollectionResult.success(List.copyOf(requirements));
+        return CollectionResult.success(List.copyOf(groups));
     }
 
     /** 判断背包快照是否足够制作指定份数。 */
@@ -315,13 +327,36 @@ final class RecipeMaterialCollector {
         return remaining == 0;
     }
 
-    record CollectionResult(boolean success, List<ItemStack> requirements, String message) {
-        static CollectionResult success(List<ItemStack> requirements) {
-            return new CollectionResult(true, requirements, "");
+    /**
+     * 一次材料收集的结果。
+     *
+     * @param groups 每个配方输入一组材料：组内是同一输入下可互换的变体，数量是「这一项一共
+     *               要发多少」（= 每份用量 × 份数）
+     */
+    record CollectionResult(boolean success, List<List<ItemStack>> groups, String message) {
+        static CollectionResult success(List<List<ItemStack>> groups) {
+            return new CollectionResult(true, groups, "");
         }
 
         static CollectionResult failure(String message) {
             return new CollectionResult(false, List.of(), message);
+        }
+
+        /**
+         * 摊平并按物品合并成一张材料清单。
+         *
+         * <p>只关心「一共要多少」的地方用它：扣背包、按当前菜单投放、预演菜单能不能收下。
+         * 发送用 {@link #groups()}——「哪几个凑成一份」的信息只在分组里。
+         */
+        List<ItemStack> requirements() {
+            List<ItemStack> flat = new ArrayList<>();
+            for (List<ItemStack> group : groups) {
+                for (ItemStack stack : group) {
+                    // 组数上限已经在收集时校验过，这里的合并只减不增，不会撑破包上限。
+                    appendRequirement(flat, stack, stack.getCount());
+                }
+            }
+            return flat;
         }
     }
 }

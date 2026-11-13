@@ -37,6 +37,8 @@ public final class RecipeSenderConfig {
     public static final int DEFAULT_MAX_BATCHES = 8192;
     /** 流体支持的默认值：开（1.0.48 起默认打开，纯液体配方与含液体配方开箱即用）。 */
     public static final boolean DEFAULT_FLUID_SUPPORT = true;
+    /** 直达跨维度的默认值：开（直达本来就要求目标区块已加载，维度本身不是额外风险）。 */
+    public static final boolean DEFAULT_DIRECT_CROSS_DIMENSION = true;
     /** 单块份数的默认值。 */
     public static final int DEFAULT_CHUNK_BATCHES = 64;
     /** 单块份数的允许下限。 */
@@ -57,6 +59,7 @@ public final class RecipeSenderConfig {
     private static final ForgeConfigSpec.IntValue RECIPE_MANAGEMENT_DISTANCE;
     private static final ForgeConfigSpec.IntValue MAX_BATCHES;
     private static final ForgeConfigSpec.BooleanValue FLUID_SUPPORT;
+    private static final ForgeConfigSpec.BooleanValue DIRECT_CROSS_DIMENSION;
     private static final ForgeConfigSpec.IntValue CHUNK_BATCHES;
 
     /** 配置规格；由 {@link #register(ModLoadingContext)} 交给 Forge。 */
@@ -68,11 +71,14 @@ public final class RecipeSenderConfig {
 
         RECIPE_MANAGEMENT_DISTANCE = builder
                 .comment("配方管理距离（格），默认 128，-1 表示不限。",
-                        "它同时管住两个边界：",
-                        "1) 绑定发送与直达的目标上限——目标离玩家超过这个距离就不发送，",
+                        "它管住两个边界：",
+                        "1) 绑定发送的目标上限——目标离玩家超过这个距离就不发送，",
                         "   回执里会说「目标超出配方管理距离」；",
+                        "   直达模式（周围直达 / 中枢直达）不受它约束：直达只要求目标所在区块已加载，",
+                        "   距离多远都行，跨维度则由 directCrossDimension 决定。",
                         "2) 周围检索半径的上限——FindMeExtended 自己的搜索半径配置仍然生效，",
                         "   但会被这个值夹住（以前是代码里写死的 32 格）。",
+                        "   这一条对反转与直达都生效：两边取的都是「玩家周围」那片区域。",
                         "注意：周围检索是服务端逐区块遍历方块实体，半径 32 已经要扫约 25 个区块，",
                         "半径越大，每次统计（选择配方时每 10 tick 一次）的开销越大。")
                 .defineInRange("recipeManagementDistance", DEFAULT_RECIPE_MANAGEMENT_DISTANCE,
@@ -95,6 +101,16 @@ public final class RecipeSenderConfig {
                         "  纯液体配方因此无法发送。",
                         "反转与绑定发送始终只处理物品，不受这个开关影响。")
                 .define("fluidSupport", DEFAULT_FLUID_SUPPORT);
+
+        DIRECT_CROSS_DIMENSION = builder
+                .comment("直达是否允许跨维度，默认开启。",
+                        "开启时：直达（周围直达 / 中枢直达）可以把材料送进另一个维度的绑定容器，",
+                        "  物品中枢与流体中枢也按同样规则解析——它们和落点不必在同一个维度。",
+                        "  仍然要求目标所在区块已加载：本模组从不为了发送去加载区块。",
+                        "关闭时：直达与绑定发送一样，只认玩家当前维度的落点；",
+                        "  跨维度的绑定会回「目标不在当前维度」。",
+                        "绑定发送（按住绑定键按 Z）始终只认当前维度，不受这个开关影响。")
+                .define("directCrossDimension", DEFAULT_DIRECT_CROSS_DIMENSION);
 
         CHUNK_BATCHES = builder
                 .comment("单块份数，默认 64。",
@@ -137,6 +153,11 @@ public final class RecipeSenderConfig {
         return read(FLUID_SUPPORT, DEFAULT_FLUID_SUPPORT);
     }
 
+    /** 直达是否允许跨维度；绑定发送不受它影响。 */
+    public static boolean directCrossDimension() {
+        return read(DIRECT_CROSS_DIMENSION, DEFAULT_DIRECT_CROSS_DIMENSION);
+    }
+
     /** 单块份数：一次发送按这个粒度分块抽取与投放。 */
     public static int chunkBatches() {
         return read(CHUNK_BATCHES, DEFAULT_CHUNK_BATCHES);
@@ -175,6 +196,12 @@ public final class RecipeSenderConfig {
     /** 写入流体支持开关并落盘。 */
     public static void setFluidSupport(boolean enabled) {
         FLUID_SUPPORT.set(enabled);
+        persist();
+    }
+
+    /** 写入「直达允许跨维度」开关并落盘。 */
+    public static void setDirectCrossDimension(boolean allowed) {
+        DIRECT_CROSS_DIMENSION.set(allowed);
         persist();
     }
 

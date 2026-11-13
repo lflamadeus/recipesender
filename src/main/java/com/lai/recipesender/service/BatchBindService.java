@@ -62,9 +62,12 @@ public final class BatchBindService {
         }
 
         // 位置 → 现有绑定的 id，以及位置 → 本次计划里的角色：父容器的合法性全靠这两张表。
+        // 必须按维度过滤：同坐标在另一个维度是完全不同的方块，不能让别的维度的绑定把本维度的框选挡下来。
         Map<BlockPos, UUID> ids = new HashMap<>();
         for (BoundContainer existing : BoundContainerService.list(player)) {
-            ids.put(existing.pos(), existing.id());
+            if (dimension.equals(existing.dimension())) {
+                ids.put(existing.pos(), existing.id());
+            }
         }
         Map<BlockPos, BoundContainer.Role> roles = new HashMap<>();
 
@@ -89,7 +92,7 @@ public final class BatchBindService {
             created++;
         }
 
-        applyGroupMode(player, packet, roles);
+        applyGroupMode(player, packet, dimension, roles);
         BoundBindingService.sync(player);
         reply(player, packet, created, failures);
     }
@@ -141,6 +144,7 @@ public final class BatchBindService {
 
     /** 给新建的主容器套上建组模式。 */
     private static void applyGroupMode(ServerPlayer player, BatchBindPacket packet,
+                                       ResourceKey<Level> dimension,
                                        Map<BlockPos, BoundContainer.Role> roles) {
         if (packet.mode() == null || packet.mode() == BoundContainer.GroupMode.INDEPENDENT) {
             return;
@@ -150,7 +154,7 @@ public final class BatchBindService {
                 continue;
             }
             for (BoundContainer binding : BoundContainerService.list(player)) {
-                if (binding.pos().equals(entry.getKey())) {
+                if (binding.pos().equals(entry.getKey()) && dimension.equals(binding.dimension())) {
                     BoundContainerService.update(player, binding.withGroupMode(packet.mode()));
                     return;
                 }

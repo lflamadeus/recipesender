@@ -24,7 +24,7 @@ import org.lwjgl.glfw.GLFW;
  *       任何阶段都能用，改完立刻重算，不用退出重来。</li>
  *   <li><b>改池子</b>（绑定键没按）：Shift+右键 = 补一台，Shift+左键 = 移出一台。</li>
  * </ul>
- * 进入模式是「按住 Shift + 绑定键 + 左键（或右键）」；模式内 <b>回车</b> 直接提交，
+ * 进入模式是「按住 Shift + 绑定键 + 左键（或右键）」；模式内 <b>回车</b> 或 <b>鼠标中键</b> 直接提交，
  * <b>退出键</b>（默认 Backspace，可在控制设置里改）退出，ESC 也能退。
  *
  * <p>**模式不会因为松手而结束**，也不再靠「对着空气按绑定键」退出——那个判定看的是准星指着什么，
@@ -224,7 +224,19 @@ public final class BatchBindInput {
         }
     }
 
-    /** 左键定起点的兜底也挂在这里。 */
+    /** 鼠标中键（选取方块键）：BOX 阶段提交批量绑定，并阻止默认的选方块行为。 */
+    @SubscribeEvent
+    public static void onPickBlock(InputEvent.InteractionKeyMappingTriggered event) {
+        if (!event.isPickBlock() || !BatchSelection.active()) {
+            return;
+        }
+        if (BatchSelection.stage() == BatchSelection.Stage.BOX) {
+            event.setCanceled(true);
+            BatchSelection.submit();
+        }
+    }
+
+    /** 鼠标中键兜底提交（对空气点击时 pickBlock 不会触发 InteractionKeyMappingTriggered），以及左键定起点的兜底。 */
     @SubscribeEvent
     public static void onMouse(InputEvent.MouseButton.Post event) {
         Minecraft minecraft = Minecraft.getInstance();
@@ -233,6 +245,12 @@ public final class BatchBindInput {
         }
         if (event.getAction() != GLFW.GLFW_PRESS) {
             return;
+        }
+        if (event.getButton() == GLFW.GLFW_MOUSE_BUTTON_MIDDLE && BatchSelection.active()) {
+            if (BatchSelection.stage() == BatchSelection.Stage.BOX) {
+                BatchSelection.submit();
+                return;
+            }
         }
         if (event.getButton() == GLFW.GLFW_MOUSE_BUTTON_LEFT && !BatchSelection.active()
                 && minecraft.player.isShiftKeyDown() && RecipeSenderClient.isBoundSendKeyHeld()) {

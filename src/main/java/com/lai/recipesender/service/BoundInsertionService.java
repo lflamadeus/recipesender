@@ -43,7 +43,7 @@ public final class BoundInsertionService {
 
     /** 处理一次「发送到已绑定容器」请求。 */
     public static void insert(ServerPlayer player, InsertRecipeItemsToBoundPacket packet) {
-        if (player == null || packet == null || packet.requirements().isEmpty()) {
+        if (player == null || packet == null || packet.requirementGroups().isEmpty()) {
             return;
         }
         try {
@@ -66,7 +66,10 @@ public final class BoundInsertionService {
                 reply(player, packet, BoundStatus.FORBIDDEN, 0, 0, null);
                 return;
             }
-            List<ItemStack> requirements = InventoryDeduction.normalize(packet.requirements());
+            // 材料按配方输入分组送达：组内是同一输入下可互换的变体（格雷的同标签多种电路板）。
+            // 扣背包、全量模拟仍然用摊平后的清单，只是「哪几个凑成一份」这个信息要留给拆份。
+            List<List<ItemStack>> groups = packet.requirementGroups();
+            List<ItemStack> requirements = InventoryDeduction.normalize(MaterialBatches.flatten(groups));
             if (requirements.isEmpty()) {
                 reply(player, packet, BoundStatus.FORBIDDEN, 0, 0, null);
                 return;
@@ -83,7 +86,11 @@ public final class BoundInsertionService {
             // 落点集合：主容器 + 并列成员 + 各自的从容器 + 组级从容器，忙闲也在这一步探完。
             // 一台机器一行（{@link DirectTargets.Member}），跳过标记与自己的从容器都跟着它走，
             // 不再需要几张靠下标手工对齐的平行表。
-            DirectTargets.TargetSet targets = DirectTargets.resolve(player, group, master, false);
+            //
+            // 口径固定为 BOUND：绑定发送的材料在玩家背包里，人得走过去，所以保持「同维度 + 受配方
+            // 管理距离约束」。直达那条路传的是 DIRECT，两条路的放宽不能互相污染。
+            DirectTargets.TargetSet targets = DirectTargets.resolve(player, group, master, false,
+                    BoundTargetResolver.Mode.BOUND);
             List<DirectTargets.Member> placeMembers = targets.active();
             if (placeMembers.isEmpty()) {
                 // 独立模式下一台空闲机器都没有：一份都不投，电路也不动。这里刻意不走从容器（overflow）——
@@ -108,9 +115,12 @@ public final class BoundInsertionService {
             //
             // 整体模式调全组：空闲成员按本次电路写入，在忙成员刚刚已被闸门确认一致（写入是 no-op）。
             applyCircuits(DirectTargets.slots(placeMembers), packet.circuit(), packet.gregRecipe());
+            // 按输入项拆份：一份可以是「A 板 ×1 + B 板 ×1」，也可以是两块同样的板，只要组内
+            // 总量对得上。旧实现逐个物品除以份数，多变体每种的商都是 0，一份也拆不出来。
+            List<List<ItemStack>> batches = MaterialBatches.split(groups, packet.batches());
             RemoteTransferPlanner.Applied applied = RemoteTransferPlanner.applyBySharesDetailed(
                     DirectTargets.slots(placeMembers), DirectTargets.ownOverflows(placeMembers),
-                    targets.groupOverflowSlots(), requirements, packet.batches());
+                    targets.groupOverflowSlots(), batches);
             List<ItemStack> inserted = applied.inserted();
             if (inserted.isEmpty()) {
                 reply(player, packet, BoundStatus.OK, 0, 0,
@@ -129,7 +139,9 @@ public final class BoundInsertionService {
             for (BoundTargetResolver.ResolvedTarget target : targets.allResolved()) {
                 markChanged(target);
             }
-            int insertedBatches = countInsertedBatches(requirements, inserted, packet.batches());
+            // 只认「整份材料都落地」的份数：少一个电路板的半份不算送达，否则回执会把缺料
+            // 说成成功，玩家按显示的数字等配方却永远等不来产物。
+            int insertedBatches = applied.completeBatches();
             BoundDetail detail;
             if (insertedBatches >= packet.batches()) {
                 detail = null;
@@ -211,18 +223,6 @@ public final class BoundInsertionService {
         if (target.blockEntity() != null) {
             target.blockEntity().setChanged();
         }
-    }
-
-    /**
-     * 按「完整送达的份数」计数。
-     *
-     * <p>包内可见：直达模式每搬一块都要按同样的口径数一遍「这一块真正进了几份」。
-     * 实现已挪到 {@link RemoteTransferPlanner#countBatches}，好让投放路径内部折算
-     * 「溢出到从容器的份数」时用同一条口径，两处不会漂移。
-     */
-    static int countInsertedBatches(List<ItemStack> requirements, List<ItemStack> inserted,
-                                    int batches) {
-        return RemoteTransferPlanner.countBatches(requirements, inserted, batches);
     }
 
     /** 把结果回执给发起请求的玩家。 */

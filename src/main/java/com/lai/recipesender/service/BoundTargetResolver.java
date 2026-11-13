@@ -50,37 +50,90 @@ public final class BoundTargetResolver {
     private BoundTargetResolver() {
     }
 
-    /** 解析目标；任何一步不满足都返回带原因的失败结果，不抛异常。 */
-    public static ResolvedTarget resolve(ServerPlayer player, BoundContainer binding) {
+    /**
+     * 解析口径：同一个绑定在两条发送路径上的准入条件并不一样。
+     *
+     * <p>差别只有两处，但都是刻意的：
+     * <ul>
+     *   <li><b>距离</b>：绑定发送的材料在玩家背包里，人得走过去；直达的材料本来就从远处搬，
+     *       距离对它是纯粹的人为障碍，所以不判。</li>
+     *   <li><b>维度</b>：绑定发送必须同维度；直达由 {@link RecipeSenderConfig#directCrossDimension()}
+     *       决定，默认允许。</li>
+     * </ul>
+     *
+     * <p>两者共用「区块必须已加载」这一条——本模组从不为了发送去加载区块，跨维度也不例外。
+     */
+    public enum Mode {
+        /** 绑定发送：同维度 + 受配方管理距离约束。 */
+        BOUND,
+        /** 直达（周围直达 / 中枢直达，以及它们的中枢）：不限距离，跨维度看配置。 */
+        DIRECT
+    }
+
+    /**
+     * 「这个坐标能不能碰」的公共前置结果。
+     *
+     * @param level  可访问时是目标所在的服务端世界；不可访问时为 {@code null}
+     * @param status {@code level} 为 {@code null} 时说明原因
+     */
+    public record Located(ServerLevel level, BoundStatus status) {
+    }
+
+    /**
+     * 维度许可、世界存在、距离（仅 {@link Mode#BOUND}）、区块已加载——四条只读前置。
+     *
+     * <p>抽出来是因为物品与流体两侧都要走同一套判定：中枢的解析原本复制了一份，两处一旦漂移就会
+     * 出现「中枢能用、落点不能用」这类只有玩家才发现的怪现象。
+     */
+    public static Located locate(ServerPlayer player, BoundContainer binding, Mode mode) {
         if (player == null || binding == null) {
-            return new ResolvedTarget(null, null, BoundStatus.FORBIDDEN);
+            return new Located(null, BoundStatus.FORBIDDEN);
         }
         MinecraftServer server = player.getServer();
         if (server == null) {
-            return new ResolvedTarget(null, null, BoundStatus.FORBIDDEN);
+            return new Located(null, BoundStatus.FORBIDDEN);
         }
-        if (!player.level().dimension().equals(binding.dimension())) {
-            // 不做跨维度发送：材料在玩家背包里，目标在另一个维度时无法核对任何现场状态。
-            return new ResolvedTarget(null, null, BoundStatus.DIMENSION_MISMATCH);
+        boolean crossDimension = !player.level().dimension().equals(binding.dimension());
+        if (crossDimension && !(mode == Mode.DIRECT && RecipeSenderConfig.directCrossDimension())) {
+            // 绑定发送永远不做跨维度：材料在玩家背包里，目标在另一个维度时无法核对任何现场状态。
+            return new Located(null, BoundStatus.DIMENSION_MISMATCH);
         }
         ServerLevel level = server.getLevel(binding.dimension());
         if (level == null) {
-            return new ResolvedTarget(null, null, BoundStatus.DIMENSION_MISMATCH);
+            // 绑定记录指向一个已经不存在（或本存档没装）的维度。
+            return new Located(null, BoundStatus.DIMENSION_MISMATCH);
         }
-        int distanceLimit = RecipeSenderConfig.recipeManagementDistance();
-        if (distanceLimit >= 0
-                && player.distanceToSqr(Vec3.atCenterOf(binding.pos())) > (double) distanceLimit * distanceLimit) {
-            // 配方管理距离（默认 128 格，-1 表示不限）：先于区块判定，
-            // 因为「太远」比「区块没加载」更容易让玩家知道该怎么做。
-            return new ResolvedTarget(null, null, BoundStatus.TOO_FAR);
+        if (mode == Mode.BOUND) {
+            // 走到这里必然同维度（跨维度的 BOUND 上面已经返回），所以距离是有意义的。
+            // 先于区块判定：因为「太远」比「区块没加载」更容易让玩家知道该怎么做。
+            int distanceLimit = RecipeSenderConfig.recipeManagementDistance();
+            if (distanceLimit >= 0
+                    && player.distanceToSqr(Vec3.atCenterOf(binding.pos())) > (double) distanceLimit * distanceLimit) {
+                return new Located(null, BoundStatus.TOO_FAR);
+            }
         }
         if (!level.isLoaded(binding.pos())) {
-            // 只判断是否已加载，不为了发送强制加载区块。
-            return new ResolvedTarget(null, null, BoundStatus.CHUNK_UNLOADED);
+            // 只判断是否已加载，不为了发送强制加载区块。直达跨维度时这一条几乎必然生效：
+            // 另一个维度通常没有玩家，区块就是没加载的。
+            return new Located(null, BoundStatus.CHUNK_UNLOADED);
         }
-        BlockEntity blockEntity = level.getBlockEntity(binding.pos());
+        return new Located(level, BoundStatus.OK);
+    }
+
+    /** 解析目标（绑定发送口径）；任何一步不满足都返回带原因的失败结果，不抛异常。 */
+    public static ResolvedTarget resolve(ServerPlayer player, BoundContainer binding) {
+        return resolve(player, binding, Mode.BOUND);
+    }
+
+    /** 按指定口径解析目标；任何一步不满足都返回带原因的失败结果，不抛异常。 */
+    public static ResolvedTarget resolve(ServerPlayer player, BoundContainer binding, Mode mode) {
+        Located located = locate(player, binding, mode);
+        if (located.level() == null) {
+            return new ResolvedTarget(null, null, located.status());
+        }
+        BlockEntity blockEntity = located.level().getBlockEntity(binding.pos());
         if (blockEntity == null) {
-            return new ResolvedTarget(null, null, BoundStatus.MISSING);
+            return new ResolvedTarget(null, blockEntity, BoundStatus.MISSING);
         }
         IItemHandler handler = findItemHandler(blockEntity);
         if (handler == null) {

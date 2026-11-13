@@ -8,6 +8,7 @@ import com.lai.recipesender.model.RecipeFluidSpec;
 import com.lai.recipesender.model.RecipeIngredientSpec;
 import com.lai.recipesender.model.SourceScope;
 import com.lai.recipesender.network.ModNetwork;
+import com.lai.recipesender.network.packet.InsertRecipeItemsPacket;
 import com.lai.recipesender.network.packet.NearbyRecipeAvailabilityPacket;
 import com.lai.recipesender.network.packet.NearbyRecipePullPacket;
 import com.lai.recipesender.network.packet.NearbyRecipeQueryPacket;
@@ -93,8 +94,7 @@ public final class NearbyRecipeService {
      * 物品侧能支持几份，按取料范围分两条来源。
      *
      * <p>{@link SourceScope#NEARBY}：背包 + 周围容器（原来的行为，需要 FindMeExtended）。
-     * {@link SourceScope#HUB}：只数绑定的物品中枢，不扫世界、也不看背包——中枢直达的卖点就是
-     * 「只拿中枢里的东西」，把背包算进去会让显示份数与实际能搬的份数对不上。
+     * {@link SourceScope#HUB}：绑定的物品中枢 + 玩家背包（中枢优先，不足从背包补料；不扫周围世界容器）。
      */
     private static ItemSource itemSource(ServerPlayer player, NearbyRecipeQueryPacket packet) {
         List<RecipeIngredientSpec> ingredients = packet.ingredients();
@@ -108,12 +108,13 @@ public final class NearbyRecipeService {
                 return new ItemSource(0, BoundDetail.NO_ITEM_HUB);
             }
             if (ItemHubService.resolve(player).isEmpty()) {
-                // 绑了但此刻都不可用（维度不对、没加载、方块实体没了）。
+                // 绑了但此刻都不可用（没加载、方块实体没了）。维度不算问题：中枢与落点都按
+                // 直达口径解析，跨维度由 directCrossDimension 决定，与真正发送时同一个开关。
                 return new ItemSource(0, BoundDetail.NO_ITEM_HUB);
             }
             List<ItemStack> stacks = ItemHubService.contents(player, relevance(ingredients));
             int batches = countAvailable(ingredients,
-                    buildDirectSnapshot(List.of(), stacks));
+                    buildDirectSnapshot(player.getInventory().items, stacks));
             return batches < 1
                     ? new ItemSource(0, BoundDetail.HUB_SHORT)
                     : new ItemSource(batches, null);
@@ -148,7 +149,8 @@ public final class NearbyRecipeService {
             return new FluidSource(0, BoundDetail.NO_FLUID_HUB);
         }
         if (!FluidHubService.resolve(player, hub).available()) {
-            // 中枢绑了但此刻不可用（维度不对、没加载、方块实体没了）：对玩家来说等同于没绑。
+            // 中枢绑了但此刻不可用（没加载、方块实体没了）：对玩家来说等同于没绑。
+            // 维度同理不构成障碍，见 ItemHubService.resolve 的注释。
             return new FluidSource(0, BoundDetail.NO_FLUID_HUB);
         }
         int batches = FluidHubService.countBatches(fluids, FluidHubService.contents(player, hub));
@@ -311,6 +313,34 @@ public final class NearbyRecipeService {
         return -1;
     }
 
+    /**
+     * 把一种变体的取用数量累加进候选表，同一种物品只保留一项。
+     *
+     * <p>候选表要如实回答「每种变体这一项一共能取多少」：发送端靠它把一份材料摊到各份，
+     * 数量虚报会少抽料，数量少报则会多抽。超过单堆上限直接判失败——配方一项的数量本来就
+     * 不该到这个量级，真到了说明包被伪造或配置失控，宁可不发。
+     */
+    private static boolean addCandidate(List<ItemStack> candidates, ItemStack stack, int used) {
+        if (used <= 0) {
+            return true;
+        }
+        int existing = indexOfSameItem(candidates, stack);
+        if (existing < 0) {
+            if (used > InsertRecipeItemsPacket.MAX_ITEMS_PER_REQUIREMENT) {
+                return false;
+            }
+            candidates.add(stack.copyWithCount(used));
+            return true;
+        }
+        ItemStack candidate = candidates.get(existing);
+        int total = candidate.getCount() + used;
+        if (total > InsertRecipeItemsPacket.MAX_ITEMS_PER_REQUIREMENT) {
+            return false;
+        }
+        candidate.setCount(total);
+        return true;
+    }
+
     /** 使用二分查找快速计算最大可制作份数。 */
     private static int countAvailable(List<RecipeIngredientSpec> ingredients, StockSnapshot snapshot) {
         int lower = 0;
@@ -362,10 +392,12 @@ public final class NearbyRecipeService {
                 if (!stock.nearby()) {
                     continue;
                 }
-                // 同一种物品分散在多个容器里时只记一个候选，取回时按剩余需求逐个尝试。
-                if (candidates.stream().noneMatch(candidate ->
-                        ItemStack.isSameItemSameTags(candidate, stock.stack()))) {
-                    candidates.add(stock.stack().copyWithCount(1));
+                // 候选要带上「这一项一共从这种变体取多少」，不能只记一个样本。发送端按候选的
+                // 数量把一项材料摊到各份里去：格雷的同标签多变体（多种 LV 电路板）只有分摊到
+                // 具体变体上才抽得出来，压到单一候选上就会「份数算得出来、料却凑不齐」。
+                // 同一种变体分散在多个容器时累加到同一项，抽料时只扫一遍搜索范围。
+                if (!addCandidate(candidates, stock.stack(), used)) {
+                    return PullPlan.failure();
                 }
             }
             if (remaining != 0) {
@@ -490,10 +522,12 @@ public final class NearbyRecipeService {
     /**
      * 直达模式一次投放的规划结果。
      *
-     * @param batches      按背包与周围容器的并集算出来的、这一次真正搬得动的份数
-     * @param requirements 每项材料的具体物品堆，数量 = 每份用量 × {@code batches}
+     * @param batches 按背包与周围容器的并集算出来的、这一次真正搬得动的份数
+     * @param groups  一个配方输入一组材料，组内是同一输入下可互换的变体，各自数量是「这一项一共
+     *                从它取多少」；每组总量 = 每份用量 × {@code batches}。发送端按组拆份，
+     *                这样才能把「两个电路板」拆成两种不同的板
      */
-    public record DirectPlan(int batches, List<ItemStack> requirements) {
+    public record DirectPlan(int batches, List<List<ItemStack>> groups) {
     }
 
     /**
@@ -501,8 +535,12 @@ public final class NearbyRecipeService {
      *
      * <p>来源是玩家背包（含快捷栏）与周围容器的<b>并集</b>，份数用 {@link #countAvailable} 算，
      * 与反转模式共用同一套「匹配的容器按存量从多到少消耗」语义，保证显示给玩家的数字和真搬得动的
-     * 数字一致。材料清单取每项里存量最多的候选（{@code candidates} 已按存量降序排列），并把同种
-     * 物品合并——配方把一种材料拆成两格很常见，合并后抽料只扫一遍搜索范围。
+     * 数字一致。
+     *
+     * <p>材料按<b>配方输入</b>分组返回，而不是摊成一张平表：同一个输入下的多种变体（格雷的同标签
+     * 电路板就是）在配方眼里完全等价，一份要两个板时允许两种板各一个。旧实现把整项数量压到存量
+     * 最多的那个候选上，其余候选直接丢掉——统计认可这种等价关系、发送却不认可，于是出现
+     * 「算得出 B 份、抽料凑不齐」的错位。
      *
      * @param inventoryItems 玩家背包与快捷栏的物品
      * @param nearbyStacks   周围容器里的物品堆
@@ -532,17 +570,11 @@ public final class NearbyRecipeService {
         if (!plan.success()) {
             return new DirectPlan(0, List.of());
         }
-        List<ItemStack> requirements = new ArrayList<>();
+        List<List<ItemStack>> groups = new ArrayList<>(plan.items().size());
         for (ItemPlan item : plan.items()) {
-            ItemStack candidate = item.candidates().get(0);
-            int existing = indexOfSameItem(requirements, candidate);
-            if (existing < 0) {
-                requirements.add(candidate.copyWithCount(item.amount));
-            } else {
-                requirements.get(existing).grow(item.amount);
-            }
+            groups.add(item.candidates());
         }
-        return new DirectPlan(batches, List.copyOf(requirements));
+        return new DirectPlan(batches, List.copyOf(groups));
     }
 
     /** 校验配方输入数量和每项材料描述。 */
@@ -602,9 +634,9 @@ public final class NearbyRecipeService {
     /**
      * 一项材料的取回计划。
      * <p>
-     * {@code candidates} 是同一个配方输入下所有「确实在附近、且能满足配方」的物品样本，
-     * 按存量从多到少排列；{@code amount} 是这一项总共要取回的数量。取回时从头顺位尝试，
-     * 前面几个取不出来就换下一个——通配符配方本来就允许这样换。
+     * {@code candidates} 是同一个配方输入下所有「确实取得到、且能满足配方」的变体，各自带着
+     * 这一项要从它那里取走的数量，并按存量从多到少排列；{@code amount} 是这一项总共要取回的
+     * 数量。取回时从头顺位尝试，前面几个取不出来就换下一个——通配符配方本来就允许这样换。
      */
     private static final class ItemPlan {
         private final List<ItemStack> candidates;

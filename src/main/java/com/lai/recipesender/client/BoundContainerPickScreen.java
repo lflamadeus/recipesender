@@ -49,14 +49,14 @@ class BoundContainerPickScreen extends Screen {
 
     private final Screen parent;
     private final List<BoundContainer> candidates;
-    private final List<ItemStack> requirements;
+    private final List<List<ItemStack>> requirementGroups;
     private final int batches;
 
     /**
      * 直达形态的配方输入描述；非 {@code null} 时本弹窗只负责挑目标。
      *
      * <p>直达的材料由服务端按 {@link #scope} 现场抽取，客户端手里没有（也不该有）物品堆清单，
-     * 所以 {@link #requirements} 在直达形态下是空的，确认时改发
+     * 所以 {@link #requirementGroups} 在直达形态下是空的，确认时改发
      * {@link RecipeSenderClient#sendDirectInsert}。为 {@code null} 时（绑定发送）行为与过去完全一致。
      */
     private final List<RecipeIngredientSpec> directSpecs;
@@ -105,13 +105,14 @@ class BoundContainerPickScreen extends Screen {
     private int listHeight;
     private boolean hasSearch;
 
-    BoundContainerPickScreen(Screen parent, List<BoundContainer> candidates, List<ItemStack> requirements,
+    BoundContainerPickScreen(Screen parent, List<BoundContainer> candidates,
+                             List<List<ItemStack>> requirementGroups,
                              int batches, ResourceLocation routeKey, List<RecipeIngredientSpec> directSpecs,
                              List<RecipeFluidSpec> fluidSpecs, SourceScope scope) {
         super(Component.translatable("text.recipe_sender.pick_title"));
         this.parent = parent;
         this.candidates = List.copyOf(candidates);
-        this.requirements = List.copyOf(requirements);
+        this.requirementGroups = List.copyOf(requirementGroups);
         this.batches = batches;
         this.directSpecs = directSpecs == null ? null : List.copyOf(directSpecs);
         this.fluidSpecs = fluidSpecs == null ? List.of() : List.copyOf(fluidSpecs);
@@ -514,7 +515,7 @@ class BoundContainerPickScreen extends Screen {
             // 因此不能走 sendBoundInsert（那条要求客户端先备好物品清单）。
             RecipeSenderClient.sendDirectInsert(binding.id(), directSpecs, fluidSpecs, batches, scope);
         } else {
-            RecipeSenderClient.sendBoundInsert(binding.id(), requirements, batches);
+            RecipeSenderClient.sendBoundInsert(binding.id(), requirementGroups, batches);
         }
         onClose();
     }

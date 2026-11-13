@@ -6,6 +6,8 @@ import com.lai.recipesender.model.BoundContainer;
 import com.lai.recipesender.model.MachineState;
 import com.lai.recipesender.network.ModNetwork;
 import com.lai.recipesender.network.packet.MachineStatusPacket;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraftforge.network.PacketDistributor;
@@ -37,7 +39,7 @@ public final class MachineStatusService {
         for (BoundContainer binding : bindings) {
             BlockEntity blockEntity = loadedBlockEntity(player, binding);
             if (blockEntity == null) {
-                // 跨维度、区块没加载、方块实体没了：连「是不是机器」都谈不上。这些情况由客户端
+                // 维度不存在、区块没加载、方块实体没了：连「是不是机器」都谈不上。这些情况由客户端
                 // 自己的存活性判定显示，这里不发条目，免得一行上出现两个互相打架的标签。
                 continue;
             }
@@ -63,16 +65,21 @@ public final class MachineStatusService {
      * 取绑定坐标上的方块实体；<b>绝不触发区块加载</b>。
      *
      * <p>{@code Level.getBlockEntity} 会把没加载的区块读进来。管理界面每秒问一次、一次几十个坐标，
-     * 隔着几百格刷上一会儿就能把服务端拖进磁盘 IO。所以先判维度、再判 {@code isLoaded}——
-     * 与 {@code BoundTargetResolver.resolve}、客户端 {@code BoundLiveness} 是同一条纪律。
+     * 隔着几百格刷上一会儿就能把服务端拖进磁盘 IO。所以先取绑定自己的维度、再判 {@code isLoaded}
+     * ——与 {@code BoundTargetResolver.locate}、客户端 {@code BoundLiveness} 是同一条纪律。
+     *
+     * <p>取的是<b>绑定自己的维度</b>而不是玩家所在维度：直达允许跨维度之后，别的维度的绑定
+     * 同样需要显示忙闲与电路。这里只读已加载的区块，跨维度也不会造成额外加载。
      */
     private static BlockEntity loadedBlockEntity(ServerPlayer player, BoundContainer binding) {
-        if (!player.level().dimension().equals(binding.dimension())) {
+        MinecraftServer server = player.getServer();
+        if (server == null) {
             return null;
         }
-        if (!player.level().isLoaded(binding.pos())) {
+        ServerLevel level = server.getLevel(binding.dimension());
+        if (level == null || !level.isLoaded(binding.pos())) {
             return null;
         }
-        return player.level().getBlockEntity(binding.pos());
+        return level.getBlockEntity(binding.pos());
     }
 }

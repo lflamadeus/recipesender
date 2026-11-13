@@ -1,5 +1,6 @@
 package com.lai.recipesender.integration.findme;
 
+import com.lai.recipesender.api.ItemMatchMode;
 import com.lai.recipesender.config.RecipeSenderConfig;
 import com.lai.recipesender.model.RecipeFluidSpec;
 import net.minecraft.core.BlockPos;
@@ -251,9 +252,30 @@ public final class FindMeExtendedAdapter {
                 continue;
             }
             pulled[index] = reflection.pull(containers, player,
-                    requirement.copyWithCount(1), requirement.getCount());
+                    requirement.copyWithCount(1), requirement.getCount(), false);
         }
         return pulled;
+    }
+
+    /**
+     * 把指定容器里的材料直接送进玩家背包，返回实际送达的数量。
+     *
+     * <p>与 {@link #pullAll} 走的是完全同一条提取链路（先本模组的 AE2 通路，再交给 FindMeExtended
+     * 的提取器），区别只在于容器由调用方指定。GTO 物品保险库这类存储只认自己给出的 AE 键，
+     * 通用反射通路抽不到时，这条链路依然有效——Recipe Sender 自己发配方用的就是它。
+     *
+     * <p>这里<b>不问保护门</b>：容器是玩家自己绑定成物品中枢的，绑定即授权；而那道具名右键的
+     * 探测会被保护模组或方块自身的右键处理取消，让一次合法取回静默变成 0（见
+     * {@code extractFromAe2Storage} 的 {@code trustBoundTarget}）。
+     */
+    public static int pullToPlayer(ServerPlayer player, List<BlockEntity> containers,
+                                   ItemStack requirement, int wanted) {
+        ReflectionAccess reflection = getAccess();
+        if (reflection == null || player == null || requirement == null || requirement.isEmpty()
+                || wanted <= 0 || containers == null || containers.isEmpty()) {
+            return 0;
+        }
+        return reflection.pull(containers, player, requirement.copyWithCount(1), wanted, true);
     }
 
     /**
@@ -280,6 +302,26 @@ public final class FindMeExtendedAdapter {
                 InteractionHand.MAIN_HAND, pos,
                 new BlockHitResult(new Vec3(0, 0, 0), Direction.UP, pos, false));
         return !MinecraftForge.EVENT_BUS.post(event);
+    }
+
+    /**
+     * 诊断用：描述一个中枢容器对某条需求的供料能力（只读，不抽取、不插回）。
+     * <p>
+     * 返回的文本会原样进入放置报告与 {@code /gtoblueprint hubcheck}：先 AE2 存储视图
+     * （键数、匹配数、首个匹配键及其标签），再 Forge 槽位（格数、匹配格数），最后是保护门判定。
+     * 目的只有一个：把「统计有、抽不到」拆成可分辨的三段——存储里根本没有 / 有但键对不上 /
+     * 对得上但被保护模组拦下。
+     */
+    public static String describeSupply(BlockEntity blockEntity, ItemStack requirement, ItemMatchMode mode,
+                                        ServerPlayer player) {
+        if (blockEntity == null) {
+            return "方块实体为空";
+        }
+        ReflectionAccess reflection = getAccess();
+        if (reflection == null) {
+            return "FindMeExtended 反射通路不可用（未安装或版本不匹配）";
+        }
+        return reflection.describeSupply(blockEntity, requirement, mode, player);
     }
 
     /**
@@ -482,9 +524,28 @@ public final class FindMeExtendedAdapter {
                 continue;
             }
             pulled[index] = reflection.extractTo(alive, player,
-                    requirement.copyWithCount(1), requirement.getCount(), output);
+                    requirement.copyWithCount(1), requirement.getCount(), output, true);
         }
         return pulled;
+    }
+
+    /**
+     * 尝试将物品存入方块实体的 AE2 存储视图（如 GTO 物品保险库、ME 接口、ME 驱动器等）。
+     *
+     * @param blockEntity 目标方块实体
+     * @param player      操作玩家（可为 null）
+     * @param stack       待存入的物品
+     * @return 存入后剩余的物品（全部存入返回 ItemStack.EMPTY）
+     */
+    public static ItemStack insertToAe2Storage(BlockEntity blockEntity, ServerPlayer player, ItemStack stack) {
+        if (stack == null || stack.isEmpty() || blockEntity == null || blockEntity.isRemoved()) {
+            return stack == null ? ItemStack.EMPTY : stack;
+        }
+        ReflectionAccess reflection = getAccess();
+        if (reflection == null) {
+            return stack;
+        }
+        return reflection.insertToAe2Storage(blockEntity, player, stack);
     }
 
     /**
@@ -595,7 +656,10 @@ public final class FindMeExtendedAdapter {
             Class<?> ae2NetworkStorageClass,
             Method ae2ExtractMethod,
             Object ae2ActionableModulate,
-            Method ae2ActionSourceOfPlayer) {
+            Method ae2ActionSourceOfPlayer,
+            Method ae2InsertMethod,
+            Method ae2ItemKeyOfMethod,
+            Method ae2ActionSourceEmptyMethod) {
 
         /** 创建 FindMeExtended、Forge capability 和 AE2 API 的反射访问器。 */
         private static ReflectionAccess create() throws ReflectiveOperationException {
@@ -615,7 +679,7 @@ public final class FindMeExtendedAdapter {
             if (!ModList.get().isLoaded(AE2_ID)) {
                 return new ReflectionAccess(common, radius, extractorList, pull,
                         null, null, null, null, null, null, null, null, null, null, null, null, null,
-                        null, null);
+                        null, null, null, null, null);
             }
 
             try {
@@ -653,11 +717,14 @@ public final class FindMeExtendedAdapter {
                     LOGGER.warn("未找到 appeng.me.storage.NetworkStorage，无法识别 AE 网络聚合视图");
                 }
 
-                // 主动取回（见 extractFromAe2Storage）也只是 FindMeExtended 提取器之外的
-                // 一条补充通路，同样单独解析：解析不了就只关掉它自己，快照与去重照常工作。
+                // 主动存取（取回与放回）是 FindMeExtended 提取器之外的补充通路，
+                // 单独解析：解析不了就只关掉主动存取，快照与去重照常工作。
                 Method extractMethod = null;
                 Object actionableModulate = null;
                 Method actionSourceOfPlayer = null;
+                Method insertMethod = null;
+                Method itemKeyOfMethod = null;
+                Method actionSourceEmpty = null;
                 try {
                     Class<?> aeKeyClass = Class.forName("appeng.api.stacks.AEKey");
                     Class<?> actionableClass = Class.forName("appeng.api.config.Actionable");
@@ -666,22 +733,27 @@ public final class FindMeExtendedAdapter {
                             "appeng.api.networking.security.IActionSource");
                     actionSourceOfPlayer = actionSourceClass.getMethod("ofPlayer",
                             net.minecraft.world.entity.player.Player.class);
+                    actionSourceEmpty = actionSourceClass.getMethod("empty");
                     extractMethod = storageClass.getMethod("extract", aeKeyClass, long.class,
                             actionableClass, actionSourceClass);
+                    insertMethod = storageClass.getMethod("insert", aeKeyClass, long.class,
+                            actionableClass, actionSourceClass);
+                    itemKeyOfMethod = itemKeyClass.getMethod("of", ItemStack.class);
                 } catch (ReflectiveOperationException | RuntimeException exception) {
-                    LOGGER.warn("AE2 主动取回接口不兼容，将只使用 FindMeExtended 的提取器", exception);
+                    LOGGER.warn("AE2 主动存取接口不兼容，将只使用 FindMeExtended 的提取器与 Forge 物品处理器", exception);
                 }
 
                 return new ReflectionAccess(common, radius, extractorList, pull, getCapability,
                         storageCapability, storageContents, itemKeyClass, toStack,
                         fluidKeyClass, fluidToStack,
                         chestOrDriveClass, isPowered, cellCount, cellInventory, networkStorageClass,
-                        extractMethod, actionableModulate, actionSourceOfPlayer);
+                        extractMethod, actionableModulate, actionSourceOfPlayer,
+                        insertMethod, itemKeyOfMethod, actionSourceEmpty);
             } catch (ReflectiveOperationException exception) {
                 LOGGER.warn("AE2 API 不兼容，将仅使用 FindMeExtended 的普通容器支持", exception);
                 return new ReflectionAccess(common, radius, extractorList, pull,
                         null, null, null, null, null, null, null, null, null, null, null, null, null,
-                        null, null);
+                        null, null, null, null, null);
             }
         }
 
@@ -892,7 +964,8 @@ public final class FindMeExtendedAdapter {
         }
 
         /** 在已收集的方块实体中提取指定材料，隔离单个提取器的异常。 */
-        private int pull(List<BlockEntity> containers, ServerPlayer player, ItemStack stack, int amount) {
+        private int pull(List<BlockEntity> containers, ServerPlayer player, ItemStack stack, int amount,
+                         boolean trustBoundTarget) {
             int extracted = 0;
             List<?> extractorSnapshot = List.copyOf(extractors);
             for (BlockEntity blockEntity : containers) {
@@ -901,7 +974,7 @@ public final class FindMeExtendedAdapter {
                 }
                 // 先试自己这条 AE2 通路，再交给 FindMeExtended 的提取器。
                 int fromAe2 = extractFromAe2Storage(blockEntity, player, stack, amount - extracted,
-                        taken -> ItemHandlerHelper.giveItemToPlayer(player, taken));
+                        taken -> ItemHandlerHelper.giveItemToPlayer(player, taken), trustBoundTarget);
                 if (fromAe2 > 0) {
                     extracted = Math.min(amount, extracted + fromAe2);
                     if (extracted >= amount) {
@@ -940,23 +1013,22 @@ public final class FindMeExtendedAdapter {
          * 匹配优先按「物品 + NBT 完全相同」，整个存储里都没有时才退回「同一种物品」。
          * 退回是有意的：配方只认物品本身（通配符输入更是如此），而 AE 侧的键可能带或不带 NBT，
          * 为了这个差异把材料判定成取不回来并不合理。
+         * <p>
+         * {@code trustBoundTarget} 为 {@code true} 时跳过保护门：这条路径的目标是玩家自己绑定
+         * 的物品中枢，绑定即授权，再去伪造右键问一遍「能不能开这个方块」既多余又会误伤——
+         * 保护类模组取消那个假事件、或者方块自己处理右键时，都会让一次合法的抽取静默变成 0。
+         * AE2 的权限由 {@code MEStorage.extract} 的 {@code ActionSource} 自己把关。
          */
         private int extractFromAe2Storage(BlockEntity blockEntity, ServerPlayer player,
                                           ItemStack requirement, int amount,
-                                          Consumer<ItemStack> sink) {
+                                          Consumer<ItemStack> sink, boolean trustBoundTarget) {
             if (ae2ExtractMethod == null || ae2ActionableModulate == null
                     || ae2ActionSourceOfPlayer == null || getCapabilityMethod == null
                     || ae2StorageCapability == null || amount <= 0 || requirement.isEmpty()) {
                 return 0;
             }
             try {
-                Object capability = getCapabilityMethod.invoke(blockEntity,
-                        ae2StorageCapability, null);
-                if (capability == null) {
-                    return 0;
-                }
-                Object storage = capability.getClass().getMethod("orElse", Object.class)
-                        .invoke(capability, new Object[]{null});
+                Object storage = storageOf(blockEntity);
                 if (storage == null) {
                     return 0;
                 }
@@ -987,22 +1059,23 @@ public final class FindMeExtendedAdapter {
                     if (keyStack.isEmpty()) {
                         continue;
                     }
-                    if (ItemStack.isSameItemSameTags(keyStack, requirement)) {
+                    if (ItemMatchMode.EXACT.matches(keyStack, requirement)) {
                         if (allowed == null) {
-                            allowed = canInteract(player, blockEntity);
+                            allowed = trustBoundTarget || canInteract(player, blockEntity);
                         }
                         if (!allowed) {
                             // 保护模组拦下了这个容器（领地、锁箱之类）：一次都不抽，也不再试别的键。
+                            LOGGER.debug("保护门拦下 {}，跳过 AE2 抽取", blockEntity.getBlockPos());
                             return 0;
                         }
                         pulled += extractKey(storage, key, actionSource, amount - pulled, sink);
-                    } else if (looseKey == null && ItemStack.isSameItem(keyStack, requirement)) {
+                    } else if (looseKey == null && ItemMatchMode.IGNORE_NBT.matches(keyStack, requirement)) {
                         looseKey = key;
                     }
                 }
                 if (pulled < amount && looseKey != null) {
                     if (allowed == null) {
-                        allowed = canInteract(player, blockEntity);
+                        allowed = trustBoundTarget || canInteract(player, blockEntity);
                     }
                     if (allowed) {
                         pulled += extractKey(storage, looseKey, actionSource, amount - pulled, sink);
@@ -1013,6 +1086,94 @@ public final class FindMeExtendedAdapter {
                 LOGGER.debug("从 AE2 存储 {} 主动取回失败", blockEntity.getBlockPos(), exception);
                 return 0;
             }
+        }
+
+        /**
+         * 取方块实体的 AE2 存储视图；没有这个能力或反射通道不可用时返回 {@code null}。
+         * <p>
+         * 抽取、存入、诊断三处都要做同一步 {@code getCapability(...).orElse(null)}，
+         * 收在这里避免各抄一遍。
+         */
+        private Object storageOf(BlockEntity blockEntity) {
+            if (getCapabilityMethod == null || ae2StorageCapability == null) {
+                return null;
+            }
+            try {
+                Object capability = getCapabilityMethod.invoke(blockEntity, ae2StorageCapability, null);
+                if (capability == null) {
+                    return null;
+                }
+                return capability.getClass().getMethod("orElse", Object.class)
+                        .invoke(capability, new Object[]{null});
+            } catch (ReflectiveOperationException | RuntimeException exception) {
+                return null;
+            }
+        }
+
+        /** 诊断：把「AE 存储 / 物品槽 / 保护门」三段拼成一行。只读，不抽取。 */
+        private String describeSupply(BlockEntity blockEntity, ItemStack requirement, ItemMatchMode mode,
+                                      ServerPlayer player) {
+            ItemMatchMode effective = mode == null ? ItemMatchMode.EXACT : mode;
+            String gate = player == null ? "保护门=未判定"
+                    : "保护门=" + (canInteract(player, blockEntity) ? "可交互" : "被拦截")
+                    + "(仅限制自动扫描，不拦中枢抽取)";
+            return describeAe(blockEntity, requirement, effective)
+                    + "，" + describeSlots(blockEntity, requirement, effective)
+                    + "，" + gate;
+        }
+
+        private String describeAe(BlockEntity blockEntity, ItemStack requirement, ItemMatchMode mode) {
+            Object storage = storageOf(blockEntity);
+            if (storage == null || storageContentsMethod == null) {
+                return "AE存储=无";
+            }
+            try {
+                Object keyCounter = storageContentsMethod.invoke(storage);
+                if (!(keyCounter instanceof Iterable<?> entries)) {
+                    return "AE存储=有(内容不可读)";
+                }
+                int keys = 0;
+                int matched = 0;
+                String first = null;
+                for (Object entry : entries) {
+                    if (!(entry instanceof Map.Entry<?, ?> mapEntry)) {
+                        continue;
+                    }
+                    Object key = mapEntry.getKey();
+                    if (!ae2ItemKeyClass.isInstance(key)) {
+                        continue;
+                    }
+                    keys++;
+                    ItemStack keyStack = toStack(key, 1);
+                    if (keyStack.isEmpty() || !mode.matches(keyStack, requirement)) {
+                        continue;
+                    }
+                    matched++;
+                    if (first == null) {
+                        first = keyStack.getHoverName().getString() + (keyStack.hasTag() ? " 带NBT" : " 无NBT");
+                    }
+                }
+                return "AE存储=有(键 " + keys + "，匹配 " + matched
+                        + (first == null ? "" : "，首个 " + first) + ")";
+            } catch (ReflectiveOperationException | RuntimeException exception) {
+                return "AE存储=有(读取异常 " + exception.getClass().getSimpleName() + ")";
+            }
+        }
+
+        private String describeSlots(BlockEntity blockEntity, ItemStack requirement, ItemMatchMode mode) {
+            IItemHandler itemHandler = blockEntity
+                    .getCapability(ForgeCapabilities.ITEM_HANDLER, null).orElse(null);
+            if (itemHandler == null) {
+                return "物品槽=无";
+            }
+            int matched = 0;
+            for (int slot = 0; slot < itemHandler.getSlots(); slot++) {
+                ItemStack inSlot = itemHandler.getStackInSlot(slot);
+                if (!inSlot.isEmpty() && mode.matches(inSlot, requirement)) {
+                    matched++;
+                }
+            }
+            return "物品槽=" + itemHandler.getSlots() + "格(匹配 " + matched + ")";
         }
 
         /**
@@ -1042,6 +1203,50 @@ public final class FindMeExtendedAdapter {
         }
 
         /**
+         * 尝试向方块实体的 AE2 存储存入物品。
+         *
+         * @return 存入后剩余的物品（全部存入返回 ItemStack.EMPTY）
+         */
+        private ItemStack insertToAe2Storage(BlockEntity blockEntity, ServerPlayer player, ItemStack stack) {
+            if (ae2InsertMethod == null || ae2ItemKeyOfMethod == null || ae2ActionableModulate == null
+                    || getCapabilityMethod == null || ae2StorageCapability == null || stack.isEmpty()) {
+                return stack;
+            }
+            try {
+                Object storage = storageOf(blockEntity);
+                if (storage == null) {
+                    return stack;
+                }
+                Object itemKey = ae2ItemKeyOfMethod.invoke(null, stack);
+                if (itemKey == null) {
+                    return stack;
+                }
+                Object actionSource;
+                if (player != null && ae2ActionSourceOfPlayer != null) {
+                    actionSource = ae2ActionSourceOfPlayer.invoke(null, player);
+                } else if (ae2ActionSourceEmptyMethod != null) {
+                    actionSource = ae2ActionSourceEmptyMethod.invoke(null);
+                } else {
+                    return stack;
+                }
+                long toInsert = stack.getCount();
+                Object result = ae2InsertMethod.invoke(storage, itemKey, toInsert,
+                        ae2ActionableModulate, actionSource);
+                long inserted = result instanceof Number number ? number.longValue() : 0L;
+                if (inserted <= 0) {
+                    return stack;
+                }
+                if (inserted >= toInsert) {
+                    return ItemStack.EMPTY;
+                }
+                return stack.copyWithCount((int) (toInsert - inserted));
+            } catch (ReflectiveOperationException | RuntimeException exception) {
+                LOGGER.debug("向方块实体 {} 的 AE2 存储存入物品失败", blockEntity.getBlockPos(), exception);
+                return stack;
+            }
+        }
+
+        /**
          * 抽出材料并收进调用方给的列表，不经过玩家背包。
          * <p>
          * 与 {@link #pull} 的区别只在交付对象：那条路最后交给 FindMeExtended 的提取器，而提取器
@@ -1054,16 +1259,19 @@ public final class FindMeExtendedAdapter {
          * 这一层是对搜索范围内<b>每一个</b>方块实体都试一遍的循环，在这里问等于为一次注定落空的
          * 尝试也发一个伪造的右键事件——搜索范围是 32 格立方体，一次取回能给整合包里所有监听右键的
          * 模组送出几百个假事件。下移之后，只有真正会动那个容器的时候才问。
+         * <p>
+         * {@code trustBoundTarget} 为 {@code true} 时连下面那层也不问：调用方是「玩家自己绑定的
+         * 物品中枢」，绑定即授权，而那道具名右键的探测本就不可靠。
          */
         private int extractTo(List<BlockEntity> containers, ServerPlayer player, ItemStack stack,
-                              int amount, List<ItemStack> output) {
+                              int amount, List<ItemStack> output, boolean trustBoundTarget) {
             int extracted = 0;
             for (BlockEntity blockEntity : containers) {
                 if (extracted >= amount) {
                     break;
                 }
                 int fromAe2 = extractFromAe2Storage(blockEntity, player, stack, amount - extracted,
-                        output::add);
+                        output::add, trustBoundTarget);
                 if (fromAe2 > 0) {
                     extracted = Math.min(amount, extracted + fromAe2);
                     if (extracted >= amount) {
@@ -1071,16 +1279,17 @@ public final class FindMeExtendedAdapter {
                     }
                 }
                 extracted = Math.min(amount, extracted
-                        + extractFromHandler(blockEntity, player, stack, amount - extracted, output));
+                        + extractFromHandler(blockEntity, player, stack, amount - extracted, output,
+                        trustBoundTarget));
             }
             return extracted;
         }
 
-        /** 只读地问一句：这个处理器里有没有我们要的东西（同物品同 NBT）。 */
+        /** 只读地问一句：这个处理器里有没有我们要的东西（同物品同 NBT，空标签与无标签视为同一状态）。 */
         private static boolean holds(IItemHandler handler, ItemStack requirement) {
             for (int slot = 0; slot < handler.getSlots(); slot++) {
                 ItemStack inSlot = handler.getStackInSlot(slot);
-                if (!inSlot.isEmpty() && ItemStack.isSameItemSameTags(inSlot, requirement)) {
+                if (!inSlot.isEmpty() && ItemMatchMode.EXACT.matches(inSlot, requirement)) {
                     return true;
                 }
             }
@@ -1089,7 +1298,8 @@ public final class FindMeExtendedAdapter {
 
         /** 按 Forge 物品处理器逐槽抽出材料，抽到的追加到 {@code output}。 */
         private int extractFromHandler(BlockEntity blockEntity, ServerPlayer player,
-                                       ItemStack requirement, int amount, List<ItemStack> output) {
+                                       ItemStack requirement, int amount, List<ItemStack> output,
+                                       boolean trustBoundTarget) {
             if (amount <= 0 || requirement.isEmpty()) {
                 return 0;
             }
@@ -1101,14 +1311,15 @@ public final class FindMeExtendedAdapter {
                                 // 里面根本没有我们要的东西：连保护门都不问。
                                 return;
                             }
-                            if (!canInteract(player, blockEntity)) {
+                            if (!trustBoundTarget && !canInteract(player, blockEntity)) {
+                                LOGGER.debug("保护门拦下 {}，跳过槽位抽取", blockEntity.getBlockPos());
                                 return;
                             }
                             int remaining = amount;
                             for (int slot = 0; slot < handler.getSlots() && remaining > 0; slot++) {
                                 ItemStack inSlot = handler.getStackInSlot(slot);
                                 if (inSlot.isEmpty()
-                                        || !ItemStack.isSameItemSameTags(inSlot, requirement)) {
+                                        || !ItemMatchMode.EXACT.matches(inSlot, requirement)) {
                                     continue;
                                 }
                                 ItemStack taken = handler.extractItem(slot, remaining, false);

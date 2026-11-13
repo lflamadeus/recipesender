@@ -71,7 +71,9 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.OptionalInt;
 import java.util.UUID;
+import com.lai.recipesender.integration.emi.EmiRecipeTreeSupport;
 import java.util.concurrent.atomic.AtomicLong;
 
 /** 管理 EMI 配方选择、份数调整以及双向材料传输。 */
@@ -89,6 +91,18 @@ public final class RecipeSenderClient {
      * 用 keysym 而不是扫描码：玩家认的是键帽上那个 1。
      */
     private static final int FILL_ALL_KEY = GLFW.GLFW_KEY_1;
+    /**
+     * 「对齐配方树需求数量」的按键：英文键盘主键区的 2。
+     *
+     * <p>在任何发送模式的选择期间按下，将发送份数对齐至 EMI 配方树所需的批次数。
+     */
+    private static final int TREE_BATCHES_KEY = GLFW.GLFW_KEY_2;
+    /**
+     * 「锁定并手动输入数量」的按键：英文键盘主键区的 3。
+     *
+     * <p>在任何发送模式的选择期间按下，锁定选择并进入手动输入模式，允许放开直达/发送键直接键入份数。
+     */
+    private static final int MANUAL_INPUT_KEY = GLFW.GLFW_KEY_3;
     private static final long AVAILABILITY_REFRESH_INTERVAL_TICKS = 10L;
     /**
      * 选择期间补问机器状态的间隔。
@@ -276,6 +290,12 @@ public final class RecipeSenderClient {
         boolean awaitingAvailability;
         boolean releasePending;
         boolean selectAllRequested;
+        boolean treeBatchesRequested;
+        int requestedTreeCount;
+        boolean treeNotFoundNotice;
+        boolean manualInputActive;
+        String manualInputBuffer = "";
+        boolean manualInputBufferFresh;
         boolean nearbyAvailabilityReceived;
         /**
          * 服务端给出的「为什么只有这么少」；null 表示没有具体原因。
@@ -530,13 +550,119 @@ public final class RecipeSenderClient {
         };
     }
 
+    /** 将当前选择份数对齐为 EMI 配方树需求数量。 */
+    private static void applyTreeBatches() {
+        OptionalInt treeCountOpt = EmiRecipeTreeSupport.getTreeBatches(
+                selection.activeIngredient, selection.activeRecipe);
+        if (treeCountOpt.isEmpty() || treeCountOpt.getAsInt() <= 0) {
+            selection.treeNotFoundNotice = true;
+            selection.treeBatchesRequested = false;
+            return;
+        }
+        int treeCount = treeCountOpt.getAsInt();
+        selection.requestedTreeCount = treeCount;
+        selection.treeBatchesRequested = true;
+        selection.selectAllRequested = false;
+        selection.treeNotFoundNotice = false;
+        int ceiling = maxSendableBatches();
+        if (ceiling > 0) {
+            selection.selectedBatches = Math.max(1, Math.min(treeCount, ceiling));
+        } else {
+            selection.selectedBatches = treeCount;
+        }
+    }
+
+    /** 进入锁定手动输入模式。 */
+    private static void enterManualInputMode() {
+        selection.manualInputActive = true;
+        selection.manualInputBuffer = selection.selectedBatches > 0 ? String.valueOf(selection.selectedBatches) : "1";
+        selection.manualInputBufferFresh = true;
+        selection.selectAllRequested = false;
+        selection.treeBatchesRequested = false;
+        selection.treeNotFoundNotice = false;
+    }
+
+    /** 处理锁定输入模式下的按键事件。 */
+    private static void handleManualInputKey(int keyCode, ScreenEvent.KeyPressed.Pre event) {
+        event.setCanceled(true);
+        if (keyCode == GLFW.GLFW_KEY_ENTER || keyCode == GLFW.GLFW_KEY_KP_ENTER) {
+            if (selection.selectedBatches > 0) {
+                finishSelection();
+            } else {
+                cancelSelection("份数为 0");
+            }
+            return;
+        }
+        if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
+            cancelSelection("玩家取消手动输入");
+            return;
+        }
+        if (keyCode == GLFW.GLFW_KEY_BACKSPACE) {
+            selection.manualInputBufferFresh = false;
+            if (!selection.manualInputBuffer.isEmpty()) {
+                selection.manualInputBuffer = selection.manualInputBuffer.substring(0, selection.manualInputBuffer.length() - 1);
+                if (selection.manualInputBuffer.isEmpty()) {
+                    selection.selectedBatches = 0;
+                } else {
+                    try {
+                        int val = Integer.parseInt(selection.manualInputBuffer);
+                        selection.selectedBatches = Math.max(0, Math.min(val, RecipeSenderConfig.maxBatches()));
+                    } catch (NumberFormatException ignored) {}
+                }
+            } else {
+                selection.selectedBatches = 0;
+            }
+            return;
+        }
+        int digit = getDigit(keyCode);
+        if (digit >= 0) {
+            if (selection.manualInputBufferFresh) {
+                selection.manualInputBuffer = String.valueOf(digit);
+                selection.manualInputBufferFresh = false;
+            } else {
+                if (selection.manualInputBuffer.equals("0")) {
+                    selection.manualInputBuffer = String.valueOf(digit);
+                } else if (selection.manualInputBuffer.length() < 7) {
+                    selection.manualInputBuffer += digit;
+                }
+            }
+            try {
+                long val = Long.parseLong(selection.manualInputBuffer);
+                selection.selectedBatches = (int) Math.min(val, RecipeSenderConfig.maxBatches());
+            } catch (NumberFormatException ignored) {}
+        }
+    }
+
+    /** 解析按键是否为 0-9 数字（支持主键盘与小键盘），不是则返回 -1。 */
+    private static int getDigit(int keyCode) {
+        if (keyCode >= GLFW.GLFW_KEY_0 && keyCode <= GLFW.GLFW_KEY_9) {
+            return keyCode - GLFW.GLFW_KEY_0;
+        }
+        if (keyCode >= GLFW.GLFW_KEY_KP_0 && keyCode <= GLFW.GLFW_KEY_KP_9) {
+            return keyCode - GLFW.GLFW_KEY_KP_0;
+        }
+        return -1;
+    }
+
     /** 处理 Alt / 1、Z、配方反转键和绑定键的按下与松开事件。 */
     @SubscribeEvent
     public static void onKeyInput(InputEvent.Key event) {
-        if (event.getAction() == GLFW.GLFW_PRESS && selection.selecting && isFillAllKey(event)) {
-            selection.selectAllRequested = true;
-            selection.selectedBatches = maxSendableBatches();
-            return;
+        if (event.getAction() == GLFW.GLFW_PRESS && selection.selecting) {
+            if (isFillAllKey(event)) {
+                selection.selectAllRequested = true;
+                selection.treeBatchesRequested = false;
+                selection.treeNotFoundNotice = false;
+                selection.selectedBatches = maxSendableBatches();
+                return;
+            }
+            if (event.getKey() == TREE_BATCHES_KEY) {
+                applyTreeBatches();
+                return;
+            }
+            if (event.getKey() == MANUAL_INPUT_KEY) {
+                enterManualInputMode();
+                return;
+            }
         }
         // 1 与 Alt 只负责「把份数顶满」，永远不会起停一次发送：松手发送这件事只由功能键
         // （Z / 直达键，鼠标绑定同理）负责。上面那条分支已经把「选择期间按下 1 / Alt = 顶满」
@@ -551,7 +677,9 @@ public final class RecipeSenderClient {
                 beginSelection();
             } else if (event.getAction() == GLFW.GLFW_RELEASE && selection.selecting
                     && !isSelectionKeyHeld()) {
-                finishSelection();
+                if (!selection.manualInputActive) {
+                    finishSelection();
+                }
             }
             return;
         }
@@ -623,7 +751,9 @@ public final class RecipeSenderClient {
                 beginSelection();
             } else if (event.getAction() == GLFW.GLFW_RELEASE && selection.selecting
                     && !isSelectionKeyHeld()) {
-                finishSelection();
+                if (!selection.manualInputActive) {
+                    finishSelection();
+                }
             }
             return;
         }
@@ -809,11 +939,14 @@ public final class RecipeSenderClient {
             selection.selectAllRequested = true;
             selection.selectedBatches = maxSendableBatches();
         }
+        if (isGlfwKeyDown(TREE_BATCHES_KEY) && !selection.treeBatchesRequested) {
+            applyTreeBatches();
+        }
         if (minecraft.screen != selection.activeScreen) {
             cancelSelection("当前界面已改变");
             return;
         }
-        if (!isActiveTarget(EmiApi.getHoveredStack(true))) {
+        if (!selection.manualInputActive && !isActiveTarget(EmiApi.getHoveredStack(true))) {
             cancelSelection("鼠标已不在目标配方上");
             return;
         }
@@ -957,6 +1090,45 @@ public final class RecipeSenderClient {
         return Lang.message("text.recipe_sender.bound_target", "发送到「" + name + "」", name);
     }
 
+    /** 判断一个绑定目标是否位于当前维度的外部。 */
+    private static boolean isCrossDimension(BoundContainer target) {
+        if (target == null) {
+            return false;
+        }
+        Minecraft minecraft = Minecraft.getInstance();
+        return minecraft.player != null && !target.dimension().equals(minecraft.player.level().dimension());
+    }
+
+    /** 格式化维度显示名（主世界 / 下界 / 末地，模组维度用 path）。 */
+    private static String formatDimensionName(ResourceKey<Level> dimension) {
+        if (dimension == null) {
+            return Lang.text("text.recipe_sender.dim_unknown", "未知维度");
+        }
+        ResourceLocation loc = dimension.location();
+        if ("minecraft".equals(loc.getNamespace())) {
+            return switch (loc.getPath()) {
+                case "overworld" -> Lang.text("text.recipe_sender.dim_overworld", "主世界");
+                case "the_nether" -> Lang.text("text.recipe_sender.dim_nether", "下界");
+                case "the_end" -> Lang.text("text.recipe_sender.dim_the_end", "末地");
+                default -> loc.getPath();
+            };
+        }
+        return loc.getPath();
+    }
+
+    /** 生成 HUD 上的「放入「X」」直达目标行；跨维度时带上维度标识。 */
+    private static Component getDirectTargetText(BoundContainer target) {
+        if (target == null) {
+            return Component.empty();
+        }
+        if (isCrossDimension(target)) {
+            String dim = formatDimensionName(target.dimension());
+            return Lang.message("text.recipe_sender.direct_target_cross_dim",
+                    "放入「" + target.name() + "」[" + dim + "]", target.name(), dim);
+        }
+        return getDirectTargetText(target.name());
+    }
+
     /** 生成 HUD 上的「放入「X」」直达目标行；材料来自周围，用词与绑定发送区分开。 */
     private static Component getDirectTargetText(String name) {
         return Lang.message("text.recipe_sender.direct_target", "放入「" + name + "」", name);
@@ -1034,7 +1206,7 @@ public final class RecipeSenderClient {
         if (!selection.selecting || event.getScreen() != selection.activeScreen) {
             return;
         }
-        if (!isActiveTarget(EmiApi.getHoveredStack((int) event.getMouseX(),
+        if (!selection.manualInputActive && !isActiveTarget(EmiApi.getHoveredStack((int) event.getMouseX(),
                 (int) event.getMouseY(), true))) {
             cancelSelection("滚轮时鼠标已不在目标配方上");
             return;
@@ -1069,7 +1241,33 @@ public final class RecipeSenderClient {
      */
     @SubscribeEvent
     public static void onScreenKeyPressed(ScreenEvent.KeyPressed.Pre event) {
-        if (shouldBlockKey(event.getScreen(), event.getKeyCode())) {
+        if (!selection.selecting || event.getScreen() != selection.activeScreen) {
+            return;
+        }
+        int keyCode = event.getKeyCode();
+        if (selection.manualInputActive) {
+            handleManualInputKey(keyCode, event);
+            return;
+        }
+        if (keyCode == FILL_ALL_KEY || keyCode == GLFW.GLFW_KEY_LEFT_ALT || keyCode == GLFW.GLFW_KEY_RIGHT_ALT) {
+            selection.selectAllRequested = true;
+            selection.treeBatchesRequested = false;
+            selection.treeNotFoundNotice = false;
+            selection.selectedBatches = maxSendableBatches();
+            event.setCanceled(true);
+            return;
+        }
+        if (keyCode == TREE_BATCHES_KEY) {
+            applyTreeBatches();
+            event.setCanceled(true);
+            return;
+        }
+        if (keyCode == MANUAL_INPUT_KEY) {
+            enterManualInputMode();
+            event.setCanceled(true);
+            return;
+        }
+        if (shouldBlockKey(event.getScreen(), keyCode)) {
             event.setCanceled(true);
         }
     }
@@ -1077,6 +1275,10 @@ public final class RecipeSenderClient {
     /** 与按下对称地屏蔽松开，避免界面收到没有对应按下的松开事件。 */
     @SubscribeEvent
     public static void onScreenKeyReleased(ScreenEvent.KeyReleased.Pre event) {
+        if (selection.manualInputActive) {
+            event.setCanceled(true);
+            return;
+        }
         if (shouldBlockKey(event.getScreen(), event.getKeyCode())) {
             event.setCanceled(true);
         }
@@ -1179,11 +1381,16 @@ public final class RecipeSenderClient {
             boolean direct = selection.directMode || selection.hubDirectMode;
             lines.add(selection.activeBinding != null
                     ? (direct
-                            ? getDirectTargetText(selection.activeBinding.name())
+                            ? getDirectTargetText(selection.activeBinding)
                             : getBoundTargetText(selection.activeBinding.name()))
                     : getBoundText("text.recipe_sender.bound_target_pick",
                             new Object[]{selection.boundCandidates.size()}, "候选容器"));
             colors.add(0x8FE08F);
+            if (direct && isCrossDimension(selection.activeBinding)) {
+                // 跨维度直达：提前提醒玩家目标区块必须已由加载器保持加载。
+                lines.add(Lang.message("text.recipe_sender.hud_cross_dim_hint", "跨维度直达：目标区块需已加载"));
+                colors.add(0x9AD9FF);
+            }
         }
         lines.add(getCountText(availableKey, selection.availableBatches,
                 materialFromNearby() ? "周围现有" : "背包现有"));
@@ -1195,15 +1402,39 @@ public final class RecipeSenderClient {
             lines.add(Component.translatable(selection.availabilityReason.key()));
             colors.add(0xFF9A9A);
         }
-        lines.add(getCountText(selection.directMode || selection.hubDirectMode
-                        ? "text.recipe_sender.direct_count"
-                        : (selection.reverseMode
-                                ? "text.recipe_sender.pull_count"
-                                : "text.recipe_sender.send_count"),
-                selection.selectedBatches,
-                selection.hubDirectMode ? "中枢直达"
-                        : (selection.directMode ? "直达" : (selection.reverseMode ? "取回" : "发送"))));
-        colors.add(0xFFFFFF);
+        if (selection.manualInputActive) {
+            boolean cursorOn = (clientTicks / 10) % 2 == 0;
+            String displayText = selection.manualInputBuffer.isEmpty() ? "0" : selection.manualInputBuffer;
+            if (cursorOn) {
+                displayText += "_";
+            }
+            lines.add(Component.translatable("text.recipe_sender.hud_manual_input", displayText));
+            colors.add(0xFFE552);
+            lines.add(Component.translatable("text.recipe_sender.hud_manual_input_hint"));
+            colors.add(0x9AD9FF);
+        } else {
+            lines.add(getCountText(selection.directMode || selection.hubDirectMode
+                            ? "text.recipe_sender.direct_count"
+                            : (selection.reverseMode
+                                    ? "text.recipe_sender.pull_count"
+                                    : "text.recipe_sender.send_count"),
+                    selection.selectedBatches,
+                    selection.hubDirectMode ? "中枢直达"
+                            : (selection.directMode ? "直达" : (selection.reverseMode ? "取回" : "发送"))));
+            colors.add(0xFFFFFF);
+            if (selection.treeBatchesRequested) {
+                if (selection.selectedBatches >= selection.requestedTreeCount) {
+                    lines.add(Component.translatable("text.recipe_sender.hud_tree_batches_matched", selection.requestedTreeCount));
+                    colors.add(0x85E35D);
+                } else {
+                    lines.add(Component.translatable("text.recipe_sender.hud_tree_batches_short", selection.requestedTreeCount));
+                    colors.add(0xFFAA00);
+                }
+            } else if (selection.treeNotFoundNotice) {
+                lines.add(Component.translatable("text.recipe_sender.hud_tree_batches_not_found"));
+                colors.add(0xFF7777);
+            }
+        }
         Component circuitLine = selection.reverseMode ? null : describeCircuitChange();
         if (circuitLine != null) {
             // 提前显示这次发送会顺带把机器电路改成什么，避免玩家不知道配置被动过。
@@ -1272,17 +1503,20 @@ public final class RecipeSenderClient {
      *       方案里被取消的 D3。老玩家升级后第一次按 B+Z 会收到一条提示，照着提示去管理界面勾类别即可。</li>
      *   <li><b>认不出配方类别时（路由键集合为空）退回全部主容器</b>：没装 GT、EMI 类别 id 也拿不到的
      *       极端情况，退回 S5 的行为（只有一个就直接发，多个就弹窗），而不是直接报错。</li>
-     *   <li><b>维度必须相同</b>：跨维度的落点连方块都加载不了，早筛掉比事后报「区块未加载」清楚。</li>
+     *   <li><b>维度必须相同</b>：跨维度的落点连方块都加载不了，早筛掉比事后报「区块未加载」清楚。
+     *       唯一的例外是<b>直达</b>（含中枢直达）：它按配置项 {@code directCrossDimension} 决定，
+     *       默认允许跨维度，所以那时不做这一层筛。绑定发送始终只认同维度。</li>
      * </ul>
      */
-    private static List<BoundContainer> routeCandidates(List<BoundContainer> masters, EmiRecipe recipe) {
+    private static List<BoundContainer> routeCandidates(List<BoundContainer> masters, EmiRecipe recipe,
+                                                        boolean allowCrossDimension) {
         Minecraft minecraft = Minecraft.getInstance();
         ResourceKey<Level> dimension = minecraft.player == null
                 ? null : minecraft.player.level().dimension();
         Set<ResourceLocation> keys = RecipeRouteKeys.of(recipe);
         List<BoundContainer> matched = new ArrayList<>();
         for (BoundContainer master : masters) {
-            if (dimension != null && !dimension.equals(master.dimension())) {
+            if (!allowCrossDimension && dimension != null && !dimension.equals(master.dimension())) {
                 continue;
             }
             // 认不出类别：没有依据可筛，只能把同维度的主容器都交出去（S5 行为）。
@@ -1385,7 +1619,12 @@ public final class RecipeSenderClient {
             // S6 起按配方类别自动路由：只有「勾了这条配方所属类别」的主容器才是候选。
             // 一个都没勾过的老容器不会被当成兜底（方案 §5.5.2），所以这里必须把话说清楚：
             // 提示里带上类别名与下一步该去哪儿勾，而不是干巴巴一句「没有匹配」。
-            candidates = routeCandidates(masters, recipe);
+            //
+            // 跨维度只在直达（含中枢直达）且配置允许时放开：绑定发送的材料在玩家背包里，
+            // 让人跨维度送进一个自己走不过去的方块没有道理，而直达本来就是远程搬运。
+            boolean crossDimension = (directRequested || hubRequested)
+                    && RecipeSenderConfig.directCrossDimension();
+            candidates = routeCandidates(masters, recipe, crossDimension);
             if (candidates.isEmpty()) {
                 sendMessage(minecraft, getBoundText("text.recipe_sender.route_none",
                         new Object[]{RecipeRouteKeys.categoryName(recipe)},
@@ -1408,6 +1647,15 @@ public final class RecipeSenderClient {
         selection.activeBinding = boundTarget;
         selection.boundCandidates = candidates;
         selection.selectAllRequested = isFillAllDown();
+        selection.treeBatchesRequested = false;
+        selection.requestedTreeCount = 0;
+        selection.treeNotFoundNotice = false;
+        selection.manualInputActive = false;
+        selection.manualInputBuffer = "";
+        selection.manualInputBufferFresh = false;
+        if (isGlfwKeyDown(TREE_BATCHES_KEY)) {
+            applyTreeBatches();
+        }
         // 直达与反转一样，份数要等服务端扫完周围才能定，先置 0 表示「还没算出来」。
         selection.selectedBatches = materialFromNearby() ? 0 : 1;
         selection.pendingScrollNotches = 0;
@@ -1504,7 +1752,7 @@ public final class RecipeSenderClient {
             // 否则会拿一份空状态去收尾，还会把「松手时鼠标已不在目标配方上」这条误导性的日志打出来。
             return;
         }
-        if (!isActiveTarget(EmiApi.getHoveredStack(true))) {
+        if (!selection.manualInputActive && !isActiveTarget(EmiApi.getHoveredStack(true))) {
             cancelSelection("松手时鼠标已不在目标配方上");
             return;
         }
@@ -1581,9 +1829,10 @@ public final class RecipeSenderClient {
             cancelSelection();
             return;
         }
-        List<ItemStack> requirements = result.requirements();
+        // 分组原样带到服务端：摊平成一张材料表以后，「哪几个凑成一份」就没了（见 sendBoundInsert）。
+        List<List<ItemStack>> groups = result.groups();
         if (candidates.size() == 1) {
-            sendBoundInsert(candidates.get(0).id(), requirements, batches);
+            sendBoundInsert(candidates.get(0).id(), groups, batches);
             cancelSelection();
             return;
         }
@@ -1591,7 +1840,7 @@ public final class RecipeSenderClient {
         // 路由键要在 cancelSelection() 之前取：它清掉的是这次选择的状态。
         ResourceLocation routeKey = RecipeRouteKeys.primary(selection.activeRecipe);
         cancelSelection();
-        minecraft.setScreen(new BoundContainerPickScreen(parent, candidates, requirements, batches, routeKey,
+        minecraft.setScreen(new BoundContainerPickScreen(parent, candidates, groups, batches, routeKey,
                 null, null, SourceScope.NEARBY));
     }
 
@@ -1659,16 +1908,19 @@ public final class RecipeSenderClient {
     }
 
     /**
-     * 把一份材料发往指定绑定，并记下这次的请求号用于认领回执。
+     * 把一次按配方输入分好的材料发往指定绑定，并记下这次的请求号用于认领回执。
      *
      * <p>这个入口同时被选择界面调用，所以请求号的分配收在这里，避免两处各写一遍。
+     *
+     * <p>材料按<b>配方输入分组</b>传递，不摊成平表：同一组里的变体可以互换（格雷的同标签多种
+     * 电路板），一份要两个板时允许两种板各一个。服务端要靠分组才能把整份材料拆出来。
      *
      * <p>电路要求随包带上（读 {@link #resolvedCircuit}，不是 {@code activeCircuit}——选择界面那条
      * 路径发包时选择已经取消了）：落点是远程方块，服务端手里没有配方信息，不带上就只能不调电路。
      * 认不出格雷配方时带 {@link GtCircuitSupport#NO_CIRCUIT}，服务端据此一律不动电路。
      */
-    public static void sendBoundInsert(UUID bindingId, List<ItemStack> requirements, int batches) {
-        if (bindingId == null || requirements.isEmpty() || batches <= 0) {
+    public static void sendBoundInsert(UUID bindingId, List<List<ItemStack>> groups, int batches) {
+        if (bindingId == null || groups == null || groups.isEmpty() || batches <= 0) {
             return;
         }
         GtCircuitSupport.CircuitRequirement circuit = selection.resolvedCircuit;
@@ -1676,7 +1928,7 @@ public final class RecipeSenderClient {
         boolean gregRecipe = circuit != null && circuit.gregRecipe();
         selection.boundRequestId = BOUND_REQUEST_SEQUENCE.incrementAndGet();
         ModNetwork.CHANNEL.sendToServer(new InsertRecipeItemsToBoundPacket(selection.boundRequestId, bindingId,
-                requirements, batches, circuitNumber, gregRecipe));
+                groups, batches, circuitNumber, gregRecipe));
     }
 
     /**
@@ -1869,6 +2121,11 @@ public final class RecipeSenderClient {
             // 玩家按住 1 却永远停在 1 份。意图只由玩家自己滚轮调数量时撤销（见 adjustBatches）。
             selection.selectAllRequested = true;
             selection.selectedBatches = selection.availableBatches;
+        } else if (isGlfwKeyDown(TREE_BATCHES_KEY) || selection.treeBatchesRequested) {
+            selection.treeBatchesRequested = true;
+            selection.selectedBatches = Math.max(1, Math.min(selection.requestedTreeCount, selection.availableBatches));
+        } else if (selection.manualInputActive) {
+            // 锁定输入模式下份数由玩家输入决定，不被默认值覆盖
         } else if (!selection.nearbyAvailabilityReceived) {
             selection.selectedBatches = 1;
         } else if (selection.selectedBatches == 0) {
@@ -1978,6 +2235,15 @@ public final class RecipeSenderClient {
         Minecraft minecraft = Minecraft.getInstance();
         String name = directTargetName(bindingId);
         if (status != BoundStatus.OK) {
+            BoundContainer target = BoundContainerClient.find(bindingId);
+            if (status == BoundStatus.CHUNK_UNLOADED && isCrossDimension(target)) {
+                String dim = formatDimensionName(target.dimension());
+                sendMessage(minecraft, Lang.message(
+                        "text.recipe_sender.bound_status.chunk_unloaded_cross_dim",
+                        "直达失败：目标位于「" + dim + "」且区块未加载（需区块加载器保持活跃）", dim),
+                        NoticeSeverity.ERROR);
+                return;
+            }
             String key = BoundContainerService.describe(status);
             String fallback = "直达失败：目标「" + name + "」不可用";
             sendMessage(minecraft, key == null ? Component.literal(fallback)
@@ -2178,6 +2444,11 @@ public final class RecipeSenderClient {
             // 与 acceptNearbyAvailability 同一套口径：只要「给满」的意图还在，就跟着最新上限走。
             selection.selectAllRequested = true;
             selection.selectedBatches = ceiling;
+        } else if (isGlfwKeyDown(TREE_BATCHES_KEY) || selection.treeBatchesRequested) {
+            selection.treeBatchesRequested = true;
+            selection.selectedBatches = Math.max(1, Math.min(selection.requestedTreeCount, ceiling));
+        } else if (selection.manualInputActive) {
+            // 锁定输入模式下保持玩家输入的值
         } else if (selection.selectedBatches == 0) {
             selection.selectedBatches = 1;
         } else {
@@ -2336,13 +2607,26 @@ public final class RecipeSenderClient {
             return 0;
         }
         int direction = scrollDelta > 0 ? 1 : -1;
+        if (selection.manualInputActive) {
+            int limit = Math.min(ceiling, RecipeSenderConfig.maxBatches());
+            int next = Math.max(1, Math.min(limit, current + direction));
+            selection.selectedBatches = next;
+            selection.manualInputBuffer = String.valueOf(next);
+            selection.manualInputBufferFresh = false;
+            return next;
+        }
         if (isFillAllDown()) {
             selection.selectAllRequested = true;
             return ceiling;
         }
-        // 没按 1 / Alt 却滚了滚轮 = 玩家要自己定数量，「给满」的意图到此为止：
+        if (isGlfwKeyDown(TREE_BATCHES_KEY) && selection.treeBatchesRequested) {
+            return Math.max(1, Math.min(selection.requestedTreeCount, ceiling));
+        }
+        // 没按 1 / Alt / 2 却滚了滚轮 = 玩家要自己定数量，「给满」与「对齐树」的意图到此为止：
         // 否则下一份统计回执又会把它顶回满值，滚轮就永远减不下去。
         selection.selectAllRequested = false;
+        selection.treeBatchesRequested = false;
+        selection.treeNotFoundNotice = false;
         int limit = Math.min(ceiling, RecipeSenderConfig.maxBatches());
         if (isControlDown()) {
             return snapToStep(current, direction, CONTROL_STEP, limit);
@@ -2436,6 +2720,12 @@ public final class RecipeSenderClient {
         selection.awaitingAvailability = false;
         selection.releasePending = false;
         selection.selectAllRequested = false;
+        selection.treeBatchesRequested = false;
+        selection.requestedTreeCount = 0;
+        selection.treeNotFoundNotice = false;
+        selection.manualInputActive = false;
+        selection.manualInputBuffer = "";
+        selection.manualInputBufferFresh = false;
         selection.nearbyAvailabilityReceived = false;
         selection.availabilityReason = null;
         selection.fluidsIgnoredByConfig = false;
